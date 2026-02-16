@@ -3,6 +3,7 @@
 
   let input = $state("");
   let sending = $state(false);
+  let textareaEl: HTMLTextAreaElement;
 
   async function handleSend() {
     const text = input.trim();
@@ -16,6 +17,7 @@
       console.error("Failed to send:", e);
     }
     sending = false;
+    textareaEl?.focus();
   }
 
   function handleKeydown(e: KeyboardEvent) {
@@ -32,9 +34,9 @@
       class="message-input"
       placeholder="Send an encrypted message..."
       bind:value={input}
+      bind:this={textareaEl}
       onkeydown={handleKeydown}
       rows="1"
-      disabled={sending}
     ></textarea>
     <button class="send-btn" onclick={handleSend} disabled={!input.trim() || sending}>
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">

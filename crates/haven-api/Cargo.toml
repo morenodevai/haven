@@ -10,6 +10,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 haven-types = { workspace = true }
 haven-db = { workspace = true }
+haven-gateway = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }

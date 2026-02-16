@@ -6,6 +6,7 @@ use jsonwebtoken::{EncodingKey, Header, encode};
 use uuid::Uuid;
 
 use haven_db::Database;
+use haven_gateway::dispatcher::Dispatcher;
 use haven_types::api::{LoginRequest, LoginResponse, RegisterRequest, RegisterResponse};
 
 use crate::middleware::Claims;
@@ -15,6 +16,7 @@ pub type AppState = Arc<AppStateInner>;
 pub struct AppStateInner {
     pub db: Database,
     pub jwt_secret: String,
+    pub dispatcher: Dispatcher,
 }
 
 pub async fn register(

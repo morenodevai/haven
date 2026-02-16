@@ -10,6 +10,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use haven_types::api::{MessageResponse, SendMessageRequest};
+use haven_types::events::GatewayEvent;
 
 use crate::auth::AppStateInner;
 use crate::middleware::Claims;
@@ -43,6 +44,19 @@ pub async fn send_message(
         )
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    let now = chrono::Utc::now();
+
+    // Broadcast to all WebSocket clients
+    state.dispatcher.broadcast(GatewayEvent::MessageCreate {
+        id: message_id,
+        channel_id,
+        author_id: claims.sub,
+        author_username: claims.username.clone(),
+        ciphertext: req.ciphertext.clone(),
+        nonce: req.nonce.clone(),
+        timestamp: now,
+    });
+
     Ok((StatusCode::CREATED, Json(MessageResponse {
         id: message_id,
         channel_id,
@@ -50,7 +64,7 @@ pub async fn send_message(
         author_username: claims.username.clone(),
         ciphertext: req.ciphertext,
         nonce: req.nonce,
-        created_at: chrono::Utc::now(),
+        created_at: now,
     })))
 }
 

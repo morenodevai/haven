@@ -52,8 +52,8 @@ async fn main() -> anyhow::Result<()> {
     let db = haven_db::Database::open(&PathBuf::from(&db_path))?;
 
     // Shared state
-    let app_state: AppState = Arc::new(AppStateInner { db, jwt_secret: jwt_secret.clone() });
     let dispatcher = Dispatcher::new();
+    let app_state: AppState = Arc::new(AppStateInner { db, jwt_secret: jwt_secret.clone(), dispatcher: dispatcher.clone() });
 
     let state = ServerState {
         app: app_state.clone(),
