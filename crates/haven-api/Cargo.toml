@@ -19,3 +19,4 @@ tracing = { workspace = true }
 argon2 = { workspace = true }
 jsonwebtoken = { workspace = true }
 rand = { workspace = true }
+rand_core = { workspace = true }

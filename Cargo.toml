@@ -33,11 +33,12 @@ serde_json = "1"
 rusqlite = { version = "0.35", features = ["bundled"] }
 
 # Auth
-argon2 = "0.5"
+argon2 = { version = "0.5", features = ["rand"] }
 jsonwebtoken = "9"
 
 # Crypto
 rand = "0.9"
+rand_core = { version = "0.6", features = ["getrandom"] }
 base64 = "0.22"
 
 # Logging

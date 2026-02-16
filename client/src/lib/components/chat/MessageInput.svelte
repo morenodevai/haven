@@ -1,8 +1,10 @@
 <script lang="ts">
   import { sendMessage } from "../../stores/messages";
+  import EmojiPicker from "./EmojiPicker.svelte";
 
   let input = $state("");
   let sending = $state(false);
+  let showEmoji = $state(false);
   let textareaEl: HTMLTextAreaElement;
 
   async function handleSend() {
@@ -26,10 +28,33 @@
       handleSend();
     }
   }
+
+  function insertEmoji(emoji: string) {
+    input += emoji;
+    showEmoji = false;
+    textareaEl?.focus();
+  }
+
+  function handleWindowClick(e: MouseEvent) {
+    if (showEmoji) {
+      const anchor = (e.target as HTMLElement).closest('.emoji-anchor');
+      if (!anchor) showEmoji = false;
+    }
+  }
 </script>
+
+<svelte:window onclick={handleWindowClick} />
 
 <div class="input-container">
   <div class="input-wrapper">
+    <div class="emoji-anchor">
+      <button class="emoji-toggle" onclick={() => showEmoji = !showEmoji} title="Emoji">
+        😀
+      </button>
+      {#if showEmoji}
+        <EmojiPicker onSelect={insertEmoji} />
+      {/if}
+    </div>
     <textarea
       class="message-input"
       placeholder="Send an encrypted message..."
@@ -80,6 +105,25 @@
 
   .message-input::placeholder {
     color: var(--text-muted);
+  }
+
+  .emoji-anchor {
+    position: relative;
+  }
+
+  .emoji-toggle {
+    background: none;
+    border: none;
+    font-size: 20px;
+    cursor: pointer;
+    padding: 4px;
+    border-radius: 6px;
+    line-height: 1;
+    transition: background-color 0.15s;
+  }
+
+  .emoji-toggle:hover {
+    background: var(--bg-tertiary);
   }
 
   .send-btn {
