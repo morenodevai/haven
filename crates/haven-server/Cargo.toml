@@ -1,0 +1,25 @@
+[package]
+name = "haven-server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "haven"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+dotenvy = { workspace = true }
+
+haven-api = { workspace = true }
+haven-db = { workspace = true }
+haven-gateway = { workspace = true }
+haven-types = { workspace = true }

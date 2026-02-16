@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/haven-server",
+    "crates/haven-api",
+    "crates/haven-gateway",
+    "crates/haven-crypto",
+    "crates/haven-db",
+    "crates/haven-types",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web framework
+axum = { version = "0.8", features = ["ws"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Database
+rusqlite = { version = "0.35", features = ["bundled"] }
+
+# Auth
+argon2 = "0.5"
+jsonwebtoken = "9"
+
+# Crypto
+rand = "0.9"
+base64 = "0.22"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Config
+dotenvy = "0.15"
+
+# Workspace crates
+haven-api = { path = "crates/haven-api" }
+haven-crypto = { path = "crates/haven-crypto" }
+haven-db = { path = "crates/haven-db" }
+haven-gateway = { path = "crates/haven-gateway" }
+haven-types = { path = "crates/haven-types" }

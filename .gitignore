@@ -1,0 +1,40 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Node / Svelte
+client/node_modules/
+client/dist/
+client/.svelte-kit/
+
+# Tauri
+client/src-tauri/target/
+client/src-tauri/gen/
+
+# Environment & secrets
+.env
+.env.local
+.env.production
+*.pem
+*.key
+secrets.*
+
+# Database
+*.db
+*.db-wal
+*.db-shm
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# File uploads
+uploads/

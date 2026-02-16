@@ -1,0 +1,21 @@
+[package]
+name = "haven-crypto"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["client"]
+# Server feature: only key relay helpers, NO encryption/decryption
+server = []
+# Client feature: full encrypt/decrypt capabilities
+client = []
+
+[dependencies]
+rand = { workspace = true }
+base64 = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# AES-256-GCM for symmetric encryption (Phase 0 MVP)
+aes-gcm = "0.10"

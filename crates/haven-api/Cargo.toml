@@ -1,0 +1,20 @@
+[package]
+name = "haven-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+axum-extra = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+haven-types = { workspace = true }
+haven-db = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+argon2 = { workspace = true }
+jsonwebtoken = { workspace = true }
+rand = { workspace = true }
