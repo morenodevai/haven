@@ -2,6 +2,7 @@
   import { messages, type DecryptedMessage } from "../../stores/messages";
   import { auth } from "../../stores/auth";
   import { tick } from "svelte";
+  import { isCustomLetter, getLetterChar } from "../../utils/emoji";
 
   let container: HTMLDivElement;
 
@@ -28,6 +29,26 @@
   function isOwnMessage(msg: DecryptedMessage): boolean {
     return msg.authorId === $auth.userId;
   }
+
+  // Split message content into text and custom letter segments
+  type Segment = { type: "text"; value: string } | { type: "letter"; value: string };
+  function parseContent(text: string): Segment[] {
+    const parts: Segment[] = [];
+    const re = /\[:.\:]/g;
+    let last = 0;
+    let match;
+    while ((match = re.exec(text)) !== null) {
+      if (match.index > last) {
+        parts.push({ type: "text", value: text.slice(last, match.index) });
+      }
+      parts.push({ type: "letter", value: match[0] });
+      last = re.lastIndex;
+    }
+    if (last < text.length) {
+      parts.push({ type: "text", value: text.slice(last) });
+    }
+    return parts;
+  }
 </script>
 
 <div class="message-list" bind:this={container}>
@@ -50,7 +71,7 @@
             </span>
             <span class="time">{formatTime(msg.timestamp)}</span>
           </div>
-          <div class="content">{msg.content}</div>
+          <div class="content">{#each parseContent(msg.content) as seg}{#if seg.type === "letter"}<span class="letter-square">{getLetterChar(seg.value)}</span>{:else}{seg.value}{/if}{/each}</div>
         </div>
       </div>
     {/each}
@@ -144,5 +165,21 @@
     color: var(--text-primary);
     word-break: break-word;
     white-space: pre-wrap;
+  }
+
+  .letter-square {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    background: #5865f2;
+    border-radius: 4px;
+    color: white;
+    font-weight: 700;
+    font-size: 13px;
+    font-family: 'Segoe UI', sans-serif;
+    vertical-align: middle;
+    margin: 0 1px;
   }
 </style>

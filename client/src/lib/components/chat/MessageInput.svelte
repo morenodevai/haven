@@ -31,7 +31,6 @@
 
   function insertEmoji(emoji: string) {
     input += emoji;
-    showEmoji = false;
     textareaEl?.focus();
   }
 
