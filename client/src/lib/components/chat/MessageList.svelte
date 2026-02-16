@@ -1,10 +1,14 @@
 <script lang="ts">
-  import { messages, type DecryptedMessage } from "../../stores/messages";
+  import { messages, toggleReaction, type DecryptedMessage } from "../../stores/messages";
   import { auth } from "../../stores/auth";
   import { tick } from "svelte";
-  import { isCustomLetter, getLetterChar } from "../../utils/emoji";
+  import { isCustomLetter, getLetterChar, parseLetters } from "../../utils/emoji";
+  import ReactionBadge from "./ReactionBadge.svelte";
+  import EmojiPicker from "./EmojiPicker.svelte";
 
   let container: HTMLDivElement;
+  let reactionPickerMsgId: string | null = $state(null);
+  let letterBuffer: string = $state("");
 
   // Auto-scroll to bottom when new messages arrive
   $effect(() => {
@@ -30,6 +34,52 @@
     return msg.authorId === $auth.userId;
   }
 
+  function hasReacted(msg: DecryptedMessage, emoji: string): boolean {
+    const group = msg.reactions.find((r) => r.emoji === emoji);
+    return group ? group.user_ids.includes($auth.userId ?? "") : false;
+  }
+
+  function handleToggleReaction(messageId: string, emoji: string) {
+    toggleReaction(messageId, emoji);
+  }
+
+  function openReactionPicker(msgId: string) {
+    reactionPickerMsgId = reactionPickerMsgId === msgId ? null : msgId;
+  }
+
+  function handleReactionSelect(emoji: string) {
+    if (!reactionPickerMsgId) return;
+    if (isCustomLetter(emoji)) {
+      letterBuffer += emoji;
+    } else {
+      toggleReaction(reactionPickerMsgId, emoji);
+      letterBuffer = "";
+      reactionPickerMsgId = null;
+    }
+  }
+
+  function sendWordReaction() {
+    if (reactionPickerMsgId && letterBuffer.length > 0) {
+      toggleReaction(reactionPickerMsgId, letterBuffer);
+      letterBuffer = "";
+      reactionPickerMsgId = null;
+    }
+  }
+
+  function clearLetterBuffer() {
+    letterBuffer = "";
+  }
+
+  function handleWindowClick(e: MouseEvent) {
+    if (reactionPickerMsgId) {
+      const target = e.target as HTMLElement;
+      if (!target.closest(".reaction-picker-anchor") && !target.closest(".emoji-picker")) {
+        letterBuffer = "";
+        reactionPickerMsgId = null;
+      }
+    }
+  }
+
   // Split message content into text and custom letter segments
   type Segment = { type: "text"; value: string } | { type: "letter"; value: string };
   function parseContent(text: string): Segment[] {
@@ -51,6 +101,8 @@
   }
 </script>
 
+<svelte:window onclick={handleWindowClick} />
+
 <div class="message-list" bind:this={container}>
   {#if $messages.length === 0}
     <div class="empty">
@@ -71,7 +123,51 @@
             </span>
             <span class="time">{formatTime(msg.timestamp)}</span>
           </div>
-          <div class="content">{#each parseContent(msg.content) as seg}{#if seg.type === "letter"}<span class="letter-square">{getLetterChar(seg.value)}</span>{:else}{seg.value}{/if}{/each}</div>
+          <div class="bubble" class:own-bubble={isOwnMessage(msg)}>
+            <div class="content">{#each parseContent(msg.content) as seg}{#if seg.type === "letter"}<span class="letter-square">{getLetterChar(seg.value)}</span>{:else}{seg.value}{/if}{/each}</div>
+          </div>
+          <div class="reactions-row">
+            {#each msg.reactions as reaction}
+              <ReactionBadge
+                emoji={reaction.emoji}
+                count={reaction.count}
+                highlighted={hasReacted(msg, reaction.emoji)}
+                onclick={() => handleToggleReaction(msg.id, reaction.emoji)}
+              />
+            {/each}
+            <div class="reaction-picker-anchor">
+              <button
+                class="add-reaction-btn"
+                title="Add Reaction"
+                onclick={(e) => { e.stopPropagation(); openReactionPicker(msg.id); }}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="10"/>
+                  <path d="M8 14s1.5 2 4 2 4-2 4-2"/>
+                  <line x1="9" y1="9" x2="9.01" y2="9"/>
+                  <line x1="15" y1="9" x2="15.01" y2="9"/>
+                </svg>
+                <span class="plus-icon">+</span>
+              </button>
+              {#if reactionPickerMsgId === msg.id}
+                <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+                <div class="picker-wrapper" onclick={(e) => e.stopPropagation()}>
+                  <EmojiPicker onSelect={handleReactionSelect} />
+                  {#if letterBuffer.length > 0}
+                    <div class="word-preview-bar">
+                      <div class="word-preview-letters">
+                        {#each parseLetters(letterBuffer) as letter}
+                          <span class="preview-letter-square">{letter}</span>
+                        {/each}
+                      </div>
+                      <button class="word-clear-btn" onclick={clearLetterBuffer} title="Clear">✕</button>
+                      <button class="word-react-btn" onclick={sendWordReaction}>React</button>
+                    </div>
+                  {/if}
+                </div>
+              {/if}
+            </div>
+          </div>
         </div>
       </div>
     {/each}
@@ -114,11 +210,6 @@
     gap: 12px;
     padding: 6px 8px;
     border-radius: 6px;
-    transition: background-color 0.1s;
-  }
-
-  .message:hover {
-    background: var(--message-hover);
   }
 
   .avatar {
@@ -161,10 +252,69 @@
     color: var(--text-muted);
   }
 
+  .bubble {
+    display: inline-block;
+    max-width: 100%;
+    background: var(--bg-secondary);
+    border-radius: 12px;
+    padding: 8px 12px;
+    margin-top: 4px;
+  }
+
+  .bubble.own-bubble {
+    background: rgba(88, 101, 242, 0.15);
+  }
+
   .content {
     color: var(--text-primary);
     word-break: break-word;
     white-space: pre-wrap;
+  }
+
+  .reactions-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 4px;
+    min-height: 24px;
+  }
+
+  .reaction-picker-anchor {
+    position: relative;
+  }
+
+  .add-reaction-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 2px 8px;
+    border-radius: 12px;
+    border: 1px dashed var(--border);
+    background: transparent;
+    cursor: pointer;
+    color: var(--text-muted);
+    font-size: 12px;
+    font-weight: 600;
+    transition: background-color 0.15s, border-color 0.15s;
+  }
+
+  .add-reaction-btn:hover {
+    background: var(--bg-tertiary);
+    border-color: var(--text-muted);
+    color: var(--text-primary);
+  }
+
+  .plus-icon {
+    font-size: 14px;
+    line-height: 1;
+  }
+
+  .picker-wrapper {
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    margin-bottom: 4px;
+    z-index: 100;
   }
 
   .letter-square {
@@ -181,5 +331,70 @@
     font-family: 'Segoe UI', sans-serif;
     vertical-align: middle;
     margin: 0 1px;
+  }
+
+  .word-preview-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 8px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-top: none;
+    border-radius: 0 0 10px 10px;
+  }
+
+  .word-preview-letters {
+    display: flex;
+    gap: 2px;
+    flex: 1;
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+
+  .preview-letter-square {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    background: #5865f2;
+    border-radius: 4px;
+    color: white;
+    font-weight: 700;
+    font-size: 13px;
+    font-family: 'Segoe UI', sans-serif;
+  }
+
+  .word-clear-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 14px;
+    padding: 2px 4px;
+    border-radius: 4px;
+    line-height: 1;
+  }
+
+  .word-clear-btn:hover {
+    color: var(--text-primary);
+    background: var(--bg-tertiary);
+  }
+
+  .word-react-btn {
+    background: #5865f2;
+    border: none;
+    color: white;
+    font-weight: 600;
+    font-size: 12px;
+    padding: 4px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .word-react-btn:hover {
+    background: #4752c4;
   }
 </style>

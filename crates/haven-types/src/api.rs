@@ -45,4 +45,19 @@ pub struct MessageResponse {
     pub ciphertext: Vec<u8>,
     pub nonce: Vec<u8>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub reactions: Vec<ReactionGroup>,
+}
+
+// -- Reactions --
+
+#[derive(Debug, Deserialize)]
+pub struct ToggleReactionRequest {
+    pub emoji: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReactionGroup {
+    pub emoji: String,
+    pub count: usize,
+    pub user_ids: Vec<Uuid>,
 }

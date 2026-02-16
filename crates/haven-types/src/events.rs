@@ -32,6 +32,21 @@ pub enum GatewayEvent {
         username: String,
         online: bool,
     },
+
+    /// A reaction was added to a message
+    ReactionAdd {
+        message_id: Uuid,
+        user_id: Uuid,
+        username: String,
+        emoji: String,
+    },
+
+    /// A reaction was removed from a message
+    ReactionRemove {
+        message_id: Uuid,
+        user_id: Uuid,
+        emoji: String,
+    },
 }
 
 /// Commands sent FROM client TO server over WebSocket.

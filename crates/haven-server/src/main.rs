@@ -16,6 +16,7 @@ use tracing::info;
 use haven_api::auth::{self, AppState, AppStateInner};
 use haven_api::messages;
 use haven_api::middleware::require_auth;
+use haven_api::reactions;
 use haven_gateway::connection;
 use haven_gateway::dispatcher::Dispatcher;
 
@@ -70,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
     let protected_routes = Router::new()
         .route("/channels/{channel_id}/messages", get(messages::get_messages))
         .route("/channels/{channel_id}/messages", post(messages::send_message))
+        .route("/channels/{channel_id}/messages/{message_id}/reactions", post(reactions::toggle_reaction))
         .layer(middleware::from_fn(require_auth))
         .with_state(app_state);
 

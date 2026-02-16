@@ -71,6 +71,12 @@ export async function login(
 
 // -- Messages --
 
+export interface ReactionGroup {
+  emoji: string;
+  count: number;
+  user_ids: string[];
+}
+
 export interface MessageResponse {
   id: string;
   channel_id: string;
@@ -79,6 +85,7 @@ export interface MessageResponse {
   ciphertext: string;
   nonce: string;
   created_at: string;
+  reactions: ReactionGroup[];
 }
 
 export async function sendMessage(
@@ -104,4 +111,17 @@ export async function getMessages(
   limit: number = 50
 ): Promise<MessageResponse[]> {
   return request(`/channels/${channelId}/messages?limit=${limit}`);
+}
+
+// -- Reactions --
+
+export async function toggleReaction(
+  channelId: string,
+  messageId: string,
+  emoji: string
+): Promise<{ added: boolean }> {
+  return request(`/channels/${channelId}/messages/${messageId}/reactions`, {
+    method: "POST",
+    body: JSON.stringify({ emoji }),
+  });
 }

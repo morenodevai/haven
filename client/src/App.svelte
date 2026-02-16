@@ -1,6 +1,6 @@
 <script lang="ts">
   import { auth } from "./lib/stores/auth";
-  import { channelKey, loadMessages, handleIncomingMessage } from "./lib/stores/messages";
+  import { channelKey, loadMessages, handleIncomingMessage, handleReactionAdd, handleReactionRemove } from "./lib/stores/messages";
   import { Gateway } from "./lib/ipc/gateway";
   import { getBaseUrl } from "./lib/ipc/api";
   import Login from "./lib/components/auth/Login.svelte";
@@ -27,6 +27,14 @@
 
       gw.on("MessageCreate", (event) => {
         handleIncomingMessage(event);
+      });
+
+      gw.on("ReactionAdd", (event) => {
+        handleReactionAdd(event);
+      });
+
+      gw.on("ReactionRemove", (event) => {
+        handleReactionRemove(event);
       });
 
       gw.on("Disconnected", () => {

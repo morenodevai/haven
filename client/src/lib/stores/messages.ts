@@ -1,6 +1,9 @@
 import { writable, get } from "svelte/store";
 import * as api from "../ipc/api";
+import type { ReactionGroup } from "../ipc/api";
 import * as crypto from "../ipc/crypto";
+
+export type { ReactionGroup } from "../ipc/api";
 
 export interface DecryptedMessage {
   id: string;
@@ -9,6 +12,7 @@ export interface DecryptedMessage {
   authorUsername: string;
   content: string;
   timestamp: string;
+  reactions: ReactionGroup[];
 }
 
 export const messages = writable<DecryptedMessage[]>([]);
@@ -50,6 +54,7 @@ export async function loadMessages() {
           authorUsername: msg.author_username,
           content,
           timestamp: msg.created_at,
+          reactions: msg.reactions ?? [],
         });
       } catch {
         decrypted.push({
@@ -59,6 +64,7 @@ export async function loadMessages() {
           authorUsername: msg.author_username,
           content: "[Unable to decrypt]",
           timestamp: msg.created_at,
+          reactions: msg.reactions ?? [],
         });
       }
     }
@@ -97,6 +103,7 @@ export async function handleIncomingMessage(event: any) {
         authorUsername: data.author_username,
         content,
         timestamp: data.timestamp,
+        reactions: [],
       },
     ]);
   } catch {
@@ -109,9 +116,57 @@ export async function handleIncomingMessage(event: any) {
         authorUsername: data.author_username,
         content: "[Unable to decrypt]",
         timestamp: data.timestamp,
+        reactions: [],
       },
     ]);
   }
+}
+
+// -- Reaction handlers --
+
+export function handleReactionAdd(event: any) {
+  const data = event.data;
+  messages.update((msgs) =>
+    msgs.map((msg) => {
+      if (msg.id !== data.message_id) return msg;
+      const reactions = [...msg.reactions];
+      const existing = reactions.find((r) => r.emoji === data.emoji);
+      if (existing) {
+        if (!existing.user_ids.includes(data.user_id)) {
+          existing.user_ids = [...existing.user_ids, data.user_id];
+          existing.count = existing.user_ids.length;
+        }
+      } else {
+        reactions.push({
+          emoji: data.emoji,
+          count: 1,
+          user_ids: [data.user_id],
+        });
+      }
+      return { ...msg, reactions };
+    })
+  );
+}
+
+export function handleReactionRemove(event: any) {
+  const data = event.data;
+  messages.update((msgs) =>
+    msgs.map((msg) => {
+      if (msg.id !== data.message_id) return msg;
+      let reactions = msg.reactions
+        .map((r) => {
+          if (r.emoji !== data.emoji) return r;
+          const user_ids = r.user_ids.filter((id) => id !== data.user_id);
+          return { ...r, user_ids, count: user_ids.length };
+        })
+        .filter((r) => r.count > 0);
+      return { ...msg, reactions };
+    })
+  );
+}
+
+export async function toggleReaction(messageId: string, emoji: string) {
+  await api.toggleReaction(GENERAL_CHANNEL_ID, messageId, emoji);
 }
 
 function bytesToBase64(data: number[] | string): string {

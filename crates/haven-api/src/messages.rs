@@ -9,7 +9,9 @@ use axum::{
 use serde::Deserialize;
 use uuid::Uuid;
 
-use haven_types::api::{MessageResponse, SendMessageRequest};
+use std::collections::HashMap;
+
+use haven_types::api::{MessageResponse, ReactionGroup, SendMessageRequest};
 use haven_types::events::GatewayEvent;
 
 use crate::auth::AppStateInner;
@@ -65,6 +67,7 @@ pub async fn send_message(
         ciphertext: req.ciphertext,
         nonce: req.nonce,
         created_at: now,
+        reactions: vec![],
     })))
 }
 
@@ -79,6 +82,23 @@ pub async fn get_messages(
         .get_messages(&channel_id.to_string(), query.limit)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // Batch-fetch reactions for all messages
+    let message_ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+    let reaction_rows = state
+        .db
+        .get_reactions_for_messages(&message_ids)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Group reactions by message_id -> emoji -> user_ids
+    let mut reaction_map: HashMap<String, HashMap<String, Vec<Uuid>>> = HashMap::new();
+    for r in &reaction_rows {
+        let emoji_map = reaction_map.entry(r.message_id.clone()).or_default();
+        let user_ids = emoji_map.entry(r.emoji.clone()).or_default();
+        if let Ok(uid) = r.user_id.parse::<Uuid>() {
+            user_ids.push(uid);
+        }
+    }
+
     let messages: Vec<MessageResponse> = rows
         .into_iter()
         .map(|row| {
@@ -86,6 +106,20 @@ pub async fn get_messages(
                 .db
                 .get_username_by_id(&row.author_id)
                 .unwrap_or_else(|_| "unknown".into());
+
+            let reactions = reaction_map
+                .get(&row.id)
+                .map(|emoji_map| {
+                    emoji_map
+                        .iter()
+                        .map(|(emoji, user_ids)| ReactionGroup {
+                            emoji: emoji.clone(),
+                            count: user_ids.len(),
+                            user_ids: user_ids.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
 
             MessageResponse {
                 id: row.id.parse().unwrap_or_default(),
@@ -98,6 +132,7 @@ pub async fn get_messages(
                     .created_at
                     .parse::<chrono::DateTime<chrono::Utc>>()
                     .unwrap_or_default(),
+                reactions,
             }
         })
         .collect();

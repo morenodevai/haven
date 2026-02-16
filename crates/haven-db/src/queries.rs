@@ -1,4 +1,4 @@
-use crate::models::{MessageRow, UserRow};
+use crate::models::{MessageRow, ReactionRow, UserRow};
 use crate::Database;
 use anyhow::{Result, anyhow};
 use rusqlite::Connection;
@@ -53,6 +53,77 @@ impl Database {
                 row.get(0)
             })
             .map_err(|_| anyhow!("User not found: {}", id))
+        })
+    }
+
+    // -- Reactions --
+
+    /// Toggle a reaction: removes if exists, inserts if not.
+    /// Returns (added, Option<id>) — added=true means inserted, added=false means removed.
+    pub fn toggle_reaction(
+        &self,
+        id: &str,
+        message_id: &str,
+        user_id: &str,
+        emoji: &str,
+    ) -> Result<(bool, Option<String>)> {
+        self.with_conn(|conn| {
+            // Check if reaction already exists
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM reactions WHERE message_id = ?1 AND user_id = ?2 AND emoji = ?3",
+                    rusqlite::params![message_id, user_id, emoji],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            if let Some(existing_id) = existing {
+                // Remove existing reaction
+                conn.execute("DELETE FROM reactions WHERE id = ?1", [&existing_id])?;
+                Ok((false, Some(existing_id)))
+            } else {
+                // Insert new reaction
+                conn.execute(
+                    "INSERT INTO reactions (id, message_id, user_id, emoji) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![id, message_id, user_id, emoji],
+                )?;
+                Ok((true, Some(id.to_string())))
+            }
+        })
+    }
+
+    /// Batch-fetch reactions for a set of message IDs.
+    pub fn get_reactions_for_messages(&self, message_ids: &[String]) -> Result<Vec<ReactionRow>> {
+        if message_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        self.with_conn(|conn| {
+            let placeholders: Vec<String> = (1..=message_ids.len()).map(|i| format!("?{}", i)).collect();
+            let sql = format!(
+                "SELECT id, message_id, user_id, emoji, created_at FROM reactions WHERE message_id IN ({})",
+                placeholders.join(", ")
+            );
+
+            let mut stmt = conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::types::ToSql> = message_ids
+                .iter()
+                .map(|id| id as &dyn rusqlite::types::ToSql)
+                .collect();
+
+            let rows = stmt
+                .query_map(params.as_slice(), |row| {
+                    Ok(ReactionRow {
+                        id: row.get(0)?,
+                        message_id: row.get(1)?,
+                        user_id: row.get(2)?,
+                        emoji: row.get(3)?,
+                        created_at: row.get(4)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            Ok(rows)
         })
     }
 }

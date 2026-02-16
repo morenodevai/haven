@@ -16,3 +16,11 @@ pub struct MessageRow {
     pub nonce: Vec<u8>,
     pub created_at: String,
 }
+
+pub struct ReactionRow {
+    pub id: String,
+    pub message_id: String,
+    pub user_id: String,
+    pub emoji: String,
+    pub created_at: String,
+}
