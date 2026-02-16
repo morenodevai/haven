@@ -9,6 +9,7 @@
   let container: HTMLDivElement;
   let reactionPickerMsgId: string | null = $state(null);
   let letterBuffer: string = $state("");
+  let lightboxSrc: string | null = $state(null);
 
   // Auto-scroll to bottom when new messages arrive
   $effect(() => {
@@ -124,7 +125,17 @@
             <span class="time">{formatTime(msg.timestamp)}</span>
           </div>
           <div class="bubble" class:own-bubble={isOwnMessage(msg)}>
-            <div class="content">{#each parseContent(msg.content) as seg}{#if seg.type === "letter"}<span class="letter-square">{getLetterChar(seg.value)}</span>{:else}{seg.value}{/if}{/each}</div>
+            {#if msg.imageData}
+              <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_noninteractive_element_interactions -->
+              <img
+                class="chat-image"
+                src={msg.imageData}
+                alt={msg.imageName || "image"}
+                onclick={() => lightboxSrc = msg.imageData!}
+              />
+            {:else}
+              <div class="content">{#each parseContent(msg.content) as seg}{#if seg.type === "letter"}<span class="letter-square">{getLetterChar(seg.value)}</span>{:else}{seg.value}{/if}{/each}</div>
+            {/if}
           </div>
           <div class="reactions-row">
             {#each msg.reactions as reaction}
@@ -173,6 +184,13 @@
     {/each}
   {/if}
 </div>
+
+{#if lightboxSrc}
+  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+  <div class="lightbox-backdrop" onclick={() => lightboxSrc = null}>
+    <img class="lightbox-image" src={lightboxSrc} alt="Full size" />
+  </div>
+{/if}
 
 <style>
   .message-list {
@@ -269,6 +287,37 @@
     color: var(--text-primary);
     word-break: break-word;
     white-space: pre-wrap;
+  }
+
+  .chat-image {
+    max-width: 400px;
+    max-height: 300px;
+    border-radius: 8px;
+    cursor: pointer;
+    display: block;
+    object-fit: contain;
+  }
+
+  .chat-image:hover {
+    opacity: 0.9;
+  }
+
+  .lightbox-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.85);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    cursor: pointer;
+  }
+
+  .lightbox-image {
+    max-width: 90vw;
+    max-height: 90vh;
+    object-fit: contain;
+    border-radius: 4px;
   }
 
   .reactions-row {

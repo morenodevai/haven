@@ -13,6 +13,30 @@ export interface DecryptedMessage {
   content: string;
   timestamp: string;
   reactions: ReactionGroup[];
+  imageData?: string;
+  imageName?: string;
+}
+
+/** After decryption, detect image envelopes and extract fields. */
+function parseDecryptedContent(plaintext: string): {
+  content: string;
+  imageData?: string;
+  imageName?: string;
+} {
+  try {
+    const parsed = JSON.parse(plaintext);
+    if (parsed && parsed.type === "image" && typeof parsed.data === "string") {
+      const mime = parsed.mime || "image/jpeg";
+      return {
+        content: parsed.name || "image",
+        imageData: `data:${mime};base64,${parsed.data}`,
+        imageName: parsed.name,
+      };
+    }
+  } catch {
+    // Not JSON — treat as plain text
+  }
+  return { content: plaintext };
 }
 
 export const messages = writable<DecryptedMessage[]>([]);
@@ -46,13 +70,16 @@ export async function loadMessages() {
         const ciphertextB64 = bytesToBase64(msg.ciphertext);
         const nonceB64 = bytesToBase64(msg.nonce);
 
-        const content = await crypto.decrypt(key, ciphertextB64, nonceB64);
+        const plaintext = await crypto.decrypt(key, ciphertextB64, nonceB64);
+        const parsed = parseDecryptedContent(plaintext);
         decrypted.push({
           id: msg.id,
           channelId: msg.channel_id,
           authorId: msg.author_id,
           authorUsername: msg.author_username,
-          content,
+          content: parsed.content,
+          imageData: parsed.imageData,
+          imageName: parsed.imageName,
           timestamp: msg.created_at,
           reactions: msg.reactions ?? [],
         });
@@ -92,7 +119,8 @@ export async function handleIncomingMessage(event: any) {
   try {
     const ciphertextB64 = bytesToBase64(data.ciphertext);
     const nonceB64 = bytesToBase64(data.nonce);
-    const content = await crypto.decrypt(key, ciphertextB64, nonceB64);
+    const plaintext = await crypto.decrypt(key, ciphertextB64, nonceB64);
+    const parsed = parseDecryptedContent(plaintext);
 
     messages.update((msgs) => [
       ...msgs,
@@ -101,7 +129,9 @@ export async function handleIncomingMessage(event: any) {
         channelId: data.channel_id,
         authorId: data.author_id,
         authorUsername: data.author_username,
-        content,
+        content: parsed.content,
+        imageData: parsed.imageData,
+        imageName: parsed.imageName,
         timestamp: data.timestamp,
         reactions: [],
       },
