@@ -1,0 +1,107 @@
+let baseUrl = "http://localhost:3000";
+
+export function setBaseUrl(url: string) {
+  baseUrl = url;
+}
+
+export function getBaseUrl(): string {
+  return baseUrl;
+}
+
+async function request<T>(
+  path: string,
+  options: RequestInit = {}
+): Promise<T> {
+  const token = localStorage.getItem("haven_token");
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...(options.headers as Record<string, string>),
+  };
+
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+
+  const res = await fetch(`${baseUrl}${path}`, {
+    ...options,
+    headers,
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`${res.status}: ${text}`);
+  }
+
+  return res.json();
+}
+
+// -- Auth --
+
+export interface RegisterResponse {
+  user_id: string;
+  token: string;
+}
+
+export interface LoginResponse {
+  user_id: string;
+  username: string;
+  token: string;
+}
+
+export async function register(
+  username: string,
+  password: string
+): Promise<RegisterResponse> {
+  return request("/auth/register", {
+    method: "POST",
+    body: JSON.stringify({ username, password }),
+  });
+}
+
+export async function login(
+  username: string,
+  password: string
+): Promise<LoginResponse> {
+  return request("/auth/login", {
+    method: "POST",
+    body: JSON.stringify({ username, password }),
+  });
+}
+
+// -- Messages --
+
+export interface MessageResponse {
+  id: string;
+  channel_id: string;
+  author_id: string;
+  author_username: string;
+  ciphertext: string;
+  nonce: string;
+  created_at: string;
+}
+
+export async function sendMessage(
+  channelId: string,
+  ciphertext: string,
+  nonce: string
+): Promise<MessageResponse> {
+  // Server expects raw bytes, but we send base64 encoded
+  const ciphertextBytes = Array.from(atob(ciphertext), (c) => c.charCodeAt(0));
+  const nonceBytes = Array.from(atob(nonce), (c) => c.charCodeAt(0));
+
+  return request(`/channels/${channelId}/messages`, {
+    method: "POST",
+    body: JSON.stringify({
+      ciphertext: ciphertextBytes,
+      nonce: nonceBytes,
+    }),
+  });
+}
+
+export async function getMessages(
+  channelId: string,
+  limit: number = 50
+): Promise<MessageResponse[]> {
+  return request(`/channels/${channelId}/messages?limit=${limit}`);
+}
