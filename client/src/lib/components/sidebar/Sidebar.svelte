@@ -1,5 +1,6 @@
 <script lang="ts">
   import { auth, logout } from "../../stores/auth";
+  import VoiceChannel from "../voice/VoiceChannel.svelte";
 </script>
 
 <div class="sidebar">
@@ -13,6 +14,8 @@
       <span class="hash">#</span>
       general
     </div>
+
+    <VoiceChannel />
   </div>
 
   <div class="user-panel">
@@ -23,9 +26,10 @@
       <div class="user-name">{$auth.username}</div>
     </div>
     <button class="logout-btn" onclick={logout} title="Log out">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9"/>
       </svg>
+      <span>Log out</span>
     </button>
   </div>
 </div>
@@ -127,10 +131,12 @@
     background: none;
     border: none;
     color: var(--text-muted);
-    padding: 6px;
+    padding: 6px 8px;
     border-radius: 4px;
     display: flex;
     align-items: center;
+    gap: 4px;
+    font-size: 11px;
   }
 
   .logout-btn:hover {

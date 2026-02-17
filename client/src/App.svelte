@@ -1,6 +1,7 @@
 <script lang="ts">
   import { auth } from "./lib/stores/auth";
   import { channelKey, loadMessages, handleIncomingMessage, handleReactionAdd, handleReactionRemove } from "./lib/stores/messages";
+  import { initVoice, handleVoiceStateUpdate, handleVoiceSignal, handleVoiceAudioData, cleanupVoice } from "./lib/stores/voice";
   import { Gateway } from "./lib/ipc/gateway";
   import { getBaseUrl } from "./lib/ipc/api";
   import Login from "./lib/components/auth/Login.svelte";
@@ -37,14 +38,28 @@
         handleReactionRemove(event);
       });
 
+      gw.on("VoiceStateUpdate", (event) => {
+        handleVoiceStateUpdate(event);
+      });
+
+      gw.on("VoiceSignal", (event) => {
+        handleVoiceSignal(event);
+      });
+
+      gw.on("VoiceAudioData", (event) => {
+        handleVoiceAudioData(event);
+      });
+
       gw.on("Disconnected", () => {
         connected = false;
       });
 
       gw.connect();
       gateway = gw;
+      initVoice(gw, $auth.userId!);
 
       return () => {
+        cleanupVoice();
         gw.disconnect();
         gateway = null;
         connected = false;

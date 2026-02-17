@@ -9,6 +9,7 @@ export class Gateway {
   private ws: WebSocket | null = null;
   private handlers: Map<string, EventHandler[]> = new Map();
   private reconnectTimer: number | null = null;
+  private closed = false;
   private url: string;
   private token: string;
 
@@ -18,6 +19,7 @@ export class Gateway {
   }
 
   connect() {
+    this.closed = false;
     this.ws = new WebSocket(this.url);
 
     this.ws.onopen = () => {
@@ -38,6 +40,9 @@ export class Gateway {
     };
 
     this.ws.onclose = () => {
+      if (this.closed) {
+        return;
+      }
       this.emit("Disconnected", { type: "Disconnected", data: {} });
       // Auto-reconnect after 3 seconds
       this.reconnectTimer = window.setTimeout(() => this.connect(), 3000);
@@ -49,6 +54,7 @@ export class Gateway {
   }
 
   disconnect() {
+    this.closed = true;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;

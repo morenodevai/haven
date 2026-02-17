@@ -1,7 +1,7 @@
 <script lang="ts">
   import { login, register, authError } from "../../stores/auth";
   import { generateKey } from "../../ipc/crypto";
-  import { setChannelKey } from "../../stores/messages";
+  import { setChannelKey, DEFAULT_CHANNEL_KEY } from "../../stores/messages";
 
   let username = $state("");
   let password = $state("");
@@ -24,6 +24,7 @@
       // Check if we have a channel key
       const savedKey = localStorage.getItem("haven_channel_key");
       if (!savedKey) {
+        channelKeyInput = DEFAULT_CHANNEL_KEY;
         showKeySetup = true;
         loading = false;
         return;

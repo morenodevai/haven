@@ -47,6 +47,28 @@ pub enum GatewayEvent {
         user_id: Uuid,
         emoji: String,
     },
+
+    /// Voice channel state update (join/leave/mute/deafen)
+    VoiceStateUpdate {
+        channel_id: Uuid,
+        user_id: Uuid,
+        username: String,
+        session_id: Option<String>,
+        self_mute: bool,
+        self_deaf: bool,
+    },
+
+    /// Voice signaling message targeted to a specific user
+    VoiceSignal {
+        from_user_id: Uuid,
+        signal: VoiceSignalPayload,
+    },
+
+    /// Server-relayed voice audio data
+    VoiceAudioData {
+        from_user_id: Uuid,
+        data: String,
+    },
 }
 
 /// Commands sent FROM client TO server over WebSocket.
@@ -58,4 +80,35 @@ pub enum GatewayCommand {
 
     /// Indicate typing in a channel
     StartTyping { channel_id: Uuid },
+
+    /// Join a voice channel
+    VoiceJoin { channel_id: Uuid },
+
+    /// Leave the current voice channel
+    VoiceLeave,
+
+    /// Update self-mute/deafen state
+    VoiceStateSet { self_mute: bool, self_deaf: bool },
+
+    /// Send a voice signaling message to a specific peer
+    VoiceSignalSend {
+        target_user_id: Uuid,
+        signal: VoiceSignalPayload,
+    },
+
+    /// Send voice audio data to be relayed to other participants
+    VoiceData { data: String },
+}
+
+/// WebRTC signaling payload relayed between peers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "signal_type")]
+pub enum VoiceSignalPayload {
+    Offer { sdp: String },
+    Answer { sdp: String },
+    IceCandidate {
+        candidate: String,
+        sdp_mid: Option<String>,
+        sdp_m_line_index: Option<u16>,
+    },
 }

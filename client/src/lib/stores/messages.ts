@@ -45,6 +45,10 @@ export const channelKey = writable<string | null>(null);
 // Default channel ID (seeded in migrations)
 export const GENERAL_CHANNEL_ID = "00000000-0000-0000-0000-000000000001";
 
+// Default shared key — all users use the same key for MVP
+// 32 bytes (AES-256) base64-encoded
+export const DEFAULT_CHANNEL_KEY = "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=";
+
 // Restore key from localStorage
 const savedKey = localStorage.getItem("haven_channel_key");
 if (savedKey) {

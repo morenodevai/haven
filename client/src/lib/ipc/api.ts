@@ -1,4 +1,4 @@
-let baseUrl = "http://localhost:3210";
+let baseUrl = "http://72.49.142.48:3210";
 
 export function setBaseUrl(url: string) {
   baseUrl = url;

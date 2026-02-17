@@ -45,6 +45,10 @@ pub fn run(conn: &Connection) -> Result<()> {
         -- Seed the default general channel
         INSERT OR IGNORE INTO channels (id, name)
             VALUES ('00000000-0000-0000-0000-000000000001', 'general');
+
+        -- Seed the default voice channel
+        INSERT OR IGNORE INTO channels (id, name)
+            VALUES ('00000000-0000-0000-0000-000000000002', 'Voice');
         ",
     )?;
 
