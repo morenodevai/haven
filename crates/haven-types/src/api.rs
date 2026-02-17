@@ -32,8 +32,8 @@ pub struct LoginResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct SendMessageRequest {
-    pub ciphertext: Vec<u8>,
-    pub nonce: Vec<u8>,
+    pub ciphertext: String,
+    pub nonce: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -42,8 +42,8 @@ pub struct MessageResponse {
     pub channel_id: Uuid,
     pub author_id: Uuid,
     pub author_username: String,
-    pub ciphertext: Vec<u8>,
-    pub nonce: Vec<u8>,
+    pub ciphertext: String,
+    pub nonce: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub reactions: Vec<ReactionGroup>,
 }

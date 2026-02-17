@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
@@ -6,10 +7,10 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use serde::Deserialize;
 use uuid::Uuid;
-
-use std::collections::HashMap;
 
 use haven_types::api::{MessageResponse, ReactionGroup, SendMessageRequest};
 use haven_types::events::GatewayEvent;
@@ -35,14 +36,17 @@ pub async fn send_message(
 ) -> Result<impl IntoResponse, StatusCode> {
     let message_id = Uuid::new_v4();
 
+    let ciphertext_bytes = B64.decode(&req.ciphertext).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let nonce_bytes = B64.decode(&req.nonce).map_err(|_| StatusCode::BAD_REQUEST)?;
+
     state
         .db
         .insert_message(
             &message_id.to_string(),
             &channel_id.to_string(),
             &claims.sub.to_string(),
-            &req.ciphertext,
-            &req.nonce,
+            &ciphertext_bytes,
+            &nonce_bytes,
         )
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -126,8 +130,8 @@ pub async fn get_messages(
                 channel_id: row.channel_id.parse().unwrap_or_default(),
                 author_id: row.author_id.parse().unwrap_or_default(),
                 author_username,
-                ciphertext: row.ciphertext,
-                nonce: row.nonce,
+                ciphertext: B64.encode(&row.ciphertext),
+                nonce: B64.encode(&row.nonce),
                 created_at: row
                     .created_at
                     .parse::<chrono::DateTime<chrono::Utc>>()

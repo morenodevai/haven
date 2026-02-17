@@ -14,8 +14,8 @@ pub enum GatewayEvent {
         channel_id: Uuid,
         author_id: Uuid,
         author_username: String,
-        ciphertext: Vec<u8>,
-        nonce: Vec<u8>,
+        ciphertext: String,
+        nonce: String,
         timestamp: chrono::DateTime<chrono::Utc>,
     },
 

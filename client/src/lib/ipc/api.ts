@@ -93,16 +93,9 @@ export async function sendMessage(
   ciphertext: string,
   nonce: string
 ): Promise<MessageResponse> {
-  // Server expects raw bytes, but we send base64 encoded
-  const ciphertextBytes = Array.from(atob(ciphertext), (c) => c.charCodeAt(0));
-  const nonceBytes = Array.from(atob(nonce), (c) => c.charCodeAt(0));
-
   return request(`/channels/${channelId}/messages`, {
     method: "POST",
-    body: JSON.stringify({
-      ciphertext: ciphertextBytes,
-      nonce: nonceBytes,
-    }),
+    body: JSON.stringify({ ciphertext, nonce }),
   });
 }
 

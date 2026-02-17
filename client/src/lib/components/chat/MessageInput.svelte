@@ -84,48 +84,20 @@
     if (!file) return;
 
     try {
-      const { dataUrl, base64, mime } = await resizeImage(file);
+      const dataUrl = await readFileAsDataUrl(file);
+      const base64 = dataUrl.split(",")[1];
+      const mime = file.type || "image/png";
       stagedImage = { dataUrl, base64, mime, name: file.name };
     } catch (err) {
       console.error("Failed to process image:", err);
     }
-    // Reset so the same file can be re-selected
     target.value = "";
   }
 
-  function resizeImage(file: File): Promise<{ dataUrl: string; base64: string; mime: string }> {
+  function readFileAsDataUrl(file: File): Promise<string> {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
-      reader.onload = () => {
-        const img = new Image();
-        img.onload = () => {
-          const MAX = 1920;
-          let { width, height } = img;
-
-          if (width > MAX || height > MAX) {
-            if (width > height) {
-              height = Math.round(height * (MAX / width));
-              width = MAX;
-            } else {
-              width = Math.round(width * (MAX / height));
-              height = MAX;
-            }
-          }
-
-          const canvas = document.createElement("canvas");
-          canvas.width = width;
-          canvas.height = height;
-          const ctx = canvas.getContext("2d")!;
-          ctx.drawImage(img, 0, 0, width, height);
-
-          const mime = "image/jpeg";
-          const dataUrl = canvas.toDataURL(mime, 0.8);
-          const base64 = dataUrl.split(",")[1];
-          resolve({ dataUrl, base64, mime });
-        };
-        img.onerror = reject;
-        img.src = reader.result as string;
-      };
+      reader.onload = () => resolve(reader.result as string);
       reader.onerror = reject;
       reader.readAsDataURL(file);
     });
@@ -136,7 +108,7 @@
 
 <input
   type="file"
-  accept="image/*"
+  accept="image/*,image/gif"
   class="hidden-file-input"
   bind:this={fileInputEl}
   onchange={handleFileSelect}

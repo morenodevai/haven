@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    extract::{State, WebSocketUpgrade},
+    extract::{State, WebSocketUpgrade, DefaultBodyLimit},
     middleware,
     response::IntoResponse,
     routing::{get, post},
@@ -83,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(public_routes)
         .merge(protected_routes)
         .merge(ws_route)
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50MB
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
 

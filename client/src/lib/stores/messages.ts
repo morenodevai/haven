@@ -70,11 +70,7 @@ export async function loadMessages() {
 
     for (const msg of raw) {
       try {
-        // Convert byte array to base64
-        const ciphertextB64 = bytesToBase64(msg.ciphertext);
-        const nonceB64 = bytesToBase64(msg.nonce);
-
-        const plaintext = await crypto.decrypt(key, ciphertextB64, nonceB64);
+        const plaintext = await crypto.decrypt(key, msg.ciphertext, msg.nonce);
         const parsed = parseDecryptedContent(plaintext);
         decrypted.push({
           id: msg.id,
@@ -121,9 +117,7 @@ export async function handleIncomingMessage(event: any) {
 
   const data = event.data;
   try {
-    const ciphertextB64 = bytesToBase64(data.ciphertext);
-    const nonceB64 = bytesToBase64(data.nonce);
-    const plaintext = await crypto.decrypt(key, ciphertextB64, nonceB64);
+    const plaintext = await crypto.decrypt(key, data.ciphertext, data.nonce);
     const parsed = parseDecryptedContent(plaintext);
 
     messages.update((msgs) => [
@@ -163,19 +157,20 @@ export function handleReactionAdd(event: any) {
   messages.update((msgs) =>
     msgs.map((msg) => {
       if (msg.id !== data.message_id) return msg;
-      const reactions = [...msg.reactions];
-      const existing = reactions.find((r) => r.emoji === data.emoji);
-      if (existing) {
-        if (!existing.user_ids.includes(data.user_id)) {
-          existing.user_ids = [...existing.user_ids, data.user_id];
-          existing.count = existing.user_ids.length;
-        }
-      } else {
-        reactions.push({
-          emoji: data.emoji,
-          count: 1,
-          user_ids: [data.user_id],
+      const hasGroup = msg.reactions.some((r) => r.emoji === data.emoji);
+      let reactions: ReactionGroup[];
+      if (hasGroup) {
+        reactions = msg.reactions.map((r) => {
+          if (r.emoji !== data.emoji) return r;
+          if (r.user_ids.includes(data.user_id)) return r;
+          const user_ids = [...r.user_ids, data.user_id];
+          return { emoji: r.emoji, count: user_ids.length, user_ids };
         });
+      } else {
+        reactions = [
+          ...msg.reactions,
+          { emoji: data.emoji, count: 1, user_ids: [data.user_id] },
+        ];
       }
       return { ...msg, reactions };
     })
@@ -203,7 +198,3 @@ export async function toggleReaction(messageId: string, emoji: string) {
   await api.toggleReaction(GENERAL_CHANNEL_ID, messageId, emoji);
 }
 
-function bytesToBase64(data: number[] | string): string {
-  if (typeof data === "string") return data;
-  return btoa(String.fromCharCode(...data));
-}
