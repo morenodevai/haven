@@ -6,6 +6,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use tracing::error;
 use uuid::Uuid;
 
 use haven_types::api::ToggleReactionRequest;
@@ -22,17 +23,25 @@ pub async fn toggle_reaction(
 ) -> Result<impl IntoResponse, StatusCode> {
     let _ = channel_id; // validated by path extraction
 
+    // M2: Validate emoji length — 64 bytes is generous for any real emoji sequence
+    if req.emoji.is_empty() || req.emoji.len() > 64 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let reaction_id = Uuid::new_v4();
 
-    let (added, _id) = state
-        .db
-        .toggle_reaction(
-            &reaction_id.to_string(),
-            &message_id.to_string(),
-            &claims.sub.to_string(),
-            &req.emoji,
-        )
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Run blocking DB call off the async runtime
+    let db = state.clone();
+    let rid = reaction_id.to_string();
+    let mid = message_id.to_string();
+    let uid = claims.sub.to_string();
+    let emoji = req.emoji.clone();
+    let (added, _id) = tokio::task::spawn_blocking(move || {
+        db.db.toggle_reaction(&rid, &mid, &uid, &emoji)
+    })
+    .await
+    .map_err(|e| { error!("spawn_blocking join error: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if added {
         state.dispatcher.broadcast(GatewayEvent::ReactionAdd {

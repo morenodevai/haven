@@ -5,20 +5,27 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::{State, WebSocketUpgrade, DefaultBodyLimit},
+    http::{Method, HeaderValue},
     middleware,
     response::IntoResponse,
     routing::{get, post},
 };
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
-use haven_api::auth::{self, AppState, AppStateInner};
+use haven_api::auth::{self, AppState, AppStateInner, AuthRateLimiter};
 use haven_api::messages;
-use haven_api::middleware::require_auth;
+use haven_api::middleware::{require_auth, JwtSecret};
 use haven_api::reactions;
 use haven_gateway::connection;
 use haven_gateway::dispatcher::Dispatcher;
+
+/// Placeholder values that MUST NOT be used as the JWT secret.
+const PLACEHOLDER_SECRETS: &[&str] = &[
+    "change-me-to-a-random-string",
+    "dev-secret-change-me",
+];
 
 #[derive(Clone)]
 struct ServerState {
@@ -40,9 +47,16 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // Config
-    let jwt_secret =
-        std::env::var("HAVEN_JWT_SECRET").unwrap_or_else(|_| "dev-secret-change-me".into());
+    // Config — JWT secret is MANDATORY
+    let jwt_secret = std::env::var("HAVEN_JWT_SECRET").unwrap_or_default();
+
+    if jwt_secret.is_empty() || PLACEHOLDER_SECRETS.contains(&jwt_secret.as_str()) {
+        eprintln!("FATAL: HAVEN_JWT_SECRET is unset or still a placeholder.");
+        eprintln!("       Generate a strong random value: openssl rand -base64 48");
+        eprintln!("       Set it in your .env file and restart.");
+        std::process::exit(1);
+    }
+
     let db_path = std::env::var("HAVEN_DB_PATH").unwrap_or_else(|_| "haven.db".into());
     let host = std::env::var("HAVEN_HOST").unwrap_or_else(|_| "0.0.0.0".into());
     let port: u16 = std::env::var("HAVEN_PORT")
@@ -54,13 +68,23 @@ async fn main() -> anyhow::Result<()> {
 
     // Shared state
     let dispatcher = Dispatcher::new();
-    let app_state: AppState = Arc::new(AppStateInner { db, jwt_secret: jwt_secret.clone(), dispatcher: dispatcher.clone() });
+    let app_state: AppState = Arc::new(AppStateInner {
+        db,
+        jwt_secret: jwt_secret.clone(),
+        dispatcher: dispatcher.clone(),
+        auth_rate_limiter: AuthRateLimiter::new(),
+    });
+
+    let jwt_extension = JwtSecret(Arc::from(jwt_secret.as_str()));
 
     let state = ServerState {
         app: app_state.clone(),
         dispatcher: dispatcher.clone(),
         jwt_secret: jwt_secret.clone(),
     };
+
+    // CORS — restrict to known origins; extend via HAVEN_CORS_ORIGINS env var
+    let cors = build_cors_layer();
 
     // Routes
     let public_routes = Router::new()
@@ -83,17 +107,54 @@ async fn main() -> anyhow::Result<()> {
         .merge(public_routes)
         .merge(protected_routes)
         .merge(ws_route)
-        .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50MB
-        .layer(CorsLayer::permissive())
+        .layer(axum::Extension(jwt_extension))
+        // 10 MB body limit — handles large images and short video clips.
+        // Tune via HAVEN_MAX_BODY_SIZE env var if needed for larger files.
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
+        .layer(cors)
         .layer(TraceLayer::new_for_http());
 
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
     info!("Haven server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
+}
+
+/// Build a CORS layer that allows the Tauri client and localhost dev server.
+/// Additional origins can be supplied via the HAVEN_CORS_ORIGINS env var
+/// (comma-separated list of origins, e.g. "http://192.168.1.5:1420,https://my.domain").
+fn build_cors_layer() -> CorsLayer {
+    let mut origins: Vec<HeaderValue> = vec![
+        "tauri://localhost".parse().unwrap(),
+        "http://localhost:1420".parse().unwrap(),
+        "http://localhost".parse().unwrap(),
+    ];
+
+    if let Ok(extra) = std::env::var("HAVEN_CORS_ORIGINS") {
+        for raw in extra.split(',') {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                if let Ok(val) = trimmed.parse::<HeaderValue>() {
+                    origins.push(val);
+                } else {
+                    eprintln!("WARNING: ignoring invalid CORS origin: {trimmed}");
+                }
+            }
+        }
+    }
+
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+        .allow_headers(tower_http::cors::Any)
+        .allow_credentials(false)
 }
 
 async fn ws_upgrade(

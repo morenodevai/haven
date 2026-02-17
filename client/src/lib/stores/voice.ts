@@ -16,7 +16,6 @@ export interface VoiceParticipant {
 // --- Constants ---
 
 const VOICE_CHANNEL_ID = "00000000-0000-0000-0000-000000000002";
-const CAPTURE_INTERVAL_MS = 60; // ~60ms chunks for low latency
 
 // --- Stores ---
 
@@ -38,7 +37,7 @@ let gw: Gateway | null = null;
 let myUserId: string | null = null;
 let localStream: MediaStream | null = null;
 let audioContext: AudioContext | null = null;
-let captureNode: ScriptProcessorNode | null = null;
+let captureNode: AudioWorkletNode | null = null;
 let vadInterval: number | null = null;
 
 // E2E encryption key (derived from channel key)
@@ -51,6 +50,27 @@ const playbackContexts: Map<string, {
 }> = new Map();
 
 // --- E2E Crypto helpers ---
+//
+// SECURITY LIMITATION: No forward secrecy on voice encryption.
+//
+// The current implementation reuses the static AES-GCM channel key for every
+// voice session. If this long-lived key is compromised, ALL past and future
+// voice sessions encrypted with it can be decrypted.
+//
+// Ideal fix: Ephemeral per-session ECDH key exchange.
+//   1. On VoiceJoin, each participant generates an ephemeral ECDH key pair.
+//   2. Public keys are exchanged via the signaling channel (VoiceSignalSend).
+//   3. Each pair of participants derives a shared secret via ECDH.
+//   4. The shared secret is fed into HKDF (with session-specific salt/info)
+//      to derive a unique AES-256-GCM session key.
+//   5. For group calls, use a group key agreement (e.g., TreeKEM from MLS)
+//      or a star topology where each pair has an independent session key.
+//   6. Ephemeral keys are discarded when the voice session ends, providing
+//      forward secrecy: compromise of the long-lived channel key does not
+//      reveal past voice session content.
+//
+// This is an architectural change that requires a key exchange protocol and
+// cannot be done as a simple patch. Tracked for future implementation.
 
 async function importCryptoKey(): Promise<boolean> {
   const keyB64 = get(channelKey);
@@ -150,7 +170,7 @@ export async function joinVoice() {
   voiceDeafened.set(false);
 
   // Set up audio capture and send to server
-  setupAudioCapture(localStream);
+  await setupAudioCapture(localStream);
   setupVAD(localStream);
 
   gw.send({
@@ -274,18 +294,24 @@ export function handleVoiceAudioData(event: any) {
 
 // --- Audio capture (mic → server) ---
 
-function setupAudioCapture(stream: MediaStream) {
+async function setupAudioCapture(stream: MediaStream) {
   try {
     audioContext = new AudioContext();
     const source = audioContext.createMediaStreamSource(stream);
 
-    // ScriptProcessorNode: buffer of 4096 samples, mono
-    captureNode = audioContext.createScriptProcessor(4096, 1, 1);
+    // Load the AudioWorklet processor module (replaces deprecated ScriptProcessorNode)
+    await audioContext.audioWorklet.addModule("/capture-processor.js");
 
-    captureNode.onaudioprocess = (e) => {
+    captureNode = new AudioWorkletNode(audioContext, "capture-processor", {
+      channelCount: 1,
+      numberOfInputs: 1,
+      numberOfOutputs: 0,
+    });
+
+    captureNode.port.onmessage = (e: MessageEvent) => {
       if (!gw || !get(voiceConnected) || get(voiceMuted)) return;
 
-      const inputData = e.inputBuffer.getChannelData(0);
+      const inputData: Float32Array = e.data.pcmData;
 
       // Downsample from native rate (usually 48kHz) to ~8kHz
       const sampleRate = audioContext!.sampleRate;
@@ -308,7 +334,6 @@ function setupAudioCapture(stream: MediaStream) {
     };
 
     source.connect(captureNode);
-    captureNode.connect(audioContext.destination); // Required for processing to work
   } catch (e) {
     console.error("[voice] Failed to setup audio capture:", e);
   }

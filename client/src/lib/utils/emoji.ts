@@ -1,5 +1,7 @@
 // Custom letter emoji format: [:X:] where X is A-Z or 0-9
 const CUSTOM_LETTER_RE = /^\[:.\:]$/;
+// L7: Non-global regex for test() — avoids stateful lastIndex bug with /g flag
+const CUSTOM_LETTER_MATCH_RE = /\[:.\:]/;
 const CUSTOM_LETTER_GLOBAL_RE = /\[:.\:]/g;
 
 export function isCustomLetter(emoji: string): boolean {
@@ -12,7 +14,7 @@ export function getLetterChar(emoji: string): string {
 
 // Check if a message text contains any custom letter tokens
 export function hasCustomLetters(text: string): boolean {
-  return CUSTOM_LETTER_GLOBAL_RE.test(text);
+  return CUSTOM_LETTER_MATCH_RE.test(text);
 }
 
 // Check if a string is a multi-letter word reaction (all [:X:] tokens, more than one)

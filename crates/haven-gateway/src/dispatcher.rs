@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::{RwLock, broadcast, mpsc};
@@ -23,7 +23,8 @@ pub struct Dispatcher {
 }
 
 struct DispatcherInner {
-    /// Broadcast channel for gateway events — all connected clients receive all events
+    /// Broadcast channel for gateway events — all connected clients receive all events.
+    /// Channel-scoped filtering is applied at the connection level, not here.
     broadcast_tx: broadcast::Sender<GatewayEvent>,
 
     /// Track online users: user_id -> username
@@ -34,6 +35,10 @@ struct DispatcherInner {
 
     /// Voice state: channel_id -> (user_id -> participant)
     voice_states: RwLock<HashMap<Uuid, HashMap<Uuid, VoiceParticipant>>>,
+
+    /// Per-user channel subscriptions: user_id -> set of channel_ids.
+    /// Only events for subscribed channels are forwarded to each client.
+    channel_subscriptions: RwLock<HashMap<Uuid, HashSet<Uuid>>>,
 }
 
 impl Dispatcher {
@@ -45,6 +50,7 @@ impl Dispatcher {
                 online_users: RwLock::new(HashMap::new()),
                 user_channels: RwLock::new(HashMap::new()),
                 voice_states: RwLock::new(HashMap::new()),
+                channel_subscriptions: RwLock::new(HashMap::new()),
             }),
         }
     }
@@ -83,6 +89,18 @@ impl Dispatcher {
         if let Some((_, tx)) = channels.get(&user_id) {
             let _ = tx.send(event);
         }
+    }
+
+    /// Update a user's channel subscriptions. Replaces the entire set.
+    pub async fn subscribe_channels(&self, user_id: Uuid, channel_ids: Vec<Uuid>) {
+        let mut subs = self.inner.channel_subscriptions.write().await;
+        subs.insert(user_id, channel_ids.into_iter().collect());
+    }
+
+    /// Remove all subscriptions for a user (called on disconnect).
+    async fn clear_subscriptions(&self, user_id: Uuid) {
+        let mut subs = self.inner.channel_subscriptions.write().await;
+        subs.remove(&user_id);
     }
 
     /// Register a user as online.
@@ -134,6 +152,7 @@ impl Dispatcher {
         }
 
         self.unregister_user_channel(user_id, conn_id).await;
+        self.clear_subscriptions(user_id).await;
 
         self.broadcast(GatewayEvent::PresenceUpdate {
             user_id,
@@ -163,9 +182,15 @@ impl Dispatcher {
     ) -> Vec<VoiceParticipant> {
         let mut voice_states = self.inner.voice_states.write().await;
 
-        // Remove from any existing channel first
-        for (_, participants) in voice_states.iter_mut() {
-            participants.remove(&user_id);
+        // Remove from any existing channel first, then clean up empty entries (L3)
+        let mut emptied = Vec::new();
+        for (&cid, participants) in voice_states.iter_mut() {
+            if participants.remove(&user_id).is_some() && participants.is_empty() {
+                emptied.push(cid);
+            }
+        }
+        for cid in emptied {
+            voice_states.remove(&cid);
         }
 
         let channel = voice_states.entry(channel_id).or_default();
@@ -186,16 +211,26 @@ impl Dispatcher {
     }
 
     /// Leave voice. Returns the channel_id they were in, if any.
+    /// L3: Also removes the channel entry if no participants remain.
     pub async fn voice_leave(&self, user_id: Uuid) -> Option<Uuid> {
         let mut voice_states = self.inner.voice_states.write().await;
 
+        let mut left_channel = None;
         for (&channel_id, participants) in voice_states.iter_mut() {
             if participants.remove(&user_id).is_some() {
-                return Some(channel_id);
+                left_channel = Some(channel_id);
+                break;
             }
         }
 
-        None
+        // Clean up empty channel entry
+        if let Some(channel_id) = left_channel {
+            if voice_states.get(&channel_id).map_or(false, |p| p.is_empty()) {
+                voice_states.remove(&channel_id);
+            }
+        }
+
+        left_channel
     }
 
     /// Relay voice audio data from sender to all other participants in the same channel.

@@ -7,7 +7,7 @@ impl Database {
     // -- Users --
 
     pub fn create_user(&self, id: &str, username: &str, password_hash: &str) -> Result<()> {
-        self.with_conn(|conn| {
+        self.with_conn_mut(|conn| {
             conn.execute(
                 "INSERT INTO users (id, username, password) VALUES (?1, ?2, ?3)",
                 (id, username, password_hash),
@@ -34,7 +34,7 @@ impl Database {
         ciphertext: &[u8],
         nonce: &[u8],
     ) -> Result<()> {
-        self.with_conn(|conn| {
+        self.with_conn_mut(|conn| {
             conn.execute(
                 "INSERT INTO messages (id, channel_id, author_id, ciphertext, nonce) VALUES (?1, ?2, ?3, ?4, ?5)",
                 rusqlite::params![id, channel_id, author_id, ciphertext, nonce],
@@ -67,7 +67,7 @@ impl Database {
         user_id: &str,
         emoji: &str,
     ) -> Result<(bool, Option<String>)> {
-        self.with_conn(|conn| {
+        self.with_conn_mut(|conn| {
             // Check if reaction already exists
             let existing: Option<String> = conn
                 .query_row(
@@ -165,11 +165,13 @@ fn query_user_by_id(conn: &Connection, id: &str) -> Result<Option<UserRow>> {
 }
 
 fn query_messages(conn: &Connection, channel_id: &str, limit: u32) -> Result<Vec<MessageRow>> {
+    // JOIN users to fetch author_username in a single query (eliminates N+1)
     let mut stmt = conn.prepare(
-        "SELECT id, channel_id, author_id, ciphertext, nonce, created_at
-         FROM messages
-         WHERE channel_id = ?1
-         ORDER BY created_at DESC
+        "SELECT m.id, m.channel_id, m.author_id, u.username, m.ciphertext, m.nonce, m.created_at
+         FROM messages m
+         LEFT JOIN users u ON m.author_id = u.id
+         WHERE m.channel_id = ?1
+         ORDER BY m.created_at DESC
          LIMIT ?2",
     )?;
 
@@ -179,9 +181,10 @@ fn query_messages(conn: &Connection, channel_id: &str, limit: u32) -> Result<Vec
                 id: row.get(0)?,
                 channel_id: row.get(1)?,
                 author_id: row.get(2)?,
-                ciphertext: row.get(3)?,
-                nonce: row.get(4)?,
-                created_at: row.get(5)?,
+                author_username: row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "unknown".to_string()),
+                ciphertext: row.get(4)?,
+                nonce: row.get(5)?,
+                created_at: row.get(6)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;

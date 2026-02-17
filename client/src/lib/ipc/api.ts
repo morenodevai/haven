@@ -1,7 +1,9 @@
-let baseUrl = "http://72.49.142.48:3210";
+const DEFAULT_BASE_URL = "http://72.49.142.48:3210";
+let baseUrl = localStorage.getItem("haven_base_url") ?? DEFAULT_BASE_URL;
 
 export function setBaseUrl(url: string) {
   baseUrl = url;
+  localStorage.setItem("haven_base_url", url);
 }
 
 export function getBaseUrl(): string {

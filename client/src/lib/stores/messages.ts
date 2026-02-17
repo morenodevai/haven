@@ -49,6 +49,16 @@ export const GENERAL_CHANNEL_ID = "00000000-0000-0000-0000-000000000001";
 // 32 bytes (AES-256) base64-encoded
 export const DEFAULT_CHANNEL_KEY = "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=";
 
+// SECURITY NOTE: The AES channel key is currently stored in localStorage, which
+// is accessible to any JavaScript running in the page context (XSS risk).
+// The CSP headers mitigate this, but do not fully eliminate the threat.
+//
+// Migration path (TODO):
+//   1. Wire up the Tauri-side KeyStore (haven-crypto) for secure native key storage, or
+//   2. Use tauri-plugin-store with encryption for on-disk key persistence.
+//
+// The key should also be cleared when the user logs out or switches channels.
+
 // Restore key from localStorage
 const savedKey = localStorage.getItem("haven_channel_key");
 if (savedKey) {

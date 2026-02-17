@@ -10,6 +10,7 @@ use axum::{
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use serde::Deserialize;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use haven_types::api::{MessageResponse, ReactionGroup, SendMessageRequest};
@@ -39,16 +40,17 @@ pub async fn send_message(
     let ciphertext_bytes = B64.decode(&req.ciphertext).map_err(|_| StatusCode::BAD_REQUEST)?;
     let nonce_bytes = B64.decode(&req.nonce).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    state
-        .db
-        .insert_message(
-            &message_id.to_string(),
-            &channel_id.to_string(),
-            &claims.sub.to_string(),
-            &ciphertext_bytes,
-            &nonce_bytes,
-        )
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Run blocking DB insert off the async runtime
+    let db = state.clone();
+    let cid = channel_id.to_string();
+    let mid = message_id.to_string();
+    let aid = claims.sub.to_string();
+    tokio::task::spawn_blocking(move || {
+        db.db.insert_message(&mid, &cid, &aid, &ciphertext_bytes, &nonce_bytes)
+    })
+    .await
+    .map_err(|e| { error!("spawn_blocking join error: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let now = chrono::Utc::now();
 
@@ -81,19 +83,29 @@ pub async fn get_messages(
     Query(query): Query<MessageQuery>,
     Extension(_claims): Extension<Claims>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let rows = state
-        .db
-        .get_messages(&channel_id.to_string(), query.limit)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Run all blocking DB queries off the async runtime
+    let db = state.clone();
+    let cid = channel_id.to_string();
+    let limit = query.limit.min(200);
 
-    // Batch-fetch reactions for all messages
-    let message_ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
-    let reaction_rows = state
-        .db
-        .get_reactions_for_messages(&message_ids)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let (rows, reaction_rows) = tokio::task::spawn_blocking(move || {
+        let rows = db
+            .db
+            .get_messages(&cid, limit)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Group reactions by message_id -> emoji -> user_ids
+        let message_ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        let reaction_rows = db
+            .db
+            .get_reactions_for_messages(&message_ids)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        Ok::<_, StatusCode>((rows, reaction_rows))
+    })
+    .await
+    .map_err(|e| { error!("spawn_blocking join error: {}", e); StatusCode::INTERNAL_SERVER_ERROR })??;
+
+    // Group reactions by message_id -> emoji -> user_ids (cheap in-memory work, fine on async thread)
     let mut reaction_map: HashMap<String, HashMap<String, Vec<Uuid>>> = HashMap::new();
     for r in &reaction_rows {
         let emoji_map = reaction_map.entry(r.message_id.clone()).or_default();
@@ -106,10 +118,7 @@ pub async fn get_messages(
     let messages: Vec<MessageResponse> = rows
         .into_iter()
         .map(|row| {
-            let author_username = state
-                .db
-                .get_username_by_id(&row.author_id)
-                .unwrap_or_else(|_| "unknown".into());
+            let author_username = row.author_username.clone();
 
             let reactions = reaction_map
                 .get(&row.id)
@@ -126,16 +135,28 @@ pub async fn get_messages(
                 .unwrap_or_default();
 
             MessageResponse {
-                id: row.id.parse().unwrap_or_default(),
-                channel_id: row.channel_id.parse().unwrap_or_default(),
-                author_id: row.author_id.parse().unwrap_or_default(),
+                id: row.id.parse().unwrap_or_else(|e| {
+                    warn!("Corrupt message id '{}': {}", row.id, e);
+                    Uuid::default()
+                }),
+                channel_id: row.channel_id.parse().unwrap_or_else(|e| {
+                    warn!("Corrupt channel_id '{}' on message '{}': {}", row.channel_id, row.id, e);
+                    Uuid::default()
+                }),
+                author_id: row.author_id.parse().unwrap_or_else(|e| {
+                    warn!("Corrupt author_id '{}' on message '{}': {}", row.author_id, row.id, e);
+                    Uuid::default()
+                }),
                 author_username,
                 ciphertext: B64.encode(&row.ciphertext),
                 nonce: B64.encode(&row.nonce),
                 created_at: row
                     .created_at
                     .parse::<chrono::DateTime<chrono::Utc>>()
-                    .unwrap_or_default(),
+                    .unwrap_or_else(|e| {
+                        warn!("Corrupt created_at '{}' on message '{}': {}", row.created_at, row.id, e);
+                        chrono::DateTime::default()
+                    }),
                 reactions,
             }
         })

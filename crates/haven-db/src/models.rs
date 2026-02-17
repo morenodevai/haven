@@ -12,6 +12,7 @@ pub struct MessageRow {
     pub id: String,
     pub channel_id: String,
     pub author_id: String,
+    pub author_username: String,
     pub ciphertext: Vec<u8>,
     pub nonce: Vec<u8>,
     pub created_at: String,

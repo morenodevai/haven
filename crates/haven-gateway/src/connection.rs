@@ -1,19 +1,23 @@
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::{DecodingKey, Validation, decode};
-use tracing::{info, warn};
+use tokio::sync::RwLock;
+use tracing::{info, trace, warn};
 use uuid::Uuid;
 
+use haven_types::api::Claims;
 use haven_types::events::{GatewayCommand, GatewayEvent};
 
 use crate::dispatcher::Dispatcher;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct Claims {
-    sub: Uuid,
-    username: String,
-    exp: usize,
-}
+/// Heartbeat interval: server sends a Ping every 30 seconds.
+/// If 2 consecutive Pongs are missed (~60s), the connection is dropped.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Handle a single WebSocket connection.
 pub async fn handle_connection(socket: WebSocket, dispatcher: Dispatcher, jwt_secret: String) {
@@ -51,46 +55,109 @@ pub async fn handle_connection(socket: WebSocket, dispatcher: Dispatcher, jwt_se
     let mut broadcast_rx = dispatcher.subscribe();
     let dispatcher_clone = dispatcher.clone();
 
-    // Spawn task to forward broadcasts + targeted messages -> client
+    // Per-connection channel subscriptions (shared between send and recv tasks).
+    // Events scoped to a channel_id are only forwarded if the user has subscribed.
+    let subscribed_channels: Arc<RwLock<HashSet<Uuid>>> = Arc::new(RwLock::new(HashSet::new()));
+    let send_subscriptions = subscribed_channels.clone();
+
+    // H6: Shared flag for heartbeat — recv_task sets it on Pong, send_task checks it.
+    let pong_received = Arc::new(AtomicBool::new(true)); // start as true (just connected)
+    let pong_flag_send = pong_received.clone();
+    let pong_flag_recv = pong_received.clone();
+
+    // Spawn task to forward broadcasts + targeted messages -> client, with heartbeat (H6)
     let mut send_task = tokio::spawn(async move {
+        let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+        // Skip the immediate first tick
+        heartbeat.tick().await;
+        let mut missed_heartbeats: u8 = 0;
+
         loop {
-            let event = tokio::select! {
+            tokio::select! {
                 result = broadcast_rx.recv() => {
-                    match result {
+                    let event = match result {
                         Ok(event) => event,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(_) => break,
+                    };
+
+                    // H5: Filter channel-scoped events by subscription
+                    if let Some(channel_id) = event.channel_id() {
+                        let subs = send_subscriptions.read().await;
+                        if !subs.contains(&channel_id) {
+                            continue;
+                        }
+                    }
+
+                    let text = serde_json::to_string(&event).unwrap();
+                    if sender.send(Message::Text(text.into())).await.is_err() {
+                        break;
                     }
                 }
                 result = user_rx.recv() => {
-                    match result {
+                    let event = match result {
                         Some(event) => event,
                         None => break,
+                    };
+
+                    let text = serde_json::to_string(&event).unwrap();
+                    if sender.send(Message::Text(text.into())).await.is_err() {
+                        break;
                     }
                 }
-            };
-
-            let text = serde_json::to_string(&event).unwrap();
-            if sender.send(Message::Text(text.into())).await.is_err() {
-                break;
+                _ = heartbeat.tick() => {
+                    // H6: Check if we received a Pong since the last Ping
+                    if pong_flag_send.swap(false, Ordering::Relaxed) {
+                        // Pong was received — reset miss counter
+                        missed_heartbeats = 0;
+                    } else {
+                        missed_heartbeats += 1;
+                        if missed_heartbeats >= 2 {
+                            warn!("Heartbeat timeout (missed {} pongs), dropping connection", missed_heartbeats);
+                            break;
+                        }
+                    }
+                    // Send WebSocket-level ping
+                    if sender.send(Message::Ping(vec![].into())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
 
     // Read commands from client
     let username_recv = username.clone();
+    let recv_subscriptions = subscribed_channels.clone();
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
                 Message::Text(text) => {
                     match serde_json::from_str::<GatewayCommand>(&text) {
                         Ok(cmd) => {
-                            handle_command(&dispatcher_clone, user_id, &username_recv, cmd).await;
+                            handle_command(
+                                &dispatcher_clone,
+                                user_id,
+                                &username_recv,
+                                cmd,
+                                &recv_subscriptions,
+                            )
+                            .await;
                         }
                         Err(e) => {
-                            warn!("{} ({}) bad command: {} — raw: {}", username_recv, user_id, e, &text[..text.len().min(200)]);
+                            warn!(
+                                "{} ({}) bad command: {} -- raw: {}",
+                                username_recv,
+                                user_id,
+                                e,
+                                &text[..text.len().min(200)]
+                            );
                         }
                     }
+                }
+                // H6: Pong received — signal the send_task to reset heartbeat counter
+                Message::Pong(_) => {
+                    pong_flag_recv.store(true, Ordering::Relaxed);
                 }
                 Message::Close(_) => break,
                 _ => {}
@@ -136,9 +203,33 @@ async fn wait_for_identify(
     timeout.await.ok().flatten()
 }
 
-async fn handle_command(dispatcher: &Dispatcher, user_id: Uuid, username: &str, cmd: GatewayCommand) {
+async fn handle_command(
+    dispatcher: &Dispatcher,
+    user_id: Uuid,
+    username: &str,
+    cmd: GatewayCommand,
+    subscriptions: &Arc<RwLock<HashSet<Uuid>>>,
+) {
     match cmd {
         GatewayCommand::Identify { .. } => {} // Already handled
+
+        // H5: Client subscribes to specific channels
+        GatewayCommand::Subscribe { channel_ids } => {
+            info!(
+                "{} ({}) subscribing to {} channels",
+                username,
+                user_id,
+                channel_ids.len()
+            );
+            // Update both local connection state and dispatcher state
+            {
+                let mut subs = subscriptions.write().await;
+                *subs = channel_ids.iter().copied().collect();
+            }
+            dispatcher
+                .subscribe_channels(user_id, channel_ids)
+                .await;
+        }
 
         GatewayCommand::StartTyping { channel_id } => {
             dispatcher.broadcast(GatewayEvent::TypingStart {
@@ -157,14 +248,19 @@ async fn handle_command(dispatcher: &Dispatcher, user_id: Uuid, username: &str, 
 
             // Send existing participants to the new joiner so they see who's already here
             for p in &existing {
-                dispatcher.send_to_user(user_id, GatewayEvent::VoiceStateUpdate {
-                    channel_id,
-                    user_id: p.user_id,
-                    username: p.username.clone(),
-                    session_id: Some(p.session_id.clone()),
-                    self_mute: p.self_mute,
-                    self_deaf: p.self_deaf,
-                }).await;
+                dispatcher
+                    .send_to_user(
+                        user_id,
+                        GatewayEvent::VoiceStateUpdate {
+                            channel_id,
+                            user_id: p.user_id,
+                            username: p.username.clone(),
+                            session_id: Some(p.session_id.clone()),
+                            self_mute: p.self_mute,
+                            self_deaf: p.self_deaf,
+                        },
+                    )
+                    .await;
             }
 
             // Broadcast the new joiner to everyone (including themselves)
@@ -192,7 +288,10 @@ async fn handle_command(dispatcher: &Dispatcher, user_id: Uuid, username: &str, 
             }
         }
 
-        GatewayCommand::VoiceStateSet { self_mute, self_deaf } => {
+        GatewayCommand::VoiceStateSet {
+            self_mute,
+            self_deaf,
+        } => {
             if let Some((channel_id, participant)) = dispatcher
                 .voice_update_state(user_id, self_mute, self_deaf)
                 .await
@@ -208,8 +307,14 @@ async fn handle_command(dispatcher: &Dispatcher, user_id: Uuid, username: &str, 
             }
         }
 
-        GatewayCommand::VoiceSignalSend { target_user_id, signal } => {
-            info!("{} ({}) -> voice signal to {}", username, user_id, target_user_id);
+        GatewayCommand::VoiceSignalSend {
+            target_user_id,
+            signal,
+        } => {
+            info!(
+                "{} ({}) -> voice signal to {}",
+                username, user_id, target_user_id
+            );
             dispatcher
                 .send_to_user(
                     target_user_id,
@@ -221,8 +326,14 @@ async fn handle_command(dispatcher: &Dispatcher, user_id: Uuid, username: &str, 
                 .await;
         }
 
+        // H9: Voice audio data logged at trace level, not info
         GatewayCommand::VoiceData { data } => {
-            info!("{} ({}) sending voice data ({} bytes)", username, user_id, data.len());
+            trace!(
+                "{} ({}) sending voice data ({} bytes)",
+                username,
+                user_id,
+                data.len()
+            );
             dispatcher.relay_voice_data(user_id, data).await;
         }
     }

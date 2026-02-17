@@ -71,6 +71,20 @@ pub enum GatewayEvent {
     },
 }
 
+impl GatewayEvent {
+    /// Returns the channel_id if this event is scoped to a specific channel.
+    /// Events that return `None` are global and should be delivered to all clients.
+    pub fn channel_id(&self) -> Option<Uuid> {
+        match self {
+            Self::MessageCreate { channel_id, .. } => Some(*channel_id),
+            Self::TypingStart { channel_id, .. } => Some(*channel_id),
+            Self::VoiceStateUpdate { channel_id, .. } => Some(*channel_id),
+            // Ready, PresenceUpdate, ReactionAdd/Remove, VoiceSignal, VoiceAudioData are global
+            _ => None,
+        }
+    }
+}
+
 /// Commands sent FROM client TO server over WebSocket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
@@ -98,6 +112,11 @@ pub enum GatewayCommand {
 
     /// Send voice audio data to be relayed to other participants
     VoiceData { data: String },
+
+    /// Subscribe to events for specific channels.
+    /// The server will only forward channel-scoped events (messages, typing, voice)
+    /// for channels the client has subscribed to.
+    Subscribe { channel_ids: Vec<Uuid> },
 }
 
 /// WebRTC signaling payload relayed between peers.

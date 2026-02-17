@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::{
     extract::Request,
     http::{StatusCode, header},
@@ -5,17 +7,17 @@ use axum::{
     response::Response,
 };
 use jsonwebtoken::{DecodingKey, Validation, decode};
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Claims {
-    pub sub: Uuid,
-    pub username: String,
-    pub exp: usize,
-}
+pub use haven_types::api::Claims;
+
+/// Shared JWT secret injected via `axum::Extension` from the server entrypoint.
+/// This avoids every middleware call reading from the environment independently.
+#[derive(Clone)]
+pub struct JwtSecret(pub Arc<str>);
 
 /// Extract and validate JWT from Authorization header.
+/// The signing secret is obtained from the `JwtSecret` extension layer,
+/// NOT from environment variables — the server sets this once at startup.
 pub async fn require_auth(mut req: Request, next: Next) -> Result<Response, StatusCode> {
     let auth_header = req
         .headers()
@@ -27,11 +29,15 @@ pub async fn require_auth(mut req: Request, next: Next) -> Result<Response, Stat
         .strip_prefix("Bearer ")
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    let secret = std::env::var("HAVEN_JWT_SECRET").unwrap_or_else(|_| "dev-secret-change-me".into());
+    let secret = req
+        .extensions()
+        .get::<JwtSecret>()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?
+        .clone();
 
     let token_data = decode::<Claims>(
         token,
-        &DecodingKey::from_secret(secret.as_bytes()),
+        &DecodingKey::from_secret(secret.0.as_bytes()),
         &Validation::default(),
     )
     .map_err(|_| StatusCode::UNAUTHORIZED)?;
