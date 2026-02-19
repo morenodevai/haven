@@ -182,13 +182,13 @@
               </div>
             {/if}
           </div>
-          {#if t.status === "transferring" || t.status === "connecting"}
+          {#if t.status === "transferring" || t.status === "connecting" || (t.status === "pending" && t.direction === "send")}
             <button
               class="cancel-btn"
               onclick={() => cancelTransfer(t.id)}
-              title="Cancel"
+              title="Cancel transfer"
             >
-              ✕
+              Cancel
             </button>
           {/if}
         </div>
@@ -370,8 +370,7 @@
     cursor: pointer;
   }
 
-  .reject-btn,
-  .cancel-btn {
+  .reject-btn {
     background: none;
     border: 1px solid var(--text-muted);
     color: var(--text-muted);
@@ -381,10 +380,25 @@
     cursor: pointer;
   }
 
-  .reject-btn:hover,
-  .cancel-btn:hover {
+  .reject-btn:hover {
     border-color: var(--error, #ef4444);
     color: var(--error, #ef4444);
+  }
+
+  .cancel-btn {
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid var(--error, #ef4444);
+    color: var(--error, #ef4444);
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  .cancel-btn:hover {
+    background: rgba(239, 68, 68, 0.2);
   }
 
   .progress-bar {
