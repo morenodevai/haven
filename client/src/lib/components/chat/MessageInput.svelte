@@ -46,8 +46,11 @@
         const encrypted = await crypto.encrypt(key, fileBase64);
 
         // Decode ciphertext from base64 to raw bytes for upload
-        const ctResponse = await fetch(`data:application/octet-stream;base64,${encrypted.ciphertext}`);
-        const ctBytes = new Uint8Array(await ctResponse.arrayBuffer());
+        const binaryStr = atob(encrypted.ciphertext);
+        const ctBytes = new Uint8Array(binaryStr.length);
+        for (let i = 0; i < binaryStr.length; i++) {
+          ctBytes[i] = binaryStr.charCodeAt(i);
+        }
 
         // Upload encrypted blob
         const { file_id } = await uploadFile(ctBytes);

@@ -80,9 +80,12 @@ async function resolveVideoUrl(
     // Decrypt — result is the original base64-encoded video data
     const videoBase64 = await crypto.decrypt(key, ciphertextB64, nonce);
 
-    // Decode base64 to raw bytes using fetch (handles any size)
-    const rawResponse = await fetch(`data:${mime};base64,${videoBase64}`);
-    const videoBytes = new Uint8Array(await rawResponse.arrayBuffer());
+    // Decode base64 to raw bytes
+    const binaryStr = atob(videoBase64);
+    const videoBytes = new Uint8Array(binaryStr.length);
+    for (let i = 0; i < binaryStr.length; i++) {
+      videoBytes[i] = binaryStr.charCodeAt(i);
+    }
 
     const blob = new Blob([videoBytes], { type: mime });
     return URL.createObjectURL(blob);

@@ -47,9 +47,28 @@ pub async fn handle_connection(socket: WebSocket, dispatcher: Dispatcher, jwt_se
         return;
     }
 
-    // Step 3: Register as online and register per-user channel
-    dispatcher.user_online(user_id, username.clone()).await;
+    // Step 3: Register per-user channel and send existing online users, then go online
     let (conn_id, mut user_rx) = dispatcher.register_user_channel(user_id).await;
+
+    // Send existing online users to this client so they see who's already here
+    let existing_users = dispatcher.online_users().await;
+    for (uid, uname) in &existing_users {
+        let event = GatewayEvent::PresenceUpdate {
+            user_id: *uid,
+            username: uname.clone(),
+            online: true,
+        };
+        if sender
+            .send(Message::Text(serde_json::to_string(&event).unwrap().into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    // Now mark ourselves online (broadcasts to everyone else)
+    dispatcher.user_online(user_id, username.clone()).await;
 
     // Step 4: Subscribe to broadcasts and relay to this client
     let mut broadcast_rx = dispatcher.subscribe();

@@ -1,7 +1,16 @@
 <script lang="ts">
   import { auth, logout } from "../../stores/auth";
   import { activeChannel } from "../../stores/channels";
+  import { checkForUpdate, installUpdate, updateAvailable, updateVersion, updateProgress } from "../../stores/updater";
   import VoiceChannel from "../voice/VoiceChannel.svelte";
+
+  async function handleUpdateClick() {
+    if ($updateAvailable) {
+      await installUpdate();
+    } else {
+      await checkForUpdate();
+    }
+  }
 </script>
 
 <div class="sidebar">
@@ -37,12 +46,35 @@
       </div>
       <div class="user-name">{$auth.username}</div>
     </div>
-    <button class="logout-btn" onclick={logout} title="Log out">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9"/>
-      </svg>
-      <span>Log out</span>
-    </button>
+    <div class="panel-actions">
+      <button
+        class="icon-btn update-btn"
+        class:has-update={$updateAvailable}
+        onclick={handleUpdateClick}
+        disabled={$updateProgress === "downloading" || $updateProgress === "installing"}
+        title={$updateAvailable ? `Update to ${$updateVersion}` : $updateProgress === "checking" ? "Checking..." : "Check for updates"}
+      >
+        {#if $updateProgress === "checking" || $updateProgress === "downloading" || $updateProgress === "installing"}
+          <svg class="spin" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-6.219-8.56"/></svg>
+        {:else if $updateAvailable}
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+        {:else}
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="23 4 23 10 17 10"/>
+            <path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/>
+          </svg>
+        {/if}
+      </button>
+      <button class="icon-btn logout-btn" onclick={logout} title="Log out">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9"/>
+        </svg>
+      </button>
+    </div>
   </div>
 </div>
 
@@ -143,20 +175,49 @@
     white-space: nowrap;
   }
 
-  .logout-btn {
-    background: none;
-    border: none;
-    color: var(--text-muted);
-    padding: 6px 8px;
-    border-radius: 4px;
+  .panel-actions {
     display: flex;
     align-items: center;
     gap: 4px;
-    font-size: 11px;
+  }
+
+  .icon-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    padding: 6px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+  }
+
+  .icon-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .update-btn:hover:not(:disabled) {
+    color: var(--accent);
+    background: rgba(88, 101, 242, 0.1);
+  }
+
+  .update-btn.has-update {
+    color: var(--accent);
   }
 
   .logout-btn:hover {
     color: var(--error);
     background: rgba(239, 68, 68, 0.1);
+  }
+
+  .spin {
+    animation: spin 1s linear infinite;
+  }
+
+  @keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
   }
 </style>
