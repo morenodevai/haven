@@ -11,7 +11,10 @@ let cachedUpdate: Awaited<ReturnType<typeof check>> | null = null;
 export async function checkForUpdate() {
   try {
     updateProgress.set("checking");
-    const update = await check();
+    const token = import.meta.env.VITE_UPDATER_TOKEN;
+    const update = await check({
+      headers: token ? { Authorization: `token ${token}` } : {},
+    });
     if (update) {
       cachedUpdate = update;
       updateVersion.set(update.version);
