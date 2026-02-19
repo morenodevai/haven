@@ -139,6 +139,8 @@ async fn main() -> anyhow::Result<()> {
 fn build_cors_layer() -> CorsLayer {
     let mut origins: Vec<HeaderValue> = vec![
         "tauri://localhost".parse().unwrap(),
+        "http://tauri.localhost".parse().unwrap(),
+        "https://tauri.localhost".parse().unwrap(),
         "http://localhost:1420".parse().unwrap(),
         "http://localhost".parse().unwrap(),
     ];

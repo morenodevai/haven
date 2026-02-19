@@ -2,7 +2,11 @@
   import { auth, logout } from "../../stores/auth";
   import { activeChannel } from "../../stores/channels";
   import { checkForUpdate, installUpdate, updateAvailable, updateVersion, updateProgress } from "../../stores/updater";
+  import { getVersion } from "@tauri-apps/api/app";
   import VoiceChannel from "../voice/VoiceChannel.svelte";
+
+  let appVersion = $state("");
+  getVersion().then(v => appVersion = v);
 
   async function handleUpdateClick() {
     if ($updateAvailable) {
@@ -15,7 +19,7 @@
 
 <div class="sidebar">
   <div class="server-header">
-    <h2>Haven</h2>
+    <h2>Haven <span class="version">{appVersion ? `v${appVersion}` : ""}</span></h2>
   </div>
 
   <div class="channels">
@@ -96,6 +100,12 @@
   .server-header h2 {
     font-size: 16px;
     font-weight: 700;
+  }
+
+  .version {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-muted);
   }
 
   .channels {

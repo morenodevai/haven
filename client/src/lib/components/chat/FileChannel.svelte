@@ -190,6 +190,8 @@
             >
               Cancel
             </button>
+          {:else if t.status === "completed"}
+            <span class="done-label">Done</span>
           {/if}
         </div>
       {/each}
@@ -399,6 +401,13 @@
 
   .cancel-btn:hover {
     background: rgba(239, 68, 68, 0.2);
+  }
+
+  .done-label {
+    color: var(--success, #22c55e);
+    font-size: 11px;
+    font-weight: 600;
+    flex-shrink: 0;
   }
 
   .progress-bar {

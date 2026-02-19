@@ -2,7 +2,7 @@
   import { auth } from "./lib/stores/auth";
   import { channelKey, loadMessages, handleIncomingMessage, handleReactionAdd, handleReactionRemove } from "./lib/stores/messages";
   import { initVoice, handleVoiceStateUpdate, handleVoiceSignal, handleVoiceAudioData, cleanupVoice } from "./lib/stores/voice";
-  import { checkForUpdate, updateAvailable, updateVersion, updateProgress, installUpdate } from "./lib/stores/updater";
+  import { checkForUpdate, updateAvailable, updateVersion, updateProgress, updateError, installUpdate } from "./lib/stores/updater";
   import { activeChannel } from "./lib/stores/channels";
   import { handlePresenceUpdate } from "./lib/stores/presence";
   import { initTransfers, cleanupTransfers, handleFileOffer, handleFileAccept, handleFileReject, handleFileSignal, handleFileChunk, handleFileDone } from "./lib/stores/transfers";
@@ -119,6 +119,8 @@
           >
             {#if $updateProgress === "downloading"}
               <svg class="spin" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-6.219-8.56"/></svg>
+            {:else if $updateProgress === "error"}
+              <span style="color: var(--error); font-size: 11px;" title={$updateError}>Failed: {$updateError.slice(0, 60)}</span>
             {:else}
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>

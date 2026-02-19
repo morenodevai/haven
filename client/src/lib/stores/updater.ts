@@ -4,7 +4,8 @@ import { relaunch } from "@tauri-apps/plugin-process";
 
 export const updateAvailable = writable(false);
 export const updateVersion = writable("");
-export const updateProgress = writable<"idle" | "checking" | "downloading" | "installing">("idle");
+export const updateProgress = writable<"idle" | "checking" | "downloading" | "installing" | "error">("idle");
+export const updateError = writable("");
 
 let cachedUpdate: Awaited<ReturnType<typeof check>> | null = null;
 
@@ -35,8 +36,10 @@ export async function installUpdate() {
     await cachedUpdate.downloadAndInstall();
     updateProgress.set("installing");
     await relaunch();
-  } catch (e) {
-    console.error("Update install failed:", e);
-    updateProgress.set("idle");
+  } catch (e: any) {
+    const msg = e?.message || String(e);
+    console.error("Update install failed:", msg);
+    updateError.set(msg);
+    updateProgress.set("error");
   }
 }
