@@ -3,6 +3,8 @@
   "description": "Haven default capabilities",
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "updater:default",
+    "process:default"
   ]
 }

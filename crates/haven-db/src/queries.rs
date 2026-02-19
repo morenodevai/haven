@@ -1,4 +1,4 @@
-use crate::models::{MessageRow, ReactionRow, UserRow};
+use crate::models::{FileRow, MessageRow, ReactionRow, UserRow};
 use crate::Database;
 use anyhow::{Result, anyhow};
 use rusqlite::Connection;
@@ -89,6 +89,38 @@ impl Database {
                 )?;
                 Ok((true, Some(id.to_string())))
             }
+        })
+    }
+
+    // -- Files --
+
+    pub fn insert_file(&self, id: &str, uploader_id: &str, filename: &str, size: i64) -> Result<()> {
+        self.with_conn_mut(|conn| {
+            conn.execute(
+                "INSERT INTO files (id, uploader_id, filename, size) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![id, uploader_id, filename, size],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_file(&self, id: &str) -> Result<Option<FileRow>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, uploader_id, filename, size, created_at FROM files WHERE id = ?1",
+            )?;
+            let row = stmt
+                .query_row([id], |row| {
+                    Ok(FileRow {
+                        id: row.get(0)?,
+                        uploader_id: row.get(1)?,
+                        filename: row.get(2)?,
+                        size: row.get(3)?,
+                        created_at: row.get(4)?,
+                    })
+                })
+                .optional()?;
+            Ok(row)
         })
     }
 

@@ -15,6 +15,7 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 
 use haven_api::auth::{self, AppState, AppStateInner, AuthRateLimiter};
+use haven_api::files;
 use haven_api::messages;
 use haven_api::middleware::{require_auth, JwtSecret};
 use haven_api::reactions;
@@ -92,10 +93,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/login", post(auth::login))
         .with_state(app_state.clone());
 
+    // Create uploads directory for file storage
+    std::fs::create_dir_all("./uploads").ok();
+
     let protected_routes = Router::new()
         .route("/channels/{channel_id}/messages", get(messages::get_messages))
         .route("/channels/{channel_id}/messages", post(messages::send_message))
         .route("/channels/{channel_id}/messages/{message_id}/reactions", post(reactions::toggle_reaction))
+        .route("/files", post(files::upload_file))
+        .route("/files/{file_id}", get(files::download_file))
         .layer(middleware::from_fn(require_auth))
         .with_state(app_state);
 
@@ -108,9 +114,9 @@ async fn main() -> anyhow::Result<()> {
         .merge(protected_routes)
         .merge(ws_route)
         .layer(axum::Extension(jwt_extension))
-        // 10 MB body limit — handles large images and short video clips.
+        // 50 MB body limit — handles images and video file uploads.
         // Tune via HAVEN_MAX_BODY_SIZE env var if needed for larger files.
-        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .layer(cors)
         .layer(TraceLayer::new_for_http());
 

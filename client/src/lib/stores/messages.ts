@@ -15,13 +15,19 @@ export interface DecryptedMessage {
   reactions: ReactionGroup[];
   imageData?: string;
   imageName?: string;
+  videoUrl?: string;
+  videoName?: string;
 }
 
-/** After decryption, detect image envelopes and extract fields. */
+/** After decryption, detect image/video envelopes and extract fields. */
 function parseDecryptedContent(plaintext: string): {
   content: string;
   imageData?: string;
   imageName?: string;
+  videoFileId?: string;
+  videoMime?: string;
+  videoName?: string;
+  videoNonce?: string;
 } {
   try {
     const parsed = JSON.parse(plaintext);
@@ -33,10 +39,57 @@ function parseDecryptedContent(plaintext: string): {
         imageName: parsed.name,
       };
     }
+    if (parsed && parsed.type === "video" && typeof parsed.file_id === "string") {
+      return {
+        content: parsed.name || "video",
+        videoFileId: parsed.file_id,
+        videoMime: parsed.mime || "video/mp4",
+        videoName: parsed.name,
+        videoNonce: parsed.nonce,
+      };
+    }
   } catch {
     // Not JSON — treat as plain text
   }
   return { content: plaintext };
+}
+
+/** Fetch, decrypt, and create a blob URL for a video file. */
+async function resolveVideoUrl(
+  fileId: string,
+  nonce: string,
+  mime: string
+): Promise<string | undefined> {
+  try {
+    const key = get(channelKey);
+    if (!key) return undefined;
+
+    const encryptedBytes = await api.downloadFile(fileId);
+    // Convert encrypted bytes to base64 for the decrypt command (FileReader handles any size)
+    const encryptedBlob = new Blob([new Uint8Array(encryptedBytes)]);
+    const ciphertextB64 = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = reader.result as string;
+        resolve(dataUrl.split(",")[1]);
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(encryptedBlob);
+    });
+
+    // Decrypt — result is the original base64-encoded video data
+    const videoBase64 = await crypto.decrypt(key, ciphertextB64, nonce);
+
+    // Decode base64 to raw bytes using fetch (handles any size)
+    const rawResponse = await fetch(`data:${mime};base64,${videoBase64}`);
+    const videoBytes = new Uint8Array(await rawResponse.arrayBuffer());
+
+    const blob = new Blob([videoBytes], { type: mime });
+    return URL.createObjectURL(blob);
+  } catch (e) {
+    console.error("Failed to resolve video:", e);
+    return undefined;
+  }
 }
 
 export const messages = writable<DecryptedMessage[]>([]);
@@ -82,6 +135,19 @@ export async function loadMessages() {
       try {
         const plaintext = await crypto.decrypt(key, msg.ciphertext, msg.nonce);
         const parsed = parseDecryptedContent(plaintext);
+
+        let videoUrl: string | undefined;
+        let videoName: string | undefined;
+
+        if (parsed.videoFileId) {
+          videoUrl = await resolveVideoUrl(
+            parsed.videoFileId,
+            parsed.videoNonce ?? "",
+            parsed.videoMime ?? "video/mp4"
+          );
+          videoName = parsed.videoName;
+        }
+
         decrypted.push({
           id: msg.id,
           channelId: msg.channel_id,
@@ -90,6 +156,8 @@ export async function loadMessages() {
           content: parsed.content,
           imageData: parsed.imageData,
           imageName: parsed.imageName,
+          videoUrl,
+          videoName,
           timestamp: msg.created_at,
           reactions: msg.reactions ?? [],
         });
@@ -130,6 +198,18 @@ export async function handleIncomingMessage(event: any) {
     const plaintext = await crypto.decrypt(key, data.ciphertext, data.nonce);
     const parsed = parseDecryptedContent(plaintext);
 
+    let videoUrl: string | undefined;
+    let videoName: string | undefined;
+
+    if (parsed.videoFileId) {
+      videoUrl = await resolveVideoUrl(
+        parsed.videoFileId,
+        parsed.videoNonce ?? "",
+        parsed.videoMime ?? "video/mp4"
+      );
+      videoName = parsed.videoName;
+    }
+
     messages.update((msgs) => [
       ...msgs,
       {
@@ -140,6 +220,8 @@ export async function handleIncomingMessage(event: any) {
         content: parsed.content,
         imageData: parsed.imageData,
         imageName: parsed.imageName,
+        videoUrl,
+        videoName,
         timestamp: data.timestamp,
         reactions: [],
       },

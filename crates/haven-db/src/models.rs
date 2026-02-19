@@ -25,3 +25,11 @@ pub struct ReactionRow {
     pub emoji: String,
     pub created_at: String,
 }
+
+pub struct FileRow {
+    pub id: String,
+    pub uploader_id: String,
+    pub filename: String,
+    pub size: i64,
+    pub created_at: String,
+}

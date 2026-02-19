@@ -2,15 +2,29 @@
   import { auth } from "./lib/stores/auth";
   import { channelKey, loadMessages, handleIncomingMessage, handleReactionAdd, handleReactionRemove } from "./lib/stores/messages";
   import { initVoice, handleVoiceStateUpdate, handleVoiceSignal, handleVoiceAudioData, cleanupVoice } from "./lib/stores/voice";
+  import { checkForUpdate, updateAvailable, updateVersion, updateProgress, installUpdate } from "./lib/stores/updater";
   import { Gateway } from "./lib/ipc/gateway";
   import { getBaseUrl } from "./lib/ipc/api";
   import Login from "./lib/components/auth/Login.svelte";
   import Sidebar from "./lib/components/sidebar/Sidebar.svelte";
   import MessageList from "./lib/components/chat/MessageList.svelte";
   import MessageInput from "./lib/components/chat/MessageInput.svelte";
+  import { onMount } from "svelte";
 
   let gateway: Gateway | null = $state(null);
   let connected = $state(false);
+  let showUpdateToast = $state(false);
+
+  // Check for updates on mount
+  onMount(() => {
+    checkForUpdate().then(() => {
+      // Show toast briefly if update is available
+      const unsub = updateAvailable.subscribe((available) => {
+        if (available) showUpdateToast = true;
+      });
+      return unsub;
+    });
+  });
 
   // Connect to gateway when logged in + have channel key
   $effect(() => {
@@ -77,6 +91,24 @@
       <div class="channel-header">
         <span class="hash">#</span>
         <span class="channel-name">general</span>
+        {#if $updateAvailable}
+          <button
+            class="update-btn"
+            onclick={() => installUpdate()}
+            disabled={$updateProgress === "downloading" || $updateProgress === "installing"}
+            title="Update to {$updateVersion}"
+          >
+            {#if $updateProgress === "downloading"}
+              <svg class="spin" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-6.219-8.56"/></svg>
+            {:else}
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+                <polyline points="7 10 12 15 17 10"/>
+                <line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+            {/if}
+          </button>
+        {/if}
         <div class="status" class:online={connected}>
           {connected ? "Connected" : "Connecting..."}
         </div>
@@ -84,6 +116,14 @@
       <MessageList />
       <MessageInput />
     </div>
+  </div>
+{/if}
+
+{#if showUpdateToast}
+  <div class="update-toast">
+    <span>Haven {$updateVersion} is available</span>
+    <button class="toast-action" onclick={() => { installUpdate(); showUpdateToast = false; }}>Update</button>
+    <button class="toast-dismiss" onclick={() => showUpdateToast = false}>✕</button>
   </div>
 {/if}
 
@@ -139,5 +179,89 @@
 
   .status.online::before {
     background: var(--success);
+  }
+
+  .update-btn {
+    background: none;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    border-radius: 6px;
+    padding: 4px 8px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    transition: background 0.15s;
+  }
+
+  .update-btn:hover:not(:disabled) {
+    background: rgba(88, 101, 242, 0.1);
+  }
+
+  .update-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .spin {
+    animation: spin 1s linear infinite;
+  }
+
+  @keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+
+  .update-toast {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    background: var(--bg-secondary, #1e1f22);
+    border: 1px solid var(--accent);
+    border-radius: 10px;
+    padding: 10px 14px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 13px;
+    color: var(--text-primary);
+    z-index: 1000;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    animation: slideIn 0.3s ease;
+  }
+
+  @keyframes slideIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .toast-action {
+    background: var(--accent);
+    border: none;
+    color: white;
+    border-radius: 6px;
+    padding: 4px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .toast-action:hover {
+    background: var(--accent-hover, #4752c4);
+  }
+
+  .toast-dismiss {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 14px;
+    padding: 2px;
+    line-height: 1;
+  }
+
+  .toast-dismiss:hover {
+    color: var(--text-primary);
   }
 </style>

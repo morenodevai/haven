@@ -108,6 +108,56 @@ export async function getMessages(
   return request(`/channels/${channelId}/messages?limit=${limit}`);
 }
 
+// -- Files --
+
+export async function uploadFile(
+  encryptedBlob: Uint8Array
+): Promise<{ file_id: string; size: number }> {
+  const token = localStorage.getItem("haven_token");
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/octet-stream",
+  };
+
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+
+  const res = await fetch(`${baseUrl}/files`, {
+    method: "POST",
+    headers,
+    body: encryptedBlob as unknown as BodyInit,
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`${res.status}: ${text}`);
+  }
+
+  return res.json();
+}
+
+export async function downloadFile(fileId: string): Promise<ArrayBuffer> {
+  const token = localStorage.getItem("haven_token");
+
+  const headers: Record<string, string> = {};
+
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+
+  const res = await fetch(`${baseUrl}/files/${fileId}`, {
+    headers,
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`${res.status}: ${text}`);
+  }
+
+  return res.arrayBuffer();
+}
+
 // -- Reactions --
 
 export async function toggleReaction(
