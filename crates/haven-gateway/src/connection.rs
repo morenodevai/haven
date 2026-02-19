@@ -437,5 +437,47 @@ async fn handle_command(
                 )
                 .await;
         }
+
+        GatewayCommand::FileChunkSend {
+            target_user_id,
+            transfer_id,
+            chunk_index,
+            data,
+        } => {
+            trace!(
+                "{} ({}) -> file chunk {} to {}",
+                username, user_id, chunk_index, target_user_id
+            );
+            dispatcher
+                .send_to_user(
+                    target_user_id,
+                    GatewayEvent::FileChunk {
+                        from_user_id: user_id,
+                        transfer_id,
+                        chunk_index,
+                        data,
+                    },
+                )
+                .await;
+        }
+
+        GatewayCommand::FileDoneSend {
+            target_user_id,
+            transfer_id,
+        } => {
+            info!(
+                "{} ({}) -> file done to {}",
+                username, user_id, target_user_id
+            );
+            dispatcher
+                .send_to_user(
+                    target_user_id,
+                    GatewayEvent::FileDone {
+                        from_user_id: user_id,
+                        transfer_id,
+                    },
+                )
+                .await;
+        }
     }
 }

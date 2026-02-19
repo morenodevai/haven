@@ -10,10 +10,12 @@ import { auth } from "./auth";
 const CHUNK_SIZE = 64 * 1024; // 64KB — WebRTC DataChannel safe max
 const BUFFER_HIGH = 1 * 1024 * 1024; // 1MB — back-pressure threshold
 const BUFFER_LOW = 512 * 1024; // 512KB — resume threshold
-const STUN_SERVERS: RTCIceServer[] = [
+const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
 ];
+const ICE_TIMEOUT = 10_000; // 10s — if P2P fails, fall back to server relay
+const RELAY_CHUNK_SIZE = 48 * 1024; // 48KB for relay (smaller due to base64 overhead)
 
 // --- Types ---
 
@@ -43,6 +45,9 @@ interface TransferInternal {
   cryptoKey?: CryptoKey;
   fileHandle?: FileHandle;
   file?: File;
+  relayMode?: boolean; // true = using server relay instead of P2P
+  relayChunkIndex?: number; // for receiver: next expected chunk
+  iceTimer?: number; // timeout handle for ICE fallback
 }
 
 // --- Stores ---
@@ -66,6 +71,26 @@ export const activeTransfers = derived(transfers, ($t) =>
 
 let gw: Gateway | null = null;
 const internals = new Map<string, TransferInternal>();
+
+// --- Base64 helpers ---
+
+function arrayBufferToBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+function base64ToArrayBuffer(b64: string): ArrayBuffer {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
 
 // --- Crypto helpers ---
 
@@ -95,7 +120,6 @@ async function deriveTransferKey(transferId: string): Promise<CryptoKey> {
 function makeNonce(chunkIndex: number): Uint8Array {
   const nonce = new Uint8Array(12);
   const view = new DataView(nonce.buffer);
-  // chunk index as big-endian u64 at offset 4 (first 4 bytes zero)
   view.setUint32(4, Math.floor(chunkIndex / 0x100000000));
   view.setUint32(8, chunkIndex >>> 0);
   return nonce;
@@ -142,8 +166,8 @@ export function initTransfers(gateway: Gateway) {
 }
 
 export function cleanupTransfers() {
-  // Tear down all active connections
   for (const [id, internal] of internals) {
+    if (internal.iceTimer) clearTimeout(internal.iceTimer);
     internal.dc?.close();
     internal.pc?.close();
     if (internal.fileHandle) {
@@ -162,7 +186,6 @@ export async function sendFile(
   if (!gw) return;
 
   const transferId = crypto.randomUUID();
-  const userId = get(auth).userId!;
 
   const transfer: Transfer = {
     id: transferId,
@@ -178,7 +201,8 @@ export async function sendFile(
   transfers.update((list) => [...list, transfer]);
   internals.set(transferId, { file });
 
-  // Send offer via gateway signaling
+  console.log("[transfers] Sending file offer:", file.name, file.size, "bytes to", peerId);
+
   gw.send({
     type: "FileOfferSend",
     data: {
@@ -197,23 +221,30 @@ export async function acceptTransfer(transferId: string) {
   if (!transfer || transfer.status !== "pending") return;
 
   // Open save dialog
-  const savePath = await save({
-    defaultPath: transfer.filename,
-    title: "Save file as...",
-  });
+  let savePath: string | null;
+  try {
+    savePath = await save({
+      defaultPath: transfer.filename,
+      title: "Save file as...",
+    });
+  } catch (e) {
+    console.error("[transfers] Save dialog error:", e);
+    updateTransfer(transferId, { status: "failed" });
+    return;
+  }
 
   if (!savePath) return; // User cancelled
 
   updateTransfer(transferId, { status: "connecting" });
 
   try {
-    // Create file handle for streaming writes
+    console.log("[transfers] Creating file at:", savePath);
     const fileHandle = await create(savePath);
 
     const cryptoKey = await deriveTransferKey(transferId);
-    internals.set(transferId, { cryptoKey, fileHandle });
+    internals.set(transferId, { cryptoKey, fileHandle, relayChunkIndex: 0 });
 
-    // Send accept signal
+    console.log("[transfers] Sending accept for transfer:", transferId);
     gw.send({
       type: "FileAcceptSend",
       data: {
@@ -247,6 +278,7 @@ export function rejectTransfer(transferId: string) {
 export function cancelTransfer(transferId: string) {
   const internal = internals.get(transferId);
   if (internal) {
+    if (internal.iceTimer) clearTimeout(internal.iceTimer);
     internal.dc?.close();
     internal.pc?.close();
     if (internal.fileHandle) {
@@ -261,13 +293,12 @@ export function cancelTransfer(transferId: string) {
 
 export function handleFileOffer(event: any) {
   const { from_user_id, transfer_id, filename, size } = event.data;
+  console.log("[transfers] Received file offer:", filename, size, "bytes from", from_user_id);
 
-  // Look up username from the event — gateway doesn't send it, so use userId as fallback
-  // The FileChannel component can resolve this from the presence store
   const transfer: Transfer = {
     id: transfer_id,
     peerId: from_user_id,
-    peerUsername: from_user_id, // Will be resolved by UI from presence store
+    peerUsername: from_user_id,
     filename,
     size,
     direction: "receive",
@@ -284,6 +315,7 @@ export async function handleFileAccept(event: any) {
   const transfer = getTransfer(transfer_id);
   if (!transfer || transfer.direction !== "send") return;
 
+  console.log("[transfers] Peer accepted transfer:", transfer_id, "— trying P2P first...");
   updateTransfer(transfer_id, { status: "connecting", startTime: Date.now() });
 
   try {
@@ -291,18 +323,32 @@ export async function handleFileAccept(event: any) {
     const internal = internals.get(transfer_id) || {};
     internal.cryptoKey = cryptoKey;
 
-    // Create WebRTC peer connection (sender is the offerer)
-    const pc = new RTCPeerConnection({ iceServers: STUN_SERVERS });
+    // Try WebRTC P2P first
+    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
     internal.pc = pc;
 
-    // Create DataChannel — reliable ordered
-    const dc = pc.createDataChannel("file", {
-      ordered: true,
-    });
+    const dc = pc.createDataChannel("file", { ordered: true });
     dc.binaryType = "arraybuffer";
     internal.dc = dc;
 
     internals.set(transfer_id, internal);
+
+    // Set up ICE timeout — if P2P fails, fall back to relay
+    internal.iceTimer = window.setTimeout(() => {
+      const t = getTransfer(transfer_id);
+      if (t && t.status === "connecting") {
+        console.log("[transfers] P2P timed out, falling back to server relay");
+        // Clean up WebRTC
+        dc.close();
+        pc.close();
+        internal.pc = undefined;
+        internal.dc = undefined;
+        internal.relayMode = true;
+        // Start relay streaming
+        updateTransfer(transfer_id, { status: "transferring" });
+        streamFileRelay(transfer_id, from_user_id);
+      }
+    }, ICE_TIMEOUT);
 
     // ICE candidate handler
     pc.onicecandidate = (e) => {
@@ -323,15 +369,41 @@ export async function handleFileAccept(event: any) {
       }
     };
 
-    // When DataChannel opens, start streaming file
+    pc.oniceconnectionstatechange = () => {
+      console.log("[transfers] ICE state:", pc.iceConnectionState);
+      if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected") {
+        // ICE failed — trigger relay fallback immediately
+        if (internal.iceTimer) {
+          clearTimeout(internal.iceTimer);
+          internal.iceTimer = undefined;
+        }
+        const t = getTransfer(transfer_id);
+        if (t && (t.status === "connecting" || t.status === "transferring") && !internal.relayMode) {
+          console.log("[transfers] ICE failed, falling back to server relay");
+          dc.close();
+          pc.close();
+          internal.pc = undefined;
+          internal.dc = undefined;
+          internal.relayMode = true;
+          updateTransfer(transfer_id, { status: "transferring" });
+          streamFileRelay(transfer_id, from_user_id);
+        }
+      }
+    };
+
+    // When DataChannel opens, start streaming file via P2P
     dc.onopen = () => {
+      console.log("[transfers] P2P DataChannel opened!");
+      if (internal.iceTimer) {
+        clearTimeout(internal.iceTimer);
+        internal.iceTimer = undefined;
+      }
       updateTransfer(transfer_id, { status: "transferring" });
       streamFile(transfer_id);
     };
 
     dc.onerror = (e) => {
       console.error("[transfers] DataChannel error:", e);
-      updateTransfer(transfer_id, { status: "failed" });
     };
 
     // Create and send SDP offer
@@ -350,7 +422,7 @@ export async function handleFileAccept(event: any) {
       },
     });
   } catch (e) {
-    console.error("[transfers] Failed to setup sender WebRTC:", e);
+    console.error("[transfers] Failed to setup sender:", e);
     updateTransfer(transfer_id, { status: "failed" });
   }
 }
@@ -360,6 +432,7 @@ export function handleFileReject(event: any) {
   updateTransfer(transfer_id, { status: "rejected" });
   const internal = internals.get(transfer_id);
   if (internal) {
+    if (internal.iceTimer) clearTimeout(internal.iceTimer);
     internal.dc?.close();
     internal.pc?.close();
     internals.delete(transfer_id);
@@ -377,7 +450,8 @@ export async function handleFileSignal(event: any) {
   if (signal.signal_type === "Offer") {
     // Receiver gets the SDP offer — create answer
     try {
-      const pc = new RTCPeerConnection({ iceServers: STUN_SERVERS });
+      console.log("[transfers] Received SDP offer, creating answer...");
+      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
       internal.pc = pc;
       internals.set(transfer_id, internal);
 
@@ -399,16 +473,20 @@ export async function handleFileSignal(event: any) {
         }
       };
 
-      // Handle incoming DataChannel
+      pc.oniceconnectionstatechange = () => {
+        console.log("[transfers] Receiver ICE state:", pc.iceConnectionState);
+      };
+
+      // Handle incoming DataChannel (P2P mode)
       pc.ondatachannel = (e) => {
         const dc = e.channel;
         dc.binaryType = "arraybuffer";
         internal.dc = dc;
+        console.log("[transfers] Receiver DataChannel opened (P2P mode)");
 
         let chunkIndex = 0;
 
         dc.onmessage = async (msg) => {
-          // Check for completion sentinel
           if (typeof msg.data === "string" && msg.data === "DONE") {
             if (internal.fileHandle) {
               await internal.fileHandle.close();
@@ -419,7 +497,6 @@ export async function handleFileSignal(event: any) {
             return;
           }
 
-          // Decrypt and write chunk to disk
           try {
             if (!internal.cryptoKey) return;
             const decrypted = await decryptChunk(
@@ -449,7 +526,6 @@ export async function handleFileSignal(event: any) {
 
         dc.onerror = (e) => {
           console.error("[transfers] Receiver DC error:", e);
-          updateTransfer(transfer_id, { status: "failed" });
         };
       };
 
@@ -475,7 +551,6 @@ export async function handleFileSignal(event: any) {
       updateTransfer(transfer_id, { status: "failed" });
     }
   } else if (signal.signal_type === "Answer") {
-    // Sender gets the SDP answer
     try {
       if (internal.pc) {
         await internal.pc.setRemoteDescription(
@@ -486,7 +561,6 @@ export async function handleFileSignal(event: any) {
       console.error("[transfers] Failed to handle SDP answer:", e);
     }
   } else if (signal.signal_type === "IceCandidate") {
-    // Both sides handle ICE candidates
     try {
       if (internal.pc) {
         await internal.pc.addIceCandidate(
@@ -503,7 +577,47 @@ export async function handleFileSignal(event: any) {
   }
 }
 
-// --- File streaming (sender side) ---
+// --- Relay event handlers (server-relayed chunks) ---
+
+export async function handleFileChunk(event: any) {
+  const { from_user_id, transfer_id, chunk_index, data } = event.data;
+
+  const internal = internals.get(transfer_id);
+  if (!internal?.cryptoKey || !internal.fileHandle) return;
+
+  try {
+    const encrypted = base64ToArrayBuffer(data);
+    const decrypted = await decryptChunk(internal.cryptoKey, encrypted, chunk_index);
+
+    await internal.fileHandle.write(new Uint8Array(decrypted));
+
+    const t = getTransfer(transfer_id);
+    if (t) {
+      updateTransfer(transfer_id, {
+        bytesTransferred: t.bytesTransferred + decrypted.byteLength,
+        status: "transferring",
+        startTime: t.startTime || Date.now(),
+      });
+    }
+  } catch (e) {
+    console.error("[transfers] Relay chunk write error:", e);
+    updateTransfer(transfer_id, { status: "failed" });
+  }
+}
+
+export async function handleFileDone(event: any) {
+  const { from_user_id, transfer_id } = event.data;
+
+  const internal = internals.get(transfer_id);
+  if (internal?.fileHandle) {
+    await internal.fileHandle.close();
+  }
+  internals.delete(transfer_id);
+  updateTransfer(transfer_id, { status: "completed" });
+  console.log("[transfers] Relay transfer complete:", transfer_id);
+}
+
+// --- File streaming via P2P DataChannel (sender side) ---
 
 async function streamFile(transferId: string) {
   const internal = internals.get(transferId);
@@ -514,8 +628,6 @@ async function streamFile(transferId: string) {
   const reader = internal.file.stream().getReader();
   let chunkIndex = 0;
   let bytesSent = 0;
-
-  // Buffer for accumulating partial chunks from the stream
   let leftover = new Uint8Array(0);
 
   try {
@@ -523,7 +635,6 @@ async function streamFile(transferId: string) {
       const { done, value } = await reader.read();
 
       if (done) {
-        // Send any remaining leftover
         if (leftover.length > 0) {
           const encrypted = await encryptChunk(key, leftover, chunkIndex);
           await waitForBuffer(dc);
@@ -532,14 +643,11 @@ async function streamFile(transferId: string) {
           chunkIndex++;
           updateTransfer(transferId, { bytesTransferred: bytesSent });
         }
-        // Send completion sentinel
         dc.send("DONE");
         updateTransfer(transferId, {
           status: "completed",
           bytesTransferred: bytesSent,
         });
-
-        // Clean up
         setTimeout(() => {
           dc.close();
           internal.pc?.close();
@@ -548,7 +656,6 @@ async function streamFile(transferId: string) {
         return;
       }
 
-      // Combine leftover with new data
       let data: Uint8Array;
       if (leftover.length > 0) {
         data = new Uint8Array(leftover.length + value.length);
@@ -559,32 +666,129 @@ async function streamFile(transferId: string) {
         data = value;
       }
 
-      // Send full chunks
       let offset = 0;
       while (offset + CHUNK_SIZE <= data.length) {
         const chunk = data.slice(offset, offset + CHUNK_SIZE);
         const encrypted = await encryptChunk(key, chunk, chunkIndex);
-
         await waitForBuffer(dc);
         dc.send(encrypted);
-
         bytesSent += chunk.length;
         chunkIndex++;
         offset += CHUNK_SIZE;
 
-        // Update progress periodically (every 16 chunks ~= 1MB)
         if (chunkIndex % 16 === 0) {
           updateTransfer(transferId, { bytesTransferred: bytesSent });
         }
       }
 
-      // Save remainder for next iteration
       if (offset < data.length) {
         leftover = data.slice(offset);
       }
     }
   } catch (e) {
-    console.error("[transfers] Stream error:", e);
+    console.error("[transfers] P2P stream error:", e);
+    updateTransfer(transferId, { status: "failed" });
+  }
+}
+
+// --- File streaming via server relay (fallback) ---
+
+async function streamFileRelay(transferId: string, targetUserId: string) {
+  const internal = internals.get(transferId);
+  if (!internal?.file || !internal.cryptoKey || !gw) return;
+
+  console.log("[transfers] Starting relay stream for:", transferId);
+  const key = internal.cryptoKey;
+  const reader = internal.file.stream().getReader();
+  let chunkIndex = 0;
+  let bytesSent = 0;
+  let leftover = new Uint8Array(0);
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+
+      if (done) {
+        if (leftover.length > 0) {
+          const encrypted = await encryptChunk(key, leftover, chunkIndex);
+          const b64 = arrayBufferToBase64(encrypted);
+          gw!.send({
+            type: "FileChunkSend",
+            data: {
+              target_user_id: targetUserId,
+              transfer_id: transferId,
+              chunk_index: chunkIndex,
+              data: b64,
+            },
+          });
+          bytesSent += leftover.length;
+          chunkIndex++;
+          updateTransfer(transferId, { bytesTransferred: bytesSent });
+        }
+
+        // Signal completion
+        gw!.send({
+          type: "FileDoneSend",
+          data: {
+            target_user_id: targetUserId,
+            transfer_id: transferId,
+          },
+        });
+        updateTransfer(transferId, {
+          status: "completed",
+          bytesTransferred: bytesSent,
+        });
+        internals.delete(transferId);
+        console.log("[transfers] Relay send complete:", transferId);
+        return;
+      }
+
+      let data: Uint8Array;
+      if (leftover.length > 0) {
+        data = new Uint8Array(leftover.length + value.length);
+        data.set(leftover, 0);
+        data.set(value, leftover.length);
+        leftover = new Uint8Array(0);
+      } else {
+        data = value;
+      }
+
+      let offset = 0;
+      while (offset + RELAY_CHUNK_SIZE <= data.length) {
+        const chunk = data.slice(offset, offset + RELAY_CHUNK_SIZE);
+        const encrypted = await encryptChunk(key, chunk, chunkIndex);
+        const b64 = arrayBufferToBase64(encrypted);
+
+        gw!.send({
+          type: "FileChunkSend",
+          data: {
+            target_user_id: targetUserId,
+            transfer_id: transferId,
+            chunk_index: chunkIndex,
+            data: b64,
+          },
+        });
+
+        bytesSent += chunk.length;
+        chunkIndex++;
+        offset += RELAY_CHUNK_SIZE;
+
+        if (chunkIndex % 16 === 0) {
+          updateTransfer(transferId, { bytesTransferred: bytesSent });
+        }
+
+        // Yield to event loop periodically to avoid blocking
+        if (chunkIndex % 4 === 0) {
+          await new Promise((r) => setTimeout(r, 0));
+        }
+      }
+
+      if (offset < data.length) {
+        leftover = data.slice(offset);
+      }
+    }
+  } catch (e) {
+    console.error("[transfers] Relay stream error:", e);
     updateTransfer(transferId, { status: "failed" });
   }
 }
@@ -612,7 +816,10 @@ export function formatBytes(bytes: number): string {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
 }
 
-export function formatSpeed(bytesTransferred: number, startTime?: number): string {
+export function formatSpeed(
+  bytesTransferred: number,
+  startTime?: number
+): string {
   if (!startTime) return "";
   const elapsed = (Date.now() - startTime) / 1000;
   if (elapsed < 0.1) return "";

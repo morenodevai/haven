@@ -96,6 +96,20 @@ pub enum GatewayEvent {
         transfer_id: String,
         signal: VoiceSignalPayload,
     },
+
+    /// Server-relayed file chunk (fallback when P2P fails)
+    FileChunk {
+        from_user_id: Uuid,
+        transfer_id: String,
+        chunk_index: u64,
+        data: String, // base64-encoded encrypted chunk
+    },
+
+    /// Server-relayed file transfer complete signal
+    FileDone {
+        from_user_id: Uuid,
+        transfer_id: String,
+    },
 }
 
 impl GatewayEvent {
@@ -170,6 +184,20 @@ pub enum GatewayCommand {
         target_user_id: Uuid,
         transfer_id: String,
         signal: VoiceSignalPayload,
+    },
+
+    /// Relay a file chunk through the server (fallback when P2P fails)
+    FileChunkSend {
+        target_user_id: Uuid,
+        transfer_id: String,
+        chunk_index: u64,
+        data: String, // base64-encoded encrypted chunk
+    },
+
+    /// Signal file transfer complete via relay
+    FileDoneSend {
+        target_user_id: Uuid,
+        transfer_id: String,
     },
 }
 

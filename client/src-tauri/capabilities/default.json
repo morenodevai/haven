@@ -7,6 +7,14 @@
     "updater:default",
     "process:default",
     "dialog:default",
-    "fs:default"
+    "fs:default",
+    "fs:allow-create",
+    "fs:allow-write",
+    "fs:allow-open",
+    "core:resources:allow-close",
+    "fs:scope-home-recursive",
+    "fs:scope-desktop-recursive",
+    "fs:scope-download-recursive",
+    "fs:scope-document-recursive"
   ]
 }
