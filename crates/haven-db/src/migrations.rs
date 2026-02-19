@@ -4,7 +4,7 @@ use tracing::info;
 
 /// Current schema version. Increment this and add a new migration function
 /// to the `MIGRATIONS` array when the schema changes.
-const CURRENT_VERSION: u32 = 2;
+const CURRENT_VERSION: u32 = 3;
 
 /// Each migration is a function that takes a connection and applies changes.
 /// Migrations are applied sequentially starting from the current version + 1.
@@ -14,6 +14,7 @@ type MigrationFn = fn(&Connection) -> Result<()>;
 const MIGRATIONS: &[MigrationFn] = &[
     migrate_v1,
     migrate_v2,
+    migrate_v3,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -124,6 +125,17 @@ fn migrate_v2(conn: &Connection) -> Result<()> {
             size        INTEGER NOT NULL,
             created_at  TEXT NOT NULL DEFAULT (datetime('now'))
         );
+        ",
+    )?;
+    Ok(())
+}
+
+/// Version 3: Seed the file-sharing channel for P2P file transfers.
+fn migrate_v3(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        INSERT OR IGNORE INTO channels (id, name)
+            VALUES ('00000000-0000-0000-0000-000000000003', 'file-sharing');
         ",
     )?;
     Ok(())

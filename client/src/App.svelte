@@ -3,12 +3,16 @@
   import { channelKey, loadMessages, handleIncomingMessage, handleReactionAdd, handleReactionRemove } from "./lib/stores/messages";
   import { initVoice, handleVoiceStateUpdate, handleVoiceSignal, handleVoiceAudioData, cleanupVoice } from "./lib/stores/voice";
   import { checkForUpdate, updateAvailable, updateVersion, updateProgress, installUpdate } from "./lib/stores/updater";
+  import { activeChannel } from "./lib/stores/channels";
+  import { handlePresenceUpdate } from "./lib/stores/presence";
+  import { initTransfers, cleanupTransfers, handleFileOffer, handleFileAccept, handleFileReject, handleFileSignal } from "./lib/stores/transfers";
   import { Gateway } from "./lib/ipc/gateway";
   import { getBaseUrl } from "./lib/ipc/api";
   import Login from "./lib/components/auth/Login.svelte";
   import Sidebar from "./lib/components/sidebar/Sidebar.svelte";
   import MessageList from "./lib/components/chat/MessageList.svelte";
   import MessageInput from "./lib/components/chat/MessageInput.svelte";
+  import FileChannel from "./lib/components/chat/FileChannel.svelte";
   import { onMount } from "svelte";
 
   let gateway: Gateway | null = $state(null);
@@ -64,6 +68,15 @@
         handleVoiceAudioData(event);
       });
 
+      // File transfer signaling events
+      gw.on("FileOffer", (event) => handleFileOffer(event));
+      gw.on("FileAccept", (event) => handleFileAccept(event));
+      gw.on("FileReject", (event) => handleFileReject(event));
+      gw.on("FileSignal", (event) => handleFileSignal(event));
+
+      // Presence tracking for online users
+      gw.on("PresenceUpdate", (event) => handlePresenceUpdate(event));
+
       gw.on("Disconnected", () => {
         connected = false;
       });
@@ -71,8 +84,10 @@
       gw.connect();
       gateway = gw;
       initVoice(gw, $auth.userId!);
+      initTransfers(gw);
 
       return () => {
+        cleanupTransfers();
         cleanupVoice();
         gw.disconnect();
         gateway = null;
@@ -90,7 +105,7 @@
     <div class="main-content">
       <div class="channel-header">
         <span class="hash">#</span>
-        <span class="channel-name">general</span>
+        <span class="channel-name">{$activeChannel === "general" ? "general" : "file-sharing"}</span>
         {#if $updateAvailable}
           <button
             class="update-btn"
@@ -113,8 +128,12 @@
           {connected ? "Connected" : "Connecting..."}
         </div>
       </div>
-      <MessageList />
-      <MessageInput />
+      {#if $activeChannel === "general"}
+        <MessageList />
+        <MessageInput />
+      {:else if $activeChannel === "file-sharing"}
+        <FileChannel />
+      {/if}
     </div>
   </div>
 {/if}

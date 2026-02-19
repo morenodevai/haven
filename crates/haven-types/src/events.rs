@@ -69,6 +69,33 @@ pub enum GatewayEvent {
         from_user_id: Uuid,
         data: String,
     },
+
+    /// A peer is offering to send a file
+    FileOffer {
+        from_user_id: Uuid,
+        transfer_id: String,
+        filename: String,
+        size: u64,
+    },
+
+    /// A peer accepted a file transfer
+    FileAccept {
+        from_user_id: Uuid,
+        transfer_id: String,
+    },
+
+    /// A peer rejected a file transfer
+    FileReject {
+        from_user_id: Uuid,
+        transfer_id: String,
+    },
+
+    /// WebRTC signaling for a file transfer (SDP offer/answer, ICE candidates)
+    FileSignal {
+        from_user_id: Uuid,
+        transfer_id: String,
+        signal: VoiceSignalPayload,
+    },
 }
 
 impl GatewayEvent {
@@ -117,6 +144,33 @@ pub enum GatewayCommand {
     /// The server will only forward channel-scoped events (messages, typing, voice)
     /// for channels the client has subscribed to.
     Subscribe { channel_ids: Vec<Uuid> },
+
+    /// Offer to send a file to a specific peer
+    FileOfferSend {
+        target_user_id: Uuid,
+        transfer_id: String,
+        filename: String,
+        size: u64,
+    },
+
+    /// Accept a file transfer from a peer
+    FileAcceptSend {
+        target_user_id: Uuid,
+        transfer_id: String,
+    },
+
+    /// Reject a file transfer from a peer
+    FileRejectSend {
+        target_user_id: Uuid,
+        transfer_id: String,
+    },
+
+    /// Send WebRTC signaling for a file transfer to a specific peer
+    FileSignalSend {
+        target_user_id: Uuid,
+        transfer_id: String,
+        signal: VoiceSignalPayload,
+    },
 }
 
 /// WebRTC signaling payload relayed between peers.

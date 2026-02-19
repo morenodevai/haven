@@ -1,5 +1,6 @@
 <script lang="ts">
   import { auth, logout } from "../../stores/auth";
+  import { activeChannel } from "../../stores/channels";
   import VoiceChannel from "../voice/VoiceChannel.svelte";
 </script>
 
@@ -10,9 +11,20 @@
 
   <div class="channels">
     <div class="channel-header">TEXT CHANNELS</div>
-    <div class="channel active">
+    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+    <div class="channel" class:active={$activeChannel === "general"} onclick={() => activeChannel.set("general")}>
       <span class="hash">#</span>
       general
+    </div>
+
+    <div class="channel-header file-header">FILE SHARING</div>
+    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+    <div class="channel" class:active={$activeChannel === "file-sharing"} onclick={() => activeChannel.set("file-sharing")}>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z"/>
+        <polyline points="13 2 13 9 20 9"/>
+      </svg>
+      file-sharing
     </div>
 
     <VoiceChannel />
@@ -76,7 +88,11 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    cursor: default;
+    cursor: pointer;
+  }
+
+  .file-header {
+    margin-top: 14px;
   }
 
   .channel.active {

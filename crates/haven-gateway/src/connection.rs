@@ -336,5 +336,87 @@ async fn handle_command(
             );
             dispatcher.relay_voice_data(user_id, data).await;
         }
+
+        GatewayCommand::FileOfferSend {
+            target_user_id,
+            transfer_id,
+            filename,
+            size,
+        } => {
+            info!(
+                "{} ({}) -> file offer to {} ({})",
+                username, user_id, target_user_id, filename
+            );
+            dispatcher
+                .send_to_user(
+                    target_user_id,
+                    GatewayEvent::FileOffer {
+                        from_user_id: user_id,
+                        transfer_id,
+                        filename,
+                        size,
+                    },
+                )
+                .await;
+        }
+
+        GatewayCommand::FileAcceptSend {
+            target_user_id,
+            transfer_id,
+        } => {
+            info!(
+                "{} ({}) -> file accept to {}",
+                username, user_id, target_user_id
+            );
+            dispatcher
+                .send_to_user(
+                    target_user_id,
+                    GatewayEvent::FileAccept {
+                        from_user_id: user_id,
+                        transfer_id,
+                    },
+                )
+                .await;
+        }
+
+        GatewayCommand::FileRejectSend {
+            target_user_id,
+            transfer_id,
+        } => {
+            info!(
+                "{} ({}) -> file reject to {}",
+                username, user_id, target_user_id
+            );
+            dispatcher
+                .send_to_user(
+                    target_user_id,
+                    GatewayEvent::FileReject {
+                        from_user_id: user_id,
+                        transfer_id,
+                    },
+                )
+                .await;
+        }
+
+        GatewayCommand::FileSignalSend {
+            target_user_id,
+            transfer_id,
+            signal,
+        } => {
+            trace!(
+                "{} ({}) -> file signal to {}",
+                username, user_id, target_user_id
+            );
+            dispatcher
+                .send_to_user(
+                    target_user_id,
+                    GatewayEvent::FileSignal {
+                        from_user_id: user_id,
+                        transfer_id,
+                        signal,
+                    },
+                )
+                .await;
+        }
     }
 }
