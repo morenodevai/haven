@@ -15,6 +15,38 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+/// Wrapper around `TcpListener` that sets TCP_NODELAY on each accepted connection.
+/// This eliminates Nagle's algorithm latency for small WebSocket frames (e.g. ack frames).
+struct NodelayListener(tokio::net::TcpListener);
+
+impl axum::serve::Listener for NodelayListener {
+    type Io = tokio::net::TcpStream;
+    type Addr = SocketAddr;
+
+    fn accept(
+        &mut self,
+    ) -> impl std::future::Future<Output = (Self::Io, Self::Addr)> + Send {
+        async {
+            loop {
+                match self.0.accept().await {
+                    Ok((stream, addr)) => {
+                        let _ = stream.set_nodelay(true);
+                        return (stream, addr);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Accept error: {e}, retrying...");
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.0.local_addr()
+    }
+}
+
 use haven_api::auth::{self, AppState, AppStateInner, AuthRateLimiter};
 use haven_api::files;
 use haven_api::messages;
@@ -125,20 +157,19 @@ async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
     info!("Haven server listening on {}", addr);
 
-    // Create listener via socket2 so we can set TCP_NODELAY on the listening socket.
-    // This ensures accepted connections inherit the NODELAY flag, eliminating
-    // Nagle's algorithm latency for small WebSocket frames.
+    // Create listener via socket2 for custom backlog and address reuse.
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
-    socket.set_nodelay(true)?;
     socket.set_reuse_address(true)?;
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
     socket.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(socket.into())?;
 
+    // Wrap in NodelayListener to set TCP_NODELAY on each accepted connection,
+    // eliminating Nagle's algorithm latency for small WebSocket frames (e.g. 37-byte ack frames).
     axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
+        NodelayListener(listener),
+        app.into_make_service(),
     )
     .await?;
 
@@ -181,8 +212,8 @@ async fn ws_upgrade(
     State(state): State<ServerState>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.max_frame_size(1_048_576)       // 1 MB max frame
-        .max_message_size(2_097_152)   // 2 MB max message
+    ws.max_frame_size(4 * 1024 * 1024)    // 4 MB max frame (supports larger chunk sizes)
+        .max_message_size(8 * 1024 * 1024) // 8 MB max message
         .on_upgrade(move |socket| {
             connection::handle_connection(socket, state.dispatcher, state.jwt_secret)
         })

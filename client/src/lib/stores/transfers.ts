@@ -10,9 +10,10 @@ const cryptoPool = new CryptoWorkerPool();
 
 // --- Constants ---
 
-const CHUNK_SIZE = 64 * 1024; // 64KB — WebRTC DataChannel safe max
-const BUFFER_HIGH = 1 * 1024 * 1024; // 1MB — back-pressure threshold
-const BUFFER_LOW = 512 * 1024; // 512KB — resume threshold
+const CHUNK_SIZE = 256 * 1024; // 256KB — large chunks for throughput (was 64KB)
+const BUFFER_HIGH = 8 * 1024 * 1024; // 8MB — back-pressure threshold (was 1MB)
+const BUFFER_LOW = 4 * 1024 * 1024; // 4MB — resume threshold (was 512KB)
+const P2P_BURST_SIZE = 16; // Number of chunks to batch-encrypt and send at once
 function getTurnServers(): RTCIceServer[] {
   try {
     const config = localStorage.getItem("haven_turn_servers");
@@ -65,6 +66,7 @@ interface TransferInternal {
   ackedChunkIndex?: number; // highest acked chunk index (-1 = none)
   ackResolve?: (() => void) | null; // resolve function when waiting for ack
   writeQueue?: Promise<void>; // sequential write chain — prevents race between chunks and FileDone
+  lastUiUpdate?: number; // throttle UI store updates to ~10fps
 }
 
 // --- Stores ---
@@ -529,9 +531,14 @@ export async function handleFileSignal(event: any) {
         console.log("[transfers] Receiver DataChannel opened (P2P mode)");
 
         let chunkIndex = 0;
+        let lastUiUpdate = Date.now();
 
         dc.onmessage = async (msg) => {
           if (typeof msg.data === "string" && msg.data === "DONE") {
+            // Wait for all queued writes to finish before closing
+            if (internal.writeQueue) {
+              await internal.writeQueue;
+            }
             if (internal.fileHandle) {
               await internal.fileHandle.close();
             }
@@ -543,24 +550,36 @@ export async function handleFileSignal(event: any) {
 
           try {
             if (!internal.cryptoKey) return;
-            const decrypted = await decryptChunk(
+            const currentChunk = chunkIndex++;
+
+            // Decrypt via worker pool (parallel, off main thread)
+            const decryptPromise = cryptoPool.decrypt(
               internal.cryptoKey,
               msg.data as ArrayBuffer,
-              chunkIndex
+              currentChunk
             );
-            chunkIndex++;
 
-            if (internal.fileHandle) {
-              await internal.fileHandle.write(new Uint8Array(decrypted));
-            }
+            // Chain writes sequentially to prevent interleaved file writes
+            const prevQueue = internal.writeQueue || Promise.resolve();
+            internal.writeQueue = prevQueue.then(async () => {
+              const decrypted = await decryptPromise;
+              if (internal.fileHandle) {
+                await internal.fileHandle.write(new Uint8Array(decrypted));
+              }
 
-            const t = getTransfer(transfer_id);
-            if (t) {
-              updateTransfer(transfer_id, {
-                bytesTransferred: t.bytesTransferred + decrypted.byteLength,
-                status: "transferring",
-              });
-            }
+              // Throttled UI update (~10fps)
+              const now = Date.now();
+              if (now - lastUiUpdate >= 100) {
+                const t = getTransfer(transfer_id);
+                if (t) {
+                  updateTransfer(transfer_id, {
+                    bytesTransferred: t.bytesTransferred + decrypted.byteLength,
+                    status: "transferring",
+                  });
+                }
+                lastUiUpdate = now;
+              }
+            });
           } catch (e) {
             console.error("[transfers] Failed to write chunk:", e);
             updateTransfer(transfer_id, { status: "failed" });
@@ -772,13 +791,18 @@ async function handleBinaryFileChunk(
             const decrypted = await decryptPromise;
             await internal.fileHandle!.write(new Uint8Array(decrypted));
 
-            const t = getTransfer(transferId);
-            if (t) {
-                updateTransfer(transferId, {
-                    bytesTransferred: t.bytesTransferred + decrypted.byteLength,
-                    status: "transferring",
-                    startTime: t.startTime || Date.now(),
-                });
+            // Throttled UI update (~10fps) instead of per-chunk
+            const now = Date.now();
+            if (!internal.lastUiUpdate || now - internal.lastUiUpdate >= 100) {
+                internal.lastUiUpdate = now;
+                const t = getTransfer(transferId);
+                if (t) {
+                    updateTransfer(transferId, {
+                        bytesTransferred: t.bytesTransferred + decrypted.byteLength,
+                        status: "transferring",
+                        startTime: t.startTime || Date.now(),
+                    });
+                }
             }
         } catch (e) {
             console.error("[transfers] Binary chunk write error:", e);
@@ -834,6 +858,48 @@ async function handleBinaryFileDone(fromUserId: string, transferId: string) {
 
 // --- File streaming via P2P DataChannel (sender side) ---
 
+/** Read the next CHUNK_SIZE bytes from a file stream, accumulating leftovers. */
+function readNextP2PChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  leftoverRef: { data: Uint8Array }
+): Promise<Uint8Array | null> {
+  if (leftoverRef.data.length >= CHUNK_SIZE) {
+    const chunk = leftoverRef.data.slice(0, CHUNK_SIZE);
+    leftoverRef.data = leftoverRef.data.slice(CHUNK_SIZE);
+    return Promise.resolve(chunk);
+  }
+
+  return reader.read().then(({ done, value }) => {
+    if (done) {
+      if (leftoverRef.data.length > 0) {
+        const last = leftoverRef.data;
+        leftoverRef.data = new Uint8Array(0);
+        return last;
+      }
+      return null;
+    }
+
+    let data: Uint8Array;
+    if (leftoverRef.data.length > 0) {
+      data = new Uint8Array(leftoverRef.data.length + value.length);
+      data.set(leftoverRef.data, 0);
+      data.set(value, leftoverRef.data.length);
+    } else {
+      data = value;
+    }
+
+    if (data.length >= CHUNK_SIZE) {
+      const chunk = data.slice(0, CHUNK_SIZE);
+      leftoverRef.data = data.slice(CHUNK_SIZE);
+      return chunk;
+    }
+
+    // Not enough yet — recurse to accumulate more
+    leftoverRef.data = data;
+    return readNextP2PChunk(reader, leftoverRef);
+  });
+}
+
 async function streamFile(transferId: string) {
   const internal = internals.get(transferId);
   if (!internal?.file || !internal.dc || !internal.cryptoKey) return;
@@ -841,23 +907,53 @@ async function streamFile(transferId: string) {
   const dc = internal.dc;
   const key = internal.cryptoKey;
   const reader = internal.file.stream().getReader();
+  const leftoverRef = { data: new Uint8Array(0) };
   let chunkIndex = 0;
   let bytesSent = 0;
-  let leftover = new Uint8Array(0);
+  let lastUiUpdate = Date.now();
 
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      // Read a batch of chunks
+      const batch: { buf: ArrayBuffer; len: number; idx: number }[] = [];
+      let fileExhausted = false;
 
-      if (done) {
-        if (leftover.length > 0) {
-          const encrypted = await encryptChunk(key, leftover, chunkIndex);
-          await waitForBuffer(dc);
-          dc.send(encrypted);
-          bytesSent += leftover.length;
-          chunkIndex++;
-          updateTransfer(transferId, { bytesTransferred: bytesSent });
+      for (let i = 0; i < P2P_BURST_SIZE; i++) {
+        const chunk = await readNextP2PChunk(reader, leftoverRef);
+        if (!chunk) {
+          fileExhausted = true;
+          break;
         }
+        const buf = chunk.buffer.slice(
+          chunk.byteOffset,
+          chunk.byteOffset + chunk.byteLength
+        ) as ArrayBuffer;
+        batch.push({ buf, len: chunk.byteLength, idx: chunkIndex });
+        chunkIndex++;
+      }
+
+      if (batch.length > 0) {
+        // Encrypt all chunks in parallel via the worker pool
+        const encrypted = await Promise.all(
+          batch.map((c) => cryptoPool.encrypt(key, c.buf, c.idx))
+        );
+
+        // Send all encrypted chunks, respecting buffer back-pressure
+        for (const enc of encrypted) {
+          await waitForBuffer(dc);
+          dc.send(enc);
+        }
+        bytesSent += batch.reduce((sum, c) => sum + c.len, 0);
+
+        // Throttled UI update (~10fps max)
+        const now = Date.now();
+        if (now - lastUiUpdate >= 100) {
+          updateTransfer(transferId, { bytesTransferred: bytesSent });
+          lastUiUpdate = now;
+        }
+      }
+
+      if (fileExhausted) {
         dc.send("DONE");
         updateTransfer(transferId, {
           status: "completed",
@@ -869,35 +965,6 @@ async function streamFile(transferId: string) {
           internals.delete(transferId);
         }, 1000);
         return;
-      }
-
-      let data: Uint8Array;
-      if (leftover.length > 0) {
-        data = new Uint8Array(leftover.length + value.length);
-        data.set(leftover, 0);
-        data.set(value, leftover.length);
-        leftover = new Uint8Array(0);
-      } else {
-        data = value;
-      }
-
-      let offset = 0;
-      while (offset + CHUNK_SIZE <= data.length) {
-        const chunk = data.slice(offset, offset + CHUNK_SIZE);
-        const encrypted = await encryptChunk(key, chunk, chunkIndex);
-        await waitForBuffer(dc);
-        dc.send(encrypted);
-        bytesSent += chunk.length;
-        chunkIndex++;
-        offset += CHUNK_SIZE;
-
-        if (chunkIndex % 16 === 0) {
-          updateTransfer(transferId, { bytesTransferred: bytesSent });
-        }
-      }
-
-      if (offset < data.length) {
-        leftover = data.slice(offset);
       }
     }
   } catch (e) {
@@ -923,6 +990,7 @@ interface RelayStream {
   totalSize: number;
   leftover: Uint8Array;
   done: boolean;
+  lastUpdate: number;
 }
 
 class TransferScheduler {
@@ -953,6 +1021,7 @@ class TransferScheduler {
       totalSize: file.size,
       leftover: new Uint8Array(0),
       done: false,
+      lastUpdate: Date.now(),
     };
     this.streams.set(transferId, stream);
     this.globalAcked.set(transferId, -1);
@@ -1025,9 +1094,14 @@ class TransferScheduler {
         const sent = await this.sendBurst(stream);
         if (sent > 0) {
           anyProgress = true;
-          updateTransfer(stream.transferId, {
-            bytesTransferred: stream.bytesSent,
-          });
+          // Throttled UI update (~10fps) instead of per-burst
+          const now = Date.now();
+          if (now - stream.lastUpdate >= 100) {
+            updateTransfer(stream.transferId, {
+              bytesTransferred: stream.bytesSent,
+            });
+            stream.lastUpdate = now;
+          }
         }
 
         // Check if this stream finished reading
@@ -1051,11 +1125,16 @@ class TransferScheduler {
         }
       }
 
-      // Yield to event loop so acks and other events can be processed
+      // Yield to event loop so acks and other events can be processed.
+      // MessageChannel gives near-zero delay (avoids browser's 4ms setTimeout clamp).
       if (anyProgress) {
-        await new Promise((r) => setTimeout(r, 0));
+        await new Promise<void>((r) => {
+          const ch = new MessageChannel();
+          ch.port1.onmessage = () => r();
+          ch.port2.postMessage(null);
+        });
       } else {
-        await new Promise((r) => setTimeout(r, 10));
+        await new Promise((r) => setTimeout(r, 5));
       }
     }
 

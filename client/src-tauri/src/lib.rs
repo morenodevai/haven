@@ -10,7 +10,7 @@ fn grant_media_permissions(window: &tauri::WebviewWindow) {
         COREWEBVIEW2_PERMISSION_KIND_CAMERA,
         COREWEBVIEW2_PERMISSION_KIND_MICROPHONE,
         COREWEBVIEW2_PERMISSION_STATE_ALLOW,
-        COREWEBVIEW2_PERMISSION_STATE_DENY,
+        COREWEBVIEW2_PERMISSION_STATE_DEFAULT,
     };
 
     let _ = window.with_webview(|webview| unsafe {
@@ -27,7 +27,8 @@ fn grant_media_permissions(window: &tauri::WebviewWindow) {
                     {
                         args.SetState(COREWEBVIEW2_PERMISSION_STATE_ALLOW)?;
                     } else {
-                        args.SetState(COREWEBVIEW2_PERMISSION_STATE_DENY)?;
+                        // Let browser/OS handle other permissions (e.g. screen capture)
+                        args.SetState(COREWEBVIEW2_PERMISSION_STATE_DEFAULT)?;
                     }
                 }
                 Ok(())
@@ -35,26 +36,6 @@ fn grant_media_permissions(window: &tauri::WebviewWindow) {
             &mut token,
         )
         .unwrap();
-    });
-}
-
-/// Force WebView2 to repaint by doing a tiny resize bounce.
-/// Works around a known WebView2 bug where the initial render sometimes
-/// produces a blank white screen until something triggers a
-/// layout/repaint (e.g. opening DevTools, resizing the window).
-#[cfg(target_os = "windows")]
-fn force_repaint(window: &tauri::WebviewWindow) {
-    use tauri::PhysicalSize;
-
-    let win = window.clone();
-    std::thread::spawn(move || {
-        // Small delay to let WebView2 finish its first layout pass
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        if let Ok(size) = win.inner_size() {
-            let _ = win.set_size(PhysicalSize::new(size.width + 1, size.height));
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            let _ = win.set_size(size);
-        }
     });
 }
 
@@ -90,9 +71,6 @@ pub fn run() {
 
                 #[cfg(target_os = "windows")]
                 grant_media_permissions(&window);
-
-                #[cfg(target_os = "windows")]
-                force_repaint(&window);
             }
             Ok(())
         })

@@ -90,14 +90,23 @@
     tiles.length <= 1 ? 1 : tiles.length <= 4 ? 2 : tiles.length <= 9 ? 3 : 4
   );
 
-  // Bind video element to stream using an action
+  // Bind video element to stream using an action.
+  // Handles autoplay policy: if unmuted autoplay is blocked, mute and retry.
   function streamAction(node: HTMLVideoElement, stream: MediaStream) {
     node.srcObject = stream;
+    node.play().catch(() => {
+      node.muted = true;
+      node.play().catch(() => {});
+    });
 
     return {
       update(newStream: MediaStream) {
         if (node.srcObject !== newStream) {
           node.srcObject = newStream;
+          node.play().catch(() => {
+            node.muted = true;
+            node.play().catch(() => {});
+          });
         }
       },
       destroy() {

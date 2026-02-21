@@ -74,8 +74,14 @@ const screenSenders: Map<string, RTCRtpSender> = new Map();
 // Track whether we're the polite peer (for perfect negotiation pattern)
 const politeFlags: Map<string, boolean> = new Map();
 
-// Whether we're currently making an offer (for perfect negotiation glare handling)
-let makingOffer = false;
+// Whether we're currently making an offer (per-peer, for perfect negotiation glare handling)
+const makingOfferMap: Map<string, boolean> = new Map();
+
+// Screen share stream IDs signaled by remote peers (userId -> set of screen stream IDs)
+const peerScreenStreamIds: Map<string, Set<string>> = new Map();
+
+// Buffered tracks that arrived before the participant was registered in the store
+const pendingTracks: Map<string, { stream: MediaStream; isScreen: boolean; track: MediaStreamTrack }[]> = new Map();
 
 // Playback state per remote user
 const playbackContexts: Map<string, {
@@ -327,6 +333,43 @@ export function handleVoiceStateUpdate(event: any) {
   if (userId !== myUserId && get(voiceConnected)) {
     ensurePeerConnection(userId);
   }
+
+  // Replay any tracks that arrived before this participant was registered
+  const buffered = pendingTracks.get(userId);
+  if (buffered && buffered.length > 0) {
+    pendingTracks.delete(userId);
+    voiceParticipants.update((m) => {
+      const p = m.get(userId);
+      if (p) {
+        let updated = { ...p };
+        for (const { stream, isScreen, track } of buffered) {
+          if (isScreen) {
+            updated.screenStream = stream;
+          } else {
+            updated.videoStream = stream;
+          }
+          // Re-attach the onended handler
+          track.onended = () => {
+            voiceParticipants.update((m2) => {
+              const p2 = m2.get(userId);
+              if (p2) {
+                if (isScreen) {
+                  m2.set(userId, { ...p2, screenStream: null });
+                } else {
+                  m2.set(userId, { ...p2, videoStream: null });
+                }
+                return new Map(m2);
+              }
+              return m2;
+            });
+          };
+        }
+        m.set(userId, updated);
+        return new Map(m);
+      }
+      return m;
+    });
+  }
 }
 
 export async function handleVoiceSignal(event: any) {
@@ -338,12 +381,27 @@ export async function handleVoiceSignal(event: any) {
 
   if (!get(voiceConnected) || !gw || !myUserId) return;
 
+  // Handle track metadata signals (camera vs screen share classification)
+  if (signal.signal_type === "TrackInfo") {
+    const streamId: string = signal.stream_id;
+    const trackType: string = signal.track_type;
+    if (trackType === "screen" && streamId) {
+      const ids = peerScreenStreamIds.get(fromUserId) || new Set();
+      ids.add(streamId);
+      peerScreenStreamIds.set(fromUserId, ids);
+    } else if (trackType === "camera_removed") {
+      // Peer stopped screen share — clear their screen stream IDs
+      peerScreenStreamIds.delete(fromUserId);
+    }
+    return;
+  }
+
   const pc = ensurePeerConnection(fromUserId);
 
   try {
     if (signal.signal_type === "Offer") {
-      // Perfect negotiation: handle incoming offer
-      const offerCollision = makingOffer || pc.signalingState !== "stable";
+      // Perfect negotiation: handle incoming offer (per-peer makingOffer flag)
+      const offerCollision = (makingOfferMap.get(fromUserId) ?? false) || pc.signalingState !== "stable";
       const isPolite = politeFlags.get(fromUserId) ?? false;
       const ignoreOffer = !isPolite && offerCollision;
 
@@ -622,7 +680,7 @@ function ensurePeerConnection(remoteUserId: string): RTCPeerConnection {
   pc.onnegotiationneeded = async () => {
     if (!gw) return;
     try {
-      makingOffer = true;
+      makingOfferMap.set(remoteUserId, true);
       await pc!.setLocalDescription();
       if (pc!.localDescription) {
         gw.send({
@@ -639,7 +697,7 @@ function ensurePeerConnection(remoteUserId: string): RTCPeerConnection {
     } catch (e) {
       console.error("[voice] Negotiation failed for", remoteUserId, e);
     } finally {
-      makingOffer = false;
+      makingOfferMap.set(remoteUserId, false);
     }
   };
 
@@ -648,9 +706,10 @@ function ensurePeerConnection(remoteUserId: string): RTCPeerConnection {
     const stream = e.streams[0];
     if (!stream) return;
 
-    // Determine if this is a camera or screen share track based on stream ID convention.
-    // We use stream IDs starting with "screen-" for screen shares.
-    const isScreen = stream.id.startsWith("screen-");
+    // Determine if this is a screen share by checking if the peer signaled
+    // this stream ID as a screen share via TrackInfo.
+    const screenIds = peerScreenStreamIds.get(remoteUserId);
+    const isScreen = screenIds?.has(stream.id) ?? false;
 
     voiceParticipants.update((m) => {
       const p = m.get(remoteUserId);
@@ -662,6 +721,10 @@ function ensurePeerConnection(remoteUserId: string): RTCPeerConnection {
         }
         return new Map(m);
       }
+      // Participant not registered yet — buffer the track for replay
+      const buf = pendingTracks.get(remoteUserId) || [];
+      buf.push({ stream, isScreen, track: e.track });
+      pendingTracks.set(remoteUserId, buf);
       return m;
     });
 
@@ -683,8 +746,13 @@ function ensurePeerConnection(remoteUserId: string): RTCPeerConnection {
   };
 
   pc.onconnectionstatechange = () => {
-    if (pc!.connectionState === "failed" || pc!.connectionState === "disconnected") {
-      console.warn("[voice] Peer connection to", remoteUserId, "state:", pc!.connectionState);
+    const state = pc!.connectionState;
+    if (state === "failed") {
+      console.warn("[voice] Peer connection to", remoteUserId, "failed, attempting ICE restart");
+      // restartIce() triggers onnegotiationneeded which creates a new offer with ICE restart
+      pc!.restartIce();
+    } else if (state === "disconnected") {
+      console.warn("[voice] Peer connection to", remoteUserId, "disconnected");
     }
   };
 
@@ -699,6 +767,20 @@ function ensurePeerConnection(remoteUserId: string): RTCPeerConnection {
 
   const currentScreenStream = get(localScreenStream);
   if (currentScreenStream) {
+    // Signal screen stream ID before adding tracks so the receiver classifies them correctly
+    if (gw) {
+      gw.send({
+        type: "VoiceSignalSend",
+        data: {
+          target_user_id: remoteUserId,
+          signal: {
+            signal_type: "TrackInfo",
+            track_type: "screen",
+            stream_id: currentScreenStream.id,
+          },
+        },
+      });
+    }
     for (const track of currentScreenStream.getVideoTracks()) {
       const sender = pc.addTrack(track, currentScreenStream);
       screenSenders.set(remoteUserId, sender);
@@ -717,6 +799,9 @@ function closePeerConnection(remoteUserId: string) {
   videoSenders.delete(remoteUserId);
   screenSenders.delete(remoteUserId);
   politeFlags.delete(remoteUserId);
+  makingOfferMap.delete(remoteUserId);
+  peerScreenStreamIds.delete(remoteUserId);
+  pendingTracks.delete(remoteUserId);
 }
 
 function closeAllPeerConnections() {
@@ -793,6 +878,20 @@ export async function toggleScreenShare() {
         if (pc) {
           pc.removeTrack(sender);
         }
+        // Signal to peer that screen share stopped
+        if (gw) {
+          gw.send({
+            type: "VoiceSignalSend",
+            data: {
+              target_user_id: userId,
+              signal: {
+                signal_type: "TrackInfo",
+                track_type: "camera_removed",
+                stream_id: stream.id,
+              },
+            },
+          });
+        }
       }
       screenSenders.clear();
     }
@@ -813,6 +912,24 @@ export async function toggleScreenShare() {
 
       localScreenStream.set(stream);
       screenShareEnabled.set(true);
+
+      // Signal to all peers that this stream is a screen share BEFORE adding tracks.
+      // The signal arrives before the SDP offer, so the receiver knows to classify it.
+      for (const [userId] of peerConnections) {
+        if (gw) {
+          gw.send({
+            type: "VoiceSignalSend",
+            data: {
+              target_user_id: userId,
+              signal: {
+                signal_type: "TrackInfo",
+                track_type: "screen",
+                stream_id: stream.id,
+              },
+            },
+          });
+        }
+      }
 
       // Add screen track to all existing peer connections
       for (const [userId, pc] of peerConnections) {

@@ -226,4 +226,10 @@ pub enum VoiceSignalPayload {
         sdp_mid: Option<String>,
         sdp_m_line_index: Option<u16>,
     },
+    /// Track metadata: tells the receiver whether a track is camera or screen share.
+    /// Sent before the SDP offer so the receiver can classify incoming tracks.
+    TrackInfo {
+        track_type: String,
+        stream_id: String,
+    },
 }

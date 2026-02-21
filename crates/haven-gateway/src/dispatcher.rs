@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::warn;
 use uuid::Uuid;
@@ -33,7 +34,8 @@ pub enum UserMessage {
     /// A gateway event that will be JSON-serialized before sending.
     Event(GatewayEvent),
     /// Raw binary data to be sent as a WebSocket binary frame (zero-copy relay).
-    Binary(Vec<u8>),
+    /// Uses `Bytes` for O(1) cloning across multiple connections.
+    Binary(Bytes),
 }
 
 /// Per-user targeted channel buffer depth. If a client can't keep up with 512
@@ -147,8 +149,9 @@ impl Dispatcher {
 
     /// Send raw binary data to a specific user (all their devices).
     /// Used for zero-copy relay of binary WebSocket frames (e.g., file chunks).
+    /// Uses `Bytes` for O(1) cloning when the user has multiple connections.
     /// Uses `try_send` -- drops data for slow clients with a warning.
-    pub async fn send_binary_to_user(&self, user_id: Uuid, data: Vec<u8>) {
+    pub async fn send_binary_to_user(&self, user_id: Uuid, data: Bytes) {
         let channels = self.inner.user_channels.read().await;
         if let Some(conns) = channels.get(&user_id) {
             for (conn_id, tx) in conns {

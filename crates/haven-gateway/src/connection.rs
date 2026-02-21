@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::{DecodingKey, Validation, decode};
 use tracing::{info, trace, warn};
@@ -135,8 +136,8 @@ pub async fn handle_connection(socket: WebSocket, dispatcher: Dispatcher, jwt_se
                             }
                         }
                         UserMessage::Binary(data) => {
-                            // Binary relay -- send raw bytes as WebSocket binary frame.
-                            if sender.send(Message::Binary(data.into())).await.is_err() {
+                            // Binary relay -- send Bytes directly as WebSocket binary frame.
+                            if sender.send(Message::Binary(data)).await.is_err() {
                                 break;
                             }
                         }
@@ -566,14 +567,15 @@ async fn handle_binary_message(
             let target_user_id =
                 Uuid::from_bytes(data[1..17].try_into().unwrap());
 
-            // Build outgoing frame: replace target_user_id with sender_user_id
+            // Build outgoing frame: replace target_user_id with sender_user_id.
+            // Converted to Bytes for O(1) cloning across multiple user connections.
             let mut outgoing = Vec::with_capacity(data.len());
             outgoing.push(0x01);
             outgoing.extend_from_slice(sender_user_id.as_bytes());
             outgoing.extend_from_slice(&data[17..]); // transfer_id + chunk_index + payload
 
             dispatcher
-                .send_binary_to_user(target_user_id, outgoing)
+                .send_binary_to_user(target_user_id, Bytes::from(outgoing))
                 .await;
         }
 
@@ -595,7 +597,7 @@ async fn handle_binary_message(
             outgoing.extend_from_slice(&data[17..]);
 
             dispatcher
-                .send_binary_to_user(target_user_id, outgoing)
+                .send_binary_to_user(target_user_id, Bytes::from(outgoing))
                 .await;
         }
 
@@ -617,7 +619,7 @@ async fn handle_binary_message(
             outgoing.extend_from_slice(&data[17..]);
 
             dispatcher
-                .send_binary_to_user(target_user_id, outgoing)
+                .send_binary_to_user(target_user_id, Bytes::from(outgoing))
                 .await;
         }
 

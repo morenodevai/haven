@@ -1,13 +1,25 @@
 import App from "./App.svelte";
 import { mount } from "svelte";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 
 (async () => {
+  const appWindow = getCurrentWebviewWindow();
+
   try {
     mount(App, {
       target: document.getElementById("app")!,
     });
+
+    // App rendered — now safe to show the window.
+    // This eliminates the WebView2 blank-screen bug entirely: the window
+    // stays hidden until the first real paint is done.
+    await appWindow.show();
+    await appWindow.setFocus();
   } catch (e: any) {
     console.error("Haven failed to start:", e);
+
+    // Show window even on crash so the user sees the error screen
+    await appWindow.show().catch(() => {});
 
     // Show a visible error screen instead of blank white
     const root = document.getElementById("app")!;
