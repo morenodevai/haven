@@ -43,13 +43,12 @@ fn force_repaint(window: &tauri::WebviewWindow) {
     use tauri::PhysicalSize;
 
     let win = window.clone();
-    // Run async so the window is fully initialized before we poke it
-    tauri::async_runtime::spawn(async move {
+    std::thread::spawn(move || {
         // Small delay to let WebView2 finish its first layout pass
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        std::thread::sleep(std::time::Duration::from_millis(150));
         if let Ok(size) = win.inner_size() {
             let _ = win.set_size(PhysicalSize::new(size.width + 1, size.height));
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            std::thread::sleep(std::time::Duration::from_millis(50));
             let _ = win.set_size(size);
         }
     });
