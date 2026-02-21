@@ -34,6 +34,27 @@ fn grant_media_permissions(window: &tauri::WebviewWindow) {
     });
 }
 
+/// Force WebView2 to repaint by doing a tiny resize bounce.
+/// Works around a known WebView2 bug where the initial render sometimes
+/// produces a blank white screen until something triggers a
+/// layout/repaint (e.g. opening DevTools, resizing the window).
+#[cfg(target_os = "windows")]
+fn force_repaint(window: &tauri::WebviewWindow) {
+    use tauri::PhysicalSize;
+
+    let win = window.clone();
+    // Run async so the window is fully initialized before we poke it
+    tauri::async_runtime::spawn(async move {
+        // Small delay to let WebView2 finish its first layout pass
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if let Ok(size) = win.inner_size() {
+            let _ = win.set_size(PhysicalSize::new(size.width + 1, size.height));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = win.set_size(size);
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // WebView2: allow autoplay audio (for voice chat) and expose real local IPs
@@ -66,6 +87,9 @@ pub fn run() {
 
                 #[cfg(target_os = "windows")]
                 grant_media_permissions(&window);
+
+                #[cfg(target_os = "windows")]
+                force_repaint(&window);
             }
             Ok(())
         })

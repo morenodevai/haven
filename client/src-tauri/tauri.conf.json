@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-cli/schema.json",
   "productName": "Haven",
-  "version": "0.9.9",
+  "version": "0.10.0",
   "identifier": "com.haven.voice",
   "build": {
     "frontendDist": "../dist",
@@ -18,7 +18,8 @@
         "minWidth": 800,
         "minHeight": 600,
         "resizable": true,
-        "fullscreen": false
+        "fullscreen": false,
+        "backgroundColor": "#1a1a2e"
       }
     ],
     "security": {
