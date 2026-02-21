@@ -7,6 +7,7 @@ use tauri::Manager;
 fn grant_media_permissions(window: &tauri::WebviewWindow) {
     use webview2_com::PermissionRequestedEventHandler;
     use webview2_com::Microsoft::Web::WebView2::Win32::{
+        COREWEBVIEW2_PERMISSION_KIND_CAMERA,
         COREWEBVIEW2_PERMISSION_KIND_MICROPHONE,
         COREWEBVIEW2_PERMISSION_STATE_ALLOW,
         COREWEBVIEW2_PERMISSION_STATE_DENY,
@@ -20,7 +21,10 @@ fn grant_media_permissions(window: &tauri::WebviewWindow) {
                 if let Some(args) = args {
                     let mut kind = std::mem::zeroed();
                     args.PermissionKind(&mut kind)?;
-                    if kind == COREWEBVIEW2_PERMISSION_KIND_MICROPHONE {
+                    // Allow both microphone and camera for voice + video chat
+                    if kind == COREWEBVIEW2_PERMISSION_KIND_MICROPHONE
+                        || kind == COREWEBVIEW2_PERMISSION_KIND_CAMERA
+                    {
                         args.SetState(COREWEBVIEW2_PERMISSION_STATE_ALLOW)?;
                     } else {
                         args.SetState(COREWEBVIEW2_PERMISSION_STATE_DENY)?;

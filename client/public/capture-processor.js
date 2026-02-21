@@ -3,13 +3,17 @@
 //
 // Runs on the audio rendering thread. Collects PCM samples and posts
 // them to the main thread when a full buffer is ready.
+//
+// Buffer size: 960 samples at 48 kHz = 20 ms frames.
+// This matches the Opus codec standard frame size and provides much lower
+// latency than the previous 4096-sample buffer (~85 ms -> ~20 ms).
 
 class CaptureProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    // Target ~4096 samples at native sample rate to match the old
-    // ScriptProcessorNode buffer size.
-    this._bufferSize = 4096;
+    // 960 samples at 48 kHz = 20 ms (standard Opus frame duration).
+    // This is the optimal trade-off between latency and processing overhead.
+    this._bufferSize = 960;
     this._buffer = new Float32Array(this._bufferSize);
     this._writeIndex = 0;
   }

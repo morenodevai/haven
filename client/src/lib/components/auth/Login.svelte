@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { login, register, authError } from "../../stores/auth";
+  import { login, register, authError, rememberMe, saveRememberMe, tryAutoLogin, autoLoginInProgress, skipAutoLogin } from "../../stores/auth";
   import { generateKey } from "../../ipc/crypto";
   import { setChannelKey, DEFAULT_CHANNEL_KEY } from "../../stores/messages";
+  import { onMount } from "svelte";
 
   let username = $state("");
   let password = $state("");
@@ -9,6 +10,21 @@
   let isRegistering = $state(false);
   let loading = $state(false);
   let showKeySetup = $state(false);
+  let remember = $state(false);
+
+  // Attempt auto-login from saved credentials on mount
+  onMount(() => {
+    tryAutoLogin().then((success) => {
+      if (success) {
+        // Check if channel key was restored
+        const savedKey = localStorage.getItem("haven_channel_key");
+        if (!savedKey) {
+          channelKeyInput = DEFAULT_CHANNEL_KEY;
+          showKeySetup = true;
+        }
+      }
+    });
+  });
 
   async function handleSubmit() {
     if (!username || !password) return;
@@ -29,6 +45,12 @@
         loading = false;
         return;
       }
+
+      // Save credentials if Remember Me is checked
+      if (remember) {
+        await saveRememberMe(username, password, savedKey);
+        rememberMe.set(true);
+      }
     } catch {
       // Error already set in store
     }
@@ -41,17 +63,35 @@
     channelKeyInput = key;
   }
 
-  function handleSetKey() {
+  async function handleSetKey() {
     if (!channelKeyInput.trim()) return;
     setChannelKey(channelKeyInput.trim());
     showKeySetup = false;
+
+    // Save credentials + channel key if Remember Me was checked
+    if (remember) {
+      await saveRememberMe(username, password, channelKeyInput.trim());
+      rememberMe.set(true);
+    }
   }
 </script>
 
-{#if showKeySetup}
+{#if $autoLoginInProgress}
   <div class="login-container">
     <div class="login-card">
-      <div class="logo">🔐</div>
+      <div class="logo">H</div>
+      <h1>Haven</h1>
+      <p class="subtitle">Signing in...</p>
+      <div class="auto-login-spinner"></div>
+      <button class="toggle" onclick={skipAutoLogin}>
+        Log into a different account
+      </button>
+    </div>
+  </div>
+{:else if showKeySetup}
+  <div class="login-container">
+    <div class="login-card">
+      <div class="logo key-logo">K</div>
       <h1>Channel Key</h1>
       <p class="subtitle">
         Enter a shared encryption key, or generate a new one and share it with your friend.
@@ -114,6 +154,13 @@
           minlength="8"
           required
         />
+
+        {#if !isRegistering}
+          <label class="remember-me">
+            <input type="checkbox" bind:checked={remember} />
+            <span>Remember me</span>
+          </label>
+        {/if}
 
         <button class="btn primary" type="submit" disabled={loading}>
           {loading ? "..." : isRegistering ? "Create Account" : "Log In"}
@@ -256,5 +303,41 @@
     padding: 8px;
     background: rgba(108, 99, 255, 0.08);
     border-radius: 6px;
+  }
+
+  .key-logo {
+    background: var(--accent);
+  }
+
+  .remember-me {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .remember-me input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+
+  .auto-login-spinner {
+    width: 32px;
+    height: 32px;
+    border: 3px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    margin: 16px auto 0;
+    animation: spin 0.8s linear infinite;
+  }
+
+  @keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
   }
 </style>

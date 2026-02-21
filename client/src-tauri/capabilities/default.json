@@ -10,11 +10,18 @@
     "fs:default",
     "fs:allow-create",
     "fs:allow-write",
+    "fs:allow-read-text-file",
+    "fs:allow-exists",
+    "fs:allow-remove",
     "fs:allow-open",
+    "fs:allow-mkdir",
     "core:resources:allow-close",
     "fs:scope-home-recursive",
     "fs:scope-desktop-recursive",
     "fs:scope-download-recursive",
-    "fs:scope-document-recursive"
+    "fs:scope-document-recursive",
+    "fs:scope-appdata-recursive",
+    "fs:allow-write-text-file",
+    "fs:create-app-specific-dirs"
   ]
 }

@@ -13,7 +13,18 @@
   import MessageList from "./lib/components/chat/MessageList.svelte";
   import MessageInput from "./lib/components/chat/MessageInput.svelte";
   import FileChannel from "./lib/components/chat/FileChannel.svelte";
+  import VideoGrid from "./lib/components/voice/VideoGrid.svelte";
+  import { voiceConnected, videoEnabled, screenShareEnabled, voiceParticipantList } from "./lib/stores/voice";
   import { onMount } from "svelte";
+
+  // Derived: true when any video tiles should be visible
+  let showVideoGrid = $derived(
+    $voiceConnected && (
+      $videoEnabled ||
+      $screenShareEnabled ||
+      $voiceParticipantList.some(p => p.videoStream !== null || p.screenStream !== null)
+    )
+  );
 
   let gateway: Gateway | null = $state(null);
   let connected = $state(false);
@@ -151,6 +162,9 @@
           {connected ? "Connected" : "Connecting..."}
         </div>
       </div>
+      {#if showVideoGrid}
+        <VideoGrid />
+      {/if}
       {#if $activeChannel === "general"}
         <MessageList />
         <MessageInput />

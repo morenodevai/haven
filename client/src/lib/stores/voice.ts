@@ -11,11 +11,25 @@ export interface VoiceParticipant {
   selfMute: boolean;
   selfDeaf: boolean;
   speaking: boolean;
+  videoStream: MediaStream | null;
+  screenStream: MediaStream | null;
 }
 
 // --- Constants ---
 
 const VOICE_CHANNEL_ID = "00000000-0000-0000-0000-000000000002";
+
+// Audio quality: 16 kHz gives clear voice reproduction (telephone = 8 kHz,
+// wideband VoIP = 16 kHz, fullband = 48 kHz). 16 kHz is the sweet spot for
+// server-relayed voice: 2x quality of 8 kHz at manageable bandwidth.
+const VOICE_SAMPLE_RATE = 16000;
+
+// Capture buffer: 320 samples at 16 kHz = 20 ms frames (Opus standard frame size).
+// Lower latency than the previous 4096-sample buffer at 48 kHz.
+const CAPTURE_BUFFER_SAMPLES = 320;
+
+// Jitter buffer: extra lead time (ms) to absorb network jitter in playback scheduling.
+const JITTER_BUFFER_MS = 40;
 
 // --- Stores ---
 
@@ -26,6 +40,12 @@ export const voiceParticipants = writable<Map<string, VoiceParticipant>>(new Map
 export const localSpeaking = writable(false);
 
 export const voiceError = writable<string | null>(null);
+
+// Video/screenshare stores
+export const videoEnabled = writable(false);
+export const screenShareEnabled = writable(false);
+export const localVideoStream = writable<MediaStream | null>(null);
+export const localScreenStream = writable<MediaStream | null>(null);
 
 export const voiceParticipantList = derived(voiceParticipants, ($p) =>
   Array.from($p.values())
@@ -39,9 +59,23 @@ let localStream: MediaStream | null = null;
 let audioContext: AudioContext | null = null;
 let captureNode: AudioWorkletNode | null = null;
 let vadInterval: number | null = null;
+let vadContext: AudioContext | null = null;
 
 // E2E encryption key (derived from channel key)
 let cryptoKey: CryptoKey | null = null;
+
+// WebRTC peer connections for video/screenshare (userId -> RTCPeerConnection)
+const peerConnections: Map<string, RTCPeerConnection> = new Map();
+
+// Track what we're sending to each peer so we can replace tracks
+const videoSenders: Map<string, RTCRtpSender> = new Map();
+const screenSenders: Map<string, RTCRtpSender> = new Map();
+
+// Track whether we're the polite peer (for perfect negotiation pattern)
+const politeFlags: Map<string, boolean> = new Map();
+
+// Whether we're currently making an offer (for perfect negotiation glare handling)
+let makingOffer = false;
 
 // Playback state per remote user
 const playbackContexts: Map<string, {
@@ -149,7 +183,21 @@ export async function joinVoice() {
   }
 
   try {
-    localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    // Optimized audio constraints for high-quality voice chat:
+    // - echoCancellation: prevents echo from speakers feeding back into mic
+    // - noiseSuppression: reduces background noise (fans, keyboard, etc.)
+    // - autoGainControl: normalizes volume levels across different mics
+    // - sampleRate: 48kHz capture, we downsample to 16kHz before sending
+    // - channelCount: mono is sufficient for voice and halves bandwidth
+    localStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        sampleRate: 48000,
+        channelCount: 1,
+      },
+    });
   } catch (e: any) {
     console.error("[voice] getUserMedia failed:", e);
     voiceError.set("Microphone access denied: " + (e.message || e.name));
@@ -255,6 +303,7 @@ export function handleVoiceStateUpdate(event: any) {
       return new Map(m);
     });
     cleanupPlayback(userId);
+    closePeerConnection(userId);
     return;
   }
 
@@ -268,13 +317,67 @@ export function handleVoiceStateUpdate(event: any) {
       selfMute: data.self_mute,
       selfDeaf: data.self_deaf,
       speaking: existing?.speaking ?? false,
+      videoStream: existing?.videoStream ?? null,
+      screenStream: existing?.screenStream ?? null,
     });
     return new Map(m);
   });
+
+  // If a new remote user joined and we're in the channel, set up a peer connection
+  if (userId !== myUserId && get(voiceConnected)) {
+    ensurePeerConnection(userId);
+  }
 }
 
-export function handleVoiceSignal(_event: any) {
-  // No longer used — audio is server-relayed, not P2P
+export async function handleVoiceSignal(event: any) {
+  // Used for WebRTC P2P video/screenshare signaling.
+  // Audio remains server-relayed, but video uses P2P connections.
+  const data = event.data;
+  const fromUserId: string = data.from_user_id;
+  const signal = data.signal;
+
+  if (!get(voiceConnected) || !gw || !myUserId) return;
+
+  const pc = ensurePeerConnection(fromUserId);
+
+  try {
+    if (signal.signal_type === "Offer") {
+      // Perfect negotiation: handle incoming offer
+      const offerCollision = makingOffer || pc.signalingState !== "stable";
+      const isPolite = politeFlags.get(fromUserId) ?? false;
+      const ignoreOffer = !isPolite && offerCollision;
+
+      if (ignoreOffer) return;
+
+      await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: signal.sdp }));
+      await pc.setLocalDescription();
+
+      if (pc.localDescription) {
+        gw.send({
+          type: "VoiceSignalSend",
+          data: {
+            target_user_id: fromUserId,
+            signal: {
+              signal_type: "Answer",
+              sdp: pc.localDescription.sdp,
+            },
+          },
+        });
+      }
+    } else if (signal.signal_type === "Answer") {
+      await pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: signal.sdp }));
+    } else if (signal.signal_type === "IceCandidate") {
+      if (signal.candidate) {
+        await pc.addIceCandidate(new RTCIceCandidate({
+          candidate: signal.candidate,
+          sdpMid: signal.sdp_mid ?? undefined,
+          sdpMLineIndex: signal.sdp_m_line_index ?? undefined,
+        }));
+      }
+    }
+  } catch (e) {
+    console.error("[voice] Failed to handle signal from", fromUserId, e);
+  }
 }
 
 export function handleVoiceAudioData(event: any) {
@@ -296,7 +399,7 @@ export function handleVoiceAudioData(event: any) {
 
 async function setupAudioCapture(stream: MediaStream) {
   try {
-    audioContext = new AudioContext();
+    audioContext = new AudioContext({ sampleRate: 48000 });
     const source = audioContext.createMediaStreamSource(stream);
 
     // Load the AudioWorklet processor module (replaces deprecated ScriptProcessorNode)
@@ -313,15 +416,22 @@ async function setupAudioCapture(stream: MediaStream) {
 
       const inputData: Float32Array = e.data.pcmData;
 
-      // Downsample from native rate (usually 48kHz) to ~8kHz
+      // Downsample from native rate (48kHz) to 16kHz (wideband voice).
+      // Linear interpolation for smoother downsampling than nearest-neighbor.
       const sampleRate = audioContext!.sampleRate;
-      const targetRate = 8000;
-      const ratio = Math.round(sampleRate / targetRate);
-      const downsampled = new Int16Array(Math.floor(inputData.length / ratio));
+      const targetRate = VOICE_SAMPLE_RATE;
+      const ratio = sampleRate / targetRate;
+      const outputLen = Math.floor(inputData.length / ratio);
+      const downsampled = new Int16Array(outputLen);
 
-      for (let i = 0; i < downsampled.length; i++) {
-        const s = Math.max(-1, Math.min(1, inputData[i * ratio]));
-        downsampled[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      for (let i = 0; i < outputLen; i++) {
+        const srcIdx = i * ratio;
+        const idx0 = Math.floor(srcIdx);
+        const idx1 = Math.min(idx0 + 1, inputData.length - 1);
+        const frac = srcIdx - idx0;
+        const sample = inputData[idx0] * (1 - frac) + inputData[idx1] * frac;
+        const clamped = Math.max(-1, Math.min(1, sample));
+        downsampled[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7FFF;
       }
 
       // E2E encrypt then send
@@ -345,10 +455,10 @@ function playReceivedAudio(userId: string, pcmBytes: Uint8Array) {
   try {
     const samples = new Int16Array(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength / 2);
 
-    // Get or create playback context for this user
+    // Get or create playback context for this user (16 kHz wideband)
     let pb = playbackContexts.get(userId);
     if (!pb) {
-      const ctx = new AudioContext({ sampleRate: 8000 });
+      const ctx = new AudioContext({ sampleRate: VOICE_SAMPLE_RATE });
       pb = { ctx, nextPlayTime: ctx.currentTime };
       playbackContexts.set(userId, pb);
     }
@@ -360,24 +470,31 @@ function playReceivedAudio(userId: string, pcmBytes: Uint8Array) {
     }
 
     // Create audio buffer and schedule playback
-    const buffer = pb.ctx.createBuffer(1, float32.length, 8000);
+    const buffer = pb.ctx.createBuffer(1, float32.length, VOICE_SAMPLE_RATE);
     buffer.getChannelData(0).set(float32);
 
     const source = pb.ctx.createBufferSource();
     source.buffer = buffer;
     source.connect(pb.ctx.destination);
 
-    // Schedule seamless playback
+    // Jitter buffer: schedule playback with lead time to absorb network jitter.
+    // If we've fallen behind real-time (packets arrived late / gap in audio),
+    // reset the schedule with the jitter buffer offset.
     const now = pb.ctx.currentTime;
+    const jitterOffset = JITTER_BUFFER_MS / 1000;
     if (pb.nextPlayTime < now) {
-      pb.nextPlayTime = now + 0.01; // Small buffer to avoid clicks
+      pb.nextPlayTime = now + jitterOffset;
     }
     source.start(pb.nextPlayTime);
     pb.nextPlayTime += buffer.duration;
 
-    // Update speaking state for remote user
-    const avg = float32.reduce((sum, v) => sum + Math.abs(v), 0) / float32.length;
-    const speaking = avg > 0.01;
+    // RMS-based speaking detection (more accurate than simple average)
+    let sumSquares = 0;
+    for (let i = 0; i < float32.length; i++) {
+      sumSquares += float32[i] * float32[i];
+    }
+    const rms = Math.sqrt(sumSquares / float32.length);
+    const speaking = rms > 0.01;
     voiceParticipants.update((m) => {
       const p = m.get(userId);
       if (p && p.speaking !== speaking) {
@@ -409,41 +526,322 @@ function cleanupAllPlayback() {
 
 function setupVAD(stream: MediaStream) {
   if (vadInterval) clearInterval(vadInterval);
+  if (vadContext) {
+    vadContext.close().catch(() => {});
+    vadContext = null;
+  }
 
   try {
     const ctx = new AudioContext();
+    vadContext = ctx;
     const source = ctx.createMediaStreamSource(stream);
     const analyser = ctx.createAnalyser();
-    analyser.fftSize = 512;
-    analyser.smoothingTimeConstant = 0.4;
+    // Larger FFT for better frequency resolution; higher smoothing for stable readings
+    analyser.fftSize = 1024;
+    analyser.smoothingTimeConstant = 0.5;
     source.connect(analyser);
 
-    const data = new Uint8Array(analyser.frequencyBinCount);
+    const timeDomainData = new Float32Array(analyser.fftSize);
+    // Hysteresis thresholds to prevent flickering
+    const SPEAK_THRESHOLD = 0.015;  // RMS level to start speaking
+    const SILENCE_THRESHOLD = 0.008; // RMS level to stop speaking
+    let isSpeaking = false;
 
     vadInterval = window.setInterval(() => {
-      analyser.getByteFrequencyData(data);
-      let sum = 0;
-      for (let i = 0; i < data.length; i++) {
-        sum += data[i];
+      analyser.getFloatTimeDomainData(timeDomainData);
+      // RMS-based voice activity detection (more reliable than frequency averaging)
+      let sumSquares = 0;
+      for (let i = 0; i < timeDomainData.length; i++) {
+        sumSquares += timeDomainData[i] * timeDomainData[i];
       }
-      const average = sum / data.length;
-      const speaking = average > 15;
-      localSpeaking.set(speaking);
+      const rms = Math.sqrt(sumSquares / timeDomainData.length);
+
+      // Hysteresis: different thresholds for start vs stop to prevent flickering
+      if (isSpeaking) {
+        if (rms < SILENCE_THRESHOLD) isSpeaking = false;
+      } else {
+        if (rms > SPEAK_THRESHOLD) isSpeaking = true;
+      }
+
+      localSpeaking.set(isSpeaking);
 
       // Update our own participant speaking state
       if (myUserId) {
         voiceParticipants.update((m) => {
           const p = m.get(myUserId!);
-          if (p && p.speaking !== speaking) {
-            m.set(myUserId!, { ...p, speaking });
+          if (p && p.speaking !== isSpeaking) {
+            m.set(myUserId!, { ...p, speaking: isSpeaking });
             return new Map(m);
           }
           return m;
         });
       }
-    }, 100);
+    }, 50); // 50ms polling for more responsive speaking indicator
   } catch (e) {
     console.error("Failed to setup VAD:", e);
+  }
+}
+
+// --- WebRTC Peer Connection Management (Video/Screenshare) ---
+
+const ICE_SERVERS: RTCIceServer[] = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
+];
+
+function ensurePeerConnection(remoteUserId: string): RTCPeerConnection {
+  let pc = peerConnections.get(remoteUserId);
+  if (pc) return pc;
+
+  pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  peerConnections.set(remoteUserId, pc);
+
+  // Perfect negotiation: determine polite/impolite peer based on user ID comparison
+  // The peer with the lexicographically smaller ID is "polite"
+  politeFlags.set(remoteUserId, myUserId! < remoteUserId);
+
+  // ICE candidate handler
+  pc.onicecandidate = (e) => {
+    if (e.candidate && gw) {
+      gw.send({
+        type: "VoiceSignalSend",
+        data: {
+          target_user_id: remoteUserId,
+          signal: {
+            signal_type: "IceCandidate",
+            candidate: e.candidate.candidate,
+            sdp_mid: e.candidate.sdpMid ?? null,
+            sdp_m_line_index: e.candidate.sdpMLineIndex ?? null,
+          },
+        },
+      });
+    }
+  };
+
+  // Handle negotiation needed (fires when tracks are added/removed)
+  pc.onnegotiationneeded = async () => {
+    if (!gw) return;
+    try {
+      makingOffer = true;
+      await pc!.setLocalDescription();
+      if (pc!.localDescription) {
+        gw.send({
+          type: "VoiceSignalSend",
+          data: {
+            target_user_id: remoteUserId,
+            signal: {
+              signal_type: "Offer",
+              sdp: pc!.localDescription.sdp,
+            },
+          },
+        });
+      }
+    } catch (e) {
+      console.error("[voice] Negotiation failed for", remoteUserId, e);
+    } finally {
+      makingOffer = false;
+    }
+  };
+
+  // Handle incoming tracks (video/screen from remote peer)
+  pc.ontrack = (e) => {
+    const stream = e.streams[0];
+    if (!stream) return;
+
+    // Determine if this is a camera or screen share track based on stream ID convention.
+    // We use stream IDs starting with "screen-" for screen shares.
+    const isScreen = stream.id.startsWith("screen-");
+
+    voiceParticipants.update((m) => {
+      const p = m.get(remoteUserId);
+      if (p) {
+        if (isScreen) {
+          m.set(remoteUserId, { ...p, screenStream: stream });
+        } else {
+          m.set(remoteUserId, { ...p, videoStream: stream });
+        }
+        return new Map(m);
+      }
+      return m;
+    });
+
+    // When the track ends, clear the stream reference
+    e.track.onended = () => {
+      voiceParticipants.update((m) => {
+        const p = m.get(remoteUserId);
+        if (p) {
+          if (isScreen) {
+            m.set(remoteUserId, { ...p, screenStream: null });
+          } else {
+            m.set(remoteUserId, { ...p, videoStream: null });
+          }
+          return new Map(m);
+        }
+        return m;
+      });
+    };
+  };
+
+  pc.onconnectionstatechange = () => {
+    if (pc!.connectionState === "failed" || pc!.connectionState === "disconnected") {
+      console.warn("[voice] Peer connection to", remoteUserId, "state:", pc!.connectionState);
+    }
+  };
+
+  // If we have local video or screen share active, add tracks to this new connection
+  const currentVideoStream = get(localVideoStream);
+  if (currentVideoStream) {
+    for (const track of currentVideoStream.getVideoTracks()) {
+      const sender = pc.addTrack(track, currentVideoStream);
+      videoSenders.set(remoteUserId, sender);
+    }
+  }
+
+  const currentScreenStream = get(localScreenStream);
+  if (currentScreenStream) {
+    for (const track of currentScreenStream.getVideoTracks()) {
+      const sender = pc.addTrack(track, currentScreenStream);
+      screenSenders.set(remoteUserId, sender);
+    }
+  }
+
+  return pc;
+}
+
+function closePeerConnection(remoteUserId: string) {
+  const pc = peerConnections.get(remoteUserId);
+  if (pc) {
+    pc.close();
+    peerConnections.delete(remoteUserId);
+  }
+  videoSenders.delete(remoteUserId);
+  screenSenders.delete(remoteUserId);
+  politeFlags.delete(remoteUserId);
+}
+
+function closeAllPeerConnections() {
+  for (const [userId] of peerConnections) {
+    closePeerConnection(userId);
+  }
+}
+
+// --- Video toggle ---
+
+export async function toggleCamera() {
+  if (!get(voiceConnected)) return;
+
+  if (get(videoEnabled)) {
+    // Turn off camera
+    const stream = get(localVideoStream);
+    if (stream) {
+      for (const track of stream.getTracks()) {
+        track.stop();
+      }
+      // Remove video tracks from all peer connections
+      for (const [userId, sender] of videoSenders) {
+        const pc = peerConnections.get(userId);
+        if (pc) {
+          pc.removeTrack(sender);
+        }
+      }
+      videoSenders.clear();
+    }
+    localVideoStream.set(null);
+    videoEnabled.set(false);
+  } else {
+    // Turn on camera
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          width: { ideal: 640, max: 1280 },
+          height: { ideal: 480, max: 720 },
+          frameRate: { ideal: 24, max: 30 },
+        },
+      });
+      localVideoStream.set(stream);
+      videoEnabled.set(true);
+
+      // Add video track to all existing peer connections
+      for (const [userId, pc] of peerConnections) {
+        for (const track of stream.getVideoTracks()) {
+          const sender = pc.addTrack(track, stream);
+          videoSenders.set(userId, sender);
+        }
+      }
+    } catch (e: any) {
+      console.error("[voice] Camera access failed:", e);
+      voiceError.set("Camera access denied: " + (e.message || e.name));
+    }
+  }
+}
+
+// --- Screen share toggle ---
+
+export async function toggleScreenShare() {
+  if (!get(voiceConnected)) return;
+
+  if (get(screenShareEnabled)) {
+    // Stop screen share
+    const stream = get(localScreenStream);
+    if (stream) {
+      for (const track of stream.getTracks()) {
+        track.stop();
+      }
+      // Remove screen tracks from all peer connections
+      for (const [userId, sender] of screenSenders) {
+        const pc = peerConnections.get(userId);
+        if (pc) {
+          pc.removeTrack(sender);
+        }
+      }
+      screenSenders.clear();
+    }
+    localScreenStream.set(null);
+    screenShareEnabled.set(false);
+  } else {
+    // Start screen share
+    try {
+      // Use a stream ID prefix to distinguish screen share from camera
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: {
+          width: { ideal: 1920, max: 1920 },
+          height: { ideal: 1080, max: 1080 },
+          frameRate: { ideal: 15, max: 30 },
+        },
+        audio: false,
+      });
+
+      localScreenStream.set(stream);
+      screenShareEnabled.set(true);
+
+      // Add screen track to all existing peer connections
+      for (const [userId, pc] of peerConnections) {
+        for (const track of stream.getVideoTracks()) {
+          const sender = pc.addTrack(track, stream);
+          screenSenders.set(userId, sender);
+        }
+      }
+
+      // Handle user stopping the share via the browser's "Stop Sharing" button
+      stream.getVideoTracks()[0].onended = () => {
+        // Clean up screen share state
+        for (const [userId, sender] of screenSenders) {
+          const pc = peerConnections.get(userId);
+          if (pc) {
+            pc.removeTrack(sender);
+          }
+        }
+        screenSenders.clear();
+        localScreenStream.set(null);
+        screenShareEnabled.set(false);
+      };
+    } catch (e: any) {
+      console.error("[voice] Screen share failed:", e);
+      // User probably cancelled the picker — don't show error for that
+      if (e.name !== "NotAllowedError") {
+        voiceError.set("Screen share failed: " + (e.message || e.name));
+      }
+    }
   }
 }
 
@@ -453,6 +851,11 @@ function cleanupLocalMedia() {
   if (vadInterval) {
     clearInterval(vadInterval);
     vadInterval = null;
+  }
+
+  if (vadContext) {
+    vadContext.close().catch(() => {});
+    vadContext = null;
   }
 
   if (captureNode) {
@@ -471,6 +874,29 @@ function cleanupLocalMedia() {
     }
     localStream = null;
   }
+
+  // Clean up video stream
+  const vidStream = get(localVideoStream);
+  if (vidStream) {
+    for (const track of vidStream.getTracks()) {
+      track.stop();
+    }
+    localVideoStream.set(null);
+  }
+  videoEnabled.set(false);
+
+  // Clean up screen share stream
+  const scrStream = get(localScreenStream);
+  if (scrStream) {
+    for (const track of scrStream.getTracks()) {
+      track.stop();
+    }
+    localScreenStream.set(null);
+  }
+  screenShareEnabled.set(false);
+
+  // Clean up all peer connections
+  closeAllPeerConnections();
 
   localSpeaking.set(false);
 }

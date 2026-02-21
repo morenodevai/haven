@@ -1,5 +1,7 @@
 import { writable, get } from "svelte/store";
 import * as api from "../ipc/api";
+import { exists, readTextFile, writeTextFile, remove, BaseDirectory } from "@tauri-apps/plugin-fs";
+import { setChannelKey } from "./messages";
 
 // SECURITY NOTE: The JWT token is currently stored in localStorage, which is
 // accessible to any JavaScript running in the page context (XSS risk).
@@ -27,6 +29,118 @@ const initial: AuthState = {
 
 export const auth = writable<AuthState>(initial);
 export const authError = writable<string | null>(null);
+
+// "Remember Me" state — true if the user checked the box on their last login
+export const rememberMe = writable<boolean>(false);
+
+// Whether auto-login from saved credentials is in progress
+export const autoLoginInProgress = writable<boolean>(false);
+export const autoLoginSkipped = writable<boolean>(false);
+
+// --- Persistent credentials (Remember Me) ---
+// Stored in {AppData}/haven-credentials.json which survives NSIS app updates.
+// Contains username + password for re-authentication, plus the channel key.
+
+const CREDENTIALS_FILE = "haven-credentials.json";
+
+interface SavedCredentials {
+  username: string;
+  password: string;
+  channelKey: string | null;
+}
+
+/** Save credentials to AppData for Remember Me. */
+export async function saveRememberMe(
+  username: string,
+  password: string,
+  channelKey: string | null,
+): Promise<void> {
+  try {
+    const data: SavedCredentials = { username, password, channelKey };
+    await writeTextFile(CREDENTIALS_FILE, JSON.stringify(data), {
+      baseDir: BaseDirectory.AppData,
+    });
+  } catch (e) {
+    console.warn("[auth] Failed to save Remember Me credentials:", e);
+  }
+}
+
+/** Clear saved credentials from AppData. */
+export async function clearRememberMe(): Promise<void> {
+  try {
+    const fileExists = await exists(CREDENTIALS_FILE, {
+      baseDir: BaseDirectory.AppData,
+    });
+    if (fileExists) {
+      await remove(CREDENTIALS_FILE, { baseDir: BaseDirectory.AppData });
+    }
+  } catch (e) {
+    console.warn("[auth] Failed to clear Remember Me credentials:", e);
+  }
+}
+
+/** Load saved credentials from AppData (returns null if none exist). */
+export async function loadRememberMe(): Promise<SavedCredentials | null> {
+  try {
+    const fileExists = await exists(CREDENTIALS_FILE, {
+      baseDir: BaseDirectory.AppData,
+    });
+    if (!fileExists) return null;
+
+    const text = await readTextFile(CREDENTIALS_FILE, {
+      baseDir: BaseDirectory.AppData,
+    });
+    const data = JSON.parse(text) as SavedCredentials;
+    if (data.username && data.password) return data;
+    return null;
+  } catch (e) {
+    console.warn("[auth] Failed to load Remember Me credentials:", e);
+    return null;
+  }
+}
+
+/** Attempt auto-login from saved credentials. Called on app startup. */
+export async function tryAutoLogin(): Promise<boolean> {
+  if (get(autoLoginSkipped)) return false;
+
+  const saved = await loadRememberMe();
+  if (!saved) return false;
+
+  autoLoginInProgress.set(true);
+  rememberMe.set(true);
+
+  try {
+    // Check if user skipped during the async login call
+    if (get(autoLoginSkipped)) return false;
+
+    const res = await api.login(saved.username, saved.password);
+
+    if (get(autoLoginSkipped)) return false;
+
+    saveSession(res.user_id, res.username, res.token);
+
+    // Restore channel key if saved (set both localStorage and the reactive store)
+    if (saved.channelKey) {
+      setChannelKey(saved.channelKey);
+    }
+
+    return true;
+  } catch (e: any) {
+    console.warn("[auth] Auto-login failed:", e);
+    // Saved credentials are invalid — clear them
+    await clearRememberMe();
+    rememberMe.set(false);
+    return false;
+  } finally {
+    autoLoginInProgress.set(false);
+  }
+}
+
+/** Skip auto-login and show manual login form. */
+export function skipAutoLogin() {
+  autoLoginSkipped.set(true);
+  autoLoginInProgress.set(false);
+}
 
 // Restore session from localStorage on startup
 const savedToken = localStorage.getItem("haven_token");
@@ -83,6 +197,9 @@ export function logout() {
   // Also clear the channel encryption key on logout to limit exposure window
   localStorage.removeItem("haven_channel_key");
   auth.set(initial);
+  // Clear saved credentials on explicit logout
+  clearRememberMe().catch(() => {});
+  rememberMe.set(false);
 }
 
 function saveSession(userId: string, username: string, token: string) {

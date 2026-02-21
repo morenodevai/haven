@@ -5,10 +5,14 @@
     voiceDeafened,
     voiceError,
     voiceParticipantList,
+    videoEnabled,
+    screenShareEnabled,
     joinVoice,
     leaveVoice,
     toggleMute,
     toggleDeafen,
+    toggleCamera,
+    toggleScreenShare,
   } from "../../stores/voice";
 </script>
 
@@ -89,6 +93,40 @@
         {:else}
           <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
             <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0014 7.97v8.05c1.48-.73 2.5-2.25 2.5-3.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
+          </svg>
+        {/if}
+      </button>
+
+      <button
+        class="control-btn"
+        class:active={$videoEnabled}
+        onclick={toggleCamera}
+        title={$videoEnabled ? "Turn off camera" : "Turn on camera"}
+      >
+        {#if $videoEnabled}
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/>
+          </svg>
+        {:else}
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M21 6.5l-4 4V7c0-.55-.45-1-1-1H9.82L21 17.18V6.5zM3.27 2L2 3.27 4.73 6H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.21 0 .39-.08.54-.18L19.73 21 21 19.73 3.27 2z"/>
+          </svg>
+        {/if}
+      </button>
+
+      <button
+        class="control-btn"
+        class:active={$screenShareEnabled}
+        onclick={toggleScreenShare}
+        title={$screenShareEnabled ? "Stop sharing" : "Share screen"}
+      >
+        {#if $screenShareEnabled}
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M20 18c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2H4c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2H0v2h24v-2h-4zM4 6h16v10H4V6z"/>
+          </svg>
+        {:else}
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M21.79 18l2 2H24v-2h-2.21zM1.11 2.98l1.55 1.56c-.41.37-.66.89-.66 1.48V16c0 1.1.9 2 2 2H0v2h18.13l2.71 2.71 1.41-1.41L2.52 1.57 1.11 2.98zM4 6.02h.13l7.87 7.87V16H4V6.02zM20 6v9.78l1.65 1.65c.22-.32.35-.71.35-1.13V6c0-1.1-.9-2-2-2H7.8l2 2H20z"/>
           </svg>
         {/if}
       </button>
