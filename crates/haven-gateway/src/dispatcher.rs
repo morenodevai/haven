@@ -38,7 +38,7 @@ pub enum UserMessage {
 
 /// Per-user targeted channel buffer depth. If a client can't keep up with 512
 /// queued events, it is too slow and messages will be dropped with a warning.
-const USER_CHANNEL_CAPACITY: usize = 512;
+const USER_CHANNEL_CAPACITY: usize = 2048;
 
 /// Manages all connected clients and broadcasts events.
 #[derive(Clone)]

@@ -28,7 +28,7 @@ const ICE_SERVERS: RTCIceServer[] = [
   ...getTurnServers(),
 ];
 const ICE_TIMEOUT = 10_000; // 10s — if P2P fails, fall back to server relay
-const RELAY_ACK_INTERVAL = 50; // receiver acks every N chunks
+const RELAY_ACK_INTERVAL = 20; // receiver acks every N chunks
 
 // --- Types ---
 
@@ -64,6 +64,7 @@ interface TransferInternal {
   // Ack-based flow control for relay sender
   ackedChunkIndex?: number; // highest acked chunk index (-1 = none)
   ackResolve?: (() => void) | null; // resolve function when waiting for ack
+  writeQueue?: Promise<void>; // sequential write chain — prevents race between chunks and FileDone
 }
 
 // --- Stores ---
@@ -756,45 +757,59 @@ async function handleBinaryFileChunk(
     const internal = internals.get(transferId);
     if (!internal?.cryptoKey || !internal.fileHandle) return;
 
-    try {
-        // Decrypt using worker pool
-        const decrypted = await cryptoPool.decrypt(
-            internal.cryptoKey,
-            encryptedPayload,
-            chunkIndex
-        );
+    // Start decryption immediately (runs in parallel across worker pool)
+    const decryptPromise = cryptoPool.decrypt(
+        internal.cryptoKey,
+        encryptedPayload,
+        chunkIndex
+    );
 
-        await internal.fileHandle.write(new Uint8Array(decrypted));
+    // Chain the file write sequentially — prevents interleaved writes and
+    // ensures FileDone can await all pending writes before closing the handle.
+    const prevQueue = internal.writeQueue || Promise.resolve();
+    internal.writeQueue = prevQueue.then(async () => {
+        try {
+            const decrypted = await decryptPromise;
+            await internal.fileHandle!.write(new Uint8Array(decrypted));
 
-        const t = getTransfer(transferId);
-        if (t) {
-            updateTransfer(transferId, {
-                bytesTransferred: t.bytesTransferred + decrypted.byteLength,
-                status: "transferring",
-                startTime: t.startTime || Date.now(),
-            });
+            const t = getTransfer(transferId);
+            if (t) {
+                updateTransfer(transferId, {
+                    bytesTransferred: t.bytesTransferred + decrypted.byteLength,
+                    status: "transferring",
+                    startTime: t.startTime || Date.now(),
+                });
+            }
+        } catch (e) {
+            console.error("[transfers] Binary chunk write error:", e);
+            updateTransfer(transferId, { status: "failed" });
         }
+    });
 
-        // Send binary ack every RELAY_ACK_INTERVAL chunks
-        if (chunkIndex > 0 && chunkIndex % RELAY_ACK_INTERVAL === 0 && gw) {
-            const targetBytes = uuidToBytes(fromUserId);
-            const transferBytes = uuidToBytes(transferId);
-            const ackFrame = new Uint8Array(37);
-            ackFrame[0] = 0x02; // FileAckSend
-            ackFrame.set(targetBytes, 1);
-            ackFrame.set(transferBytes, 17);
-            const ackView = new DataView(ackFrame.buffer as ArrayBuffer);
-            ackView.setUint32(33, chunkIndex);
-            gw.sendBinary(ackFrame.buffer as ArrayBuffer);
-        }
-    } catch (e) {
-        console.error("[transfers] Binary chunk write error:", e);
-        updateTransfer(transferId, { status: "failed" });
+    // Send binary ack every RELAY_ACK_INTERVAL chunks
+    if (chunkIndex > 0 && chunkIndex % RELAY_ACK_INTERVAL === 0 && gw) {
+        const targetBytes = uuidToBytes(fromUserId);
+        const transferBytes = uuidToBytes(transferId);
+        const ackFrame = new Uint8Array(37);
+        ackFrame[0] = 0x02; // FileAckSend
+        ackFrame.set(targetBytes, 1);
+        ackFrame.set(transferBytes, 17);
+        const ackView = new DataView(ackFrame.buffer as ArrayBuffer);
+        ackView.setUint32(33, chunkIndex);
+        gw.sendBinary(ackFrame.buffer as ArrayBuffer);
     }
 }
 
 async function handleBinaryFileDone(fromUserId: string, transferId: string) {
     const internal = internals.get(transferId);
+
+    // Wait for all queued chunk writes to finish before closing the file.
+    // Without this, FileDone races with in-flight decrypts and the last
+    // chunks fail to write → status incorrectly flips to "failed".
+    if (internal?.writeQueue) {
+        await internal.writeQueue;
+    }
+
     if (internal?.fileHandle) {
         await internal.fileHandle.close();
     }
@@ -919,7 +934,8 @@ class TransferScheduler {
   // Shared window across ALL transfers
   private static readonly GLOBAL_WINDOW = 200;
   private static readonly CHUNK_SIZE = 256 * 1024;
-  private static readonly ACK_INTERVAL = 50;
+  private static readonly ACK_INTERVAL = 20;
+  private static readonly BURST_SIZE = 16;
 
   addTransfer(
     transferId: string,
@@ -984,14 +1000,13 @@ class TransferScheduler {
     while (this.streams.size > 0) {
       let anyProgress = false;
 
-      // Round-robin: try to send one chunk from each active transfer
+      // Round-robin: send a burst of chunks from each active transfer
       for (const [id, stream] of this.streams) {
         if (stream.done) continue;
 
-        // Check global window — if saturated, wait for any ack
-        if (this.totalInFlight() >= TransferScheduler.GLOBAL_WINDOW) {
+        // Wait for window space (block until space opens, don't skip)
+        while (this.totalInFlight() >= TransferScheduler.GLOBAL_WINDOW) {
           await new Promise<void>((resolve) => {
-            // Set resolver on the transfer with the most in-flight chunks
             let maxInFlight = -1;
             let maxId = id;
             for (const [tid, s] of this.streams) {
@@ -1004,14 +1019,19 @@ class TransferScheduler {
             }
             this.ackResolvers.set(maxId, resolve);
           });
-          continue;
         }
 
-        // Read next chunk for this transfer
-        const chunk = await this.readNextChunk(stream);
-        if (!chunk) {
-          // This transfer has finished reading its file
-          stream.done = true;
+        // Send a burst of chunks (read + encrypt in parallel, then send)
+        const sent = await this.sendBurst(stream);
+        if (sent > 0) {
+          anyProgress = true;
+          updateTransfer(stream.transferId, {
+            bytesTransferred: stream.bytesSent,
+          });
+        }
+
+        // Check if this stream finished reading
+        if (stream.done) {
           if (gw) {
             const targetBytes = uuidToBytes(stream.targetUserId);
             const transferBytes = uuidToBytes(stream.transferId);
@@ -1027,47 +1047,7 @@ class TransferScheduler {
           });
           this.streams.delete(id);
           internals.delete(stream.transferId);
-          console.log(
-            "[transfers] Relay send complete (scheduler):",
-            stream.transferId
-          );
-          continue;
-        }
-
-        // Encrypt using worker pool and send as binary WebSocket frame (no base64, no JSON)
-        const chunkBuffer = chunk.buffer.slice(
-          chunk.byteOffset,
-          chunk.byteOffset + chunk.byteLength
-        ) as ArrayBuffer;
-        const chunkLen = chunk.byteLength;
-        const encrypted = await cryptoPool.encrypt(
-          stream.cryptoKey,
-          chunkBuffer,
-          stream.chunkIndex
-        );
-
-        if (gw) {
-          const targetBytes = uuidToBytes(stream.targetUserId);
-          const transferBytes = uuidToBytes(stream.transferId);
-          const header = new Uint8Array(37 + encrypted.byteLength);
-          header[0] = 0x01; // FileChunkSend
-          header.set(targetBytes, 1);
-          header.set(transferBytes, 17);
-          const view = new DataView(header.buffer as ArrayBuffer);
-          view.setUint32(33, stream.chunkIndex);
-          header.set(new Uint8Array(encrypted), 37);
-          gw.sendBinary(header.buffer as ArrayBuffer);
-        }
-
-        stream.bytesSent += chunkLen;
-        stream.chunkIndex++;
-        anyProgress = true;
-
-        // Update UI periodically (every 4 chunks)
-        if (stream.chunkIndex % 4 === 0) {
-          updateTransfer(stream.transferId, {
-            bytesTransferred: stream.bytesSent,
-          });
+          console.log("[transfers] Relay send complete (scheduler):", stream.transferId);
         }
       }
 
@@ -1075,12 +1055,60 @@ class TransferScheduler {
       if (anyProgress) {
         await new Promise((r) => setTimeout(r, 0));
       } else {
-        // No progress — wait a bit before retrying
         await new Promise((r) => setTimeout(r, 10));
       }
     }
 
     this.running = false;
+  }
+
+  /** Read up to BURST_SIZE chunks, encrypt all in parallel, send all frames. */
+  private async sendBurst(stream: RelayStream): Promise<number> {
+    const batch: { buf: ArrayBuffer; len: number; idx: number }[] = [];
+
+    for (let i = 0; i < TransferScheduler.BURST_SIZE; i++) {
+      // Stop if we'd exceed the window
+      if (this.totalInFlight() >= TransferScheduler.GLOBAL_WINDOW) break;
+
+      const chunk = await this.readNextChunk(stream);
+      if (!chunk) {
+        stream.done = true;
+        break;
+      }
+
+      const buf = chunk.buffer.slice(
+        chunk.byteOffset,
+        chunk.byteOffset + chunk.byteLength
+      ) as ArrayBuffer;
+      batch.push({ buf, len: chunk.byteLength, idx: stream.chunkIndex });
+      stream.chunkIndex++;
+    }
+
+    if (batch.length === 0) return 0;
+
+    // Encrypt all chunks in parallel across the worker pool
+    const encrypted = await Promise.all(
+      batch.map((c) => cryptoPool.encrypt(stream.cryptoKey, c.buf, c.idx))
+    );
+
+    // Build and send all binary frames
+    const targetBytes = uuidToBytes(stream.targetUserId);
+    const transferBytes = uuidToBytes(stream.transferId);
+
+    for (let i = 0; i < encrypted.length; i++) {
+      if (!gw) break;
+      const frame = new Uint8Array(37 + encrypted[i].byteLength);
+      frame[0] = 0x01; // FileChunkSend
+      frame.set(targetBytes, 1);
+      frame.set(transferBytes, 17);
+      const view = new DataView(frame.buffer as ArrayBuffer);
+      view.setUint32(33, batch[i].idx);
+      frame.set(new Uint8Array(encrypted[i]), 37);
+      gw.sendBinary(frame.buffer as ArrayBuffer);
+      stream.bytesSent += batch[i].len;
+    }
+
+    return encrypted.length;
   }
 
   private async readNextChunk(
