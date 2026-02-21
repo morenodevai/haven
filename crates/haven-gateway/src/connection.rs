@@ -6,18 +6,17 @@ use std::time::Duration;
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::{DecodingKey, Validation, decode};
-use tokio::sync::RwLock;
 use tracing::{info, trace, warn};
 use uuid::Uuid;
 
 use haven_types::api::Claims;
 use haven_types::events::{GatewayCommand, GatewayEvent};
 
-use crate::dispatcher::Dispatcher;
+use crate::dispatcher::{Dispatcher, UserMessage};
 
-/// Heartbeat interval: server sends a Ping every 30 seconds.
-/// If 2 consecutive Pongs are missed (~60s), the connection is dropped.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+/// Heartbeat interval: server sends a Ping every 15 seconds.
+/// If 2 consecutive Pongs are missed (~30s), the connection is dropped.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Handle a single WebSocket connection.
 pub async fn handle_connection(socket: WebSocket, dispatcher: Dispatcher, jwt_secret: String) {
@@ -76,10 +75,13 @@ pub async fn handle_connection(socket: WebSocket, dispatcher: Dispatcher, jwt_se
 
     // Per-connection channel subscriptions (shared between send and recv tasks).
     // Events scoped to a channel_id are only forwarded if the user has subscribed.
-    let subscribed_channels: Arc<RwLock<HashSet<Uuid>>> = Arc::new(RwLock::new(HashSet::new()));
+    // Uses std::sync::RwLock because the critical section is trivial (HashSet lookup)
+    // and never held across await points.
+    let subscribed_channels: Arc<std::sync::RwLock<HashSet<Uuid>>> =
+        Arc::new(std::sync::RwLock::new(HashSet::new()));
     let send_subscriptions = subscribed_channels.clone();
 
-    // H6: Shared flag for heartbeat — recv_task sets it on Pong, send_task checks it.
+    // H6: Shared flag for heartbeat -- recv_task sets it on Pong, send_task checks it.
     let pong_received = Arc::new(AtomicBool::new(true)); // start as true (just connected)
     let pong_flag_send = pong_received.clone();
     let pong_flag_recv = pong_received.clone();
@@ -94,40 +96,57 @@ pub async fn handle_connection(socket: WebSocket, dispatcher: Dispatcher, jwt_se
         loop {
             tokio::select! {
                 result = broadcast_rx.recv() => {
-                    let event = match result {
-                        Ok(event) => event,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    let msg = match result {
+                        Ok(msg) => msg,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("Broadcast receiver lagged by {} messages", n);
+                            continue;
+                        }
                         Err(_) => break,
                     };
 
-                    // H5: Filter channel-scoped events by subscription
-                    if let Some(channel_id) = event.channel_id() {
-                        let subs = send_subscriptions.read().await;
+                    // H5: Filter channel-scoped events by subscription.
+                    // std::sync::RwLock -- trivial critical section, no await inside.
+                    if let Some(channel_id) = msg.channel_id {
+                        let subs = send_subscriptions.read()
+                            .expect("subscription lock poisoned");
                         if !subs.contains(&channel_id) {
                             continue;
                         }
                     }
 
-                    let text = serde_json::to_string(&event).unwrap();
-                    if sender.send(Message::Text(text.into())).await.is_err() {
+                    // Broadcast messages are pre-serialized -- send the JSON directly.
+                    if sender.send(Message::Text(msg.json.to_string().into())).await.is_err() {
                         break;
                     }
                 }
                 result = user_rx.recv() => {
-                    let event = match result {
-                        Some(event) => event,
+                    let msg = match result {
+                        Some(msg) => msg,
                         None => break,
                     };
 
-                    let text = serde_json::to_string(&event).unwrap();
-                    if sender.send(Message::Text(text.into())).await.is_err() {
-                        break;
+                    match msg {
+                        UserMessage::Event(event) => {
+                            // Targeted user events are GatewayEvent -- serialize here.
+                            let text = serde_json::to_string(&event).unwrap();
+                            if sender.send(Message::Text(text.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        UserMessage::Binary(data) => {
+                            // Binary relay -- send raw bytes as WebSocket binary frame.
+                            if sender.send(Message::Binary(data.into())).await.is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
                 _ = heartbeat.tick() => {
-                    // H6: Check if we received a Pong since the last Ping
-                    if pong_flag_send.swap(false, Ordering::Relaxed) {
-                        // Pong was received — reset miss counter
+                    // H6: Check if we received a Pong since the last Ping.
+                    // Acquire ordering pairs with the Release store in recv_task.
+                    if pong_flag_send.swap(false, Ordering::Acquire) {
+                        // Pong was received -- reset miss counter
                         missed_heartbeats = 0;
                     } else {
                         missed_heartbeats += 1;
@@ -174,9 +193,18 @@ pub async fn handle_connection(socket: WebSocket, dispatcher: Dispatcher, jwt_se
                         }
                     }
                 }
-                // H6: Pong received — signal the send_task to reset heartbeat counter
+                // Binary frames: file chunk relay via zero-copy binary protocol.
+                Message::Binary(data) => {
+                    handle_binary_message(
+                        &dispatcher_clone,
+                        user_id,
+                        &data,
+                    ).await;
+                }
+                // H6: Pong received -- signal the send_task to reset heartbeat counter.
+                // Release ordering pairs with the Acquire swap in send_task.
                 Message::Pong(_) => {
-                    pong_flag_recv.store(true, Ordering::Relaxed);
+                    pong_flag_recv.store(true, Ordering::Release);
                 }
                 Message::Close(_) => break,
                 _ => {}
@@ -227,7 +255,7 @@ async fn handle_command(
     user_id: Uuid,
     username: &str,
     cmd: GatewayCommand,
-    subscriptions: &Arc<RwLock<HashSet<Uuid>>>,
+    subscriptions: &Arc<std::sync::RwLock<HashSet<Uuid>>>,
 ) {
     match cmd {
         GatewayCommand::Identify { .. } => {} // Already handled
@@ -240,9 +268,11 @@ async fn handle_command(
                 user_id,
                 channel_ids.len()
             );
-            // Update both local connection state and dispatcher state
+            // Update both local connection state and dispatcher state.
+            // std::sync::RwLock -- trivial critical section, no await inside.
             {
-                let mut subs = subscriptions.write().await;
+                let mut subs = subscriptions.write()
+                    .expect("subscription lock poisoned");
                 *subs = channel_ids.iter().copied().collect();
             }
             dispatcher
@@ -499,6 +529,100 @@ async fn handle_command(
                     },
                 )
                 .await;
+        }
+    }
+}
+
+/// Handle incoming binary WebSocket frames for the file transfer fast path.
+///
+/// Binary protocol (all multi-byte integers are big-endian):
+///
+///   0x01 FileChunkSend:  [type(1)] [target_uid(16)] [transfer_id(16)] [chunk_idx(4)] [payload...]
+///   0x02 FileAckSend:    [type(1)] [target_uid(16)] [transfer_id(16)] [ack_chunk_idx(4)]
+///   0x03 FileDoneSend:   [type(1)] [target_uid(16)] [transfer_id(16)]
+///
+/// The server swaps `target_user_id` for `sender_user_id` (from_user_id) and
+/// forwards the frame to the target -- zero-copy relay for the encrypted payload.
+async fn handle_binary_message(
+    dispatcher: &Dispatcher,
+    sender_user_id: Uuid,
+    data: &[u8],
+) {
+    if data.is_empty() {
+        return;
+    }
+
+    let msg_type = data[0];
+    match msg_type {
+        // 0x01: FileChunkSend -- minimum 37 bytes (1 + 16 + 16 + 4), payload follows
+        0x01 => {
+            if data.len() < 37 {
+                warn!(
+                    "Binary FileChunkSend too short: {} bytes (need >= 37)",
+                    data.len()
+                );
+                return;
+            }
+            let target_user_id =
+                Uuid::from_bytes(data[1..17].try_into().unwrap());
+
+            // Build outgoing frame: replace target_user_id with sender_user_id
+            let mut outgoing = Vec::with_capacity(data.len());
+            outgoing.push(0x01);
+            outgoing.extend_from_slice(sender_user_id.as_bytes());
+            outgoing.extend_from_slice(&data[17..]); // transfer_id + chunk_index + payload
+
+            dispatcher
+                .send_binary_to_user(target_user_id, outgoing)
+                .await;
+        }
+
+        // 0x02: FileAckSend -- exactly 37 bytes (1 + 16 + 16 + 4)
+        0x02 => {
+            if data.len() < 37 {
+                warn!(
+                    "Binary FileAckSend too short: {} bytes (need >= 37)",
+                    data.len()
+                );
+                return;
+            }
+            let target_user_id =
+                Uuid::from_bytes(data[1..17].try_into().unwrap());
+
+            let mut outgoing = Vec::with_capacity(37);
+            outgoing.push(0x02);
+            outgoing.extend_from_slice(sender_user_id.as_bytes());
+            outgoing.extend_from_slice(&data[17..]);
+
+            dispatcher
+                .send_binary_to_user(target_user_id, outgoing)
+                .await;
+        }
+
+        // 0x03: FileDoneSend -- exactly 33 bytes (1 + 16 + 16)
+        0x03 => {
+            if data.len() < 33 {
+                warn!(
+                    "Binary FileDoneSend too short: {} bytes (need >= 33)",
+                    data.len()
+                );
+                return;
+            }
+            let target_user_id =
+                Uuid::from_bytes(data[1..17].try_into().unwrap());
+
+            let mut outgoing = Vec::with_capacity(33);
+            outgoing.push(0x03);
+            outgoing.extend_from_slice(sender_user_id.as_bytes());
+            outgoing.extend_from_slice(&data[17..]);
+
+            dispatcher
+                .send_binary_to_user(target_user_id, outgoing)
+                .await;
+        }
+
+        _ => {
+            warn!("Unknown binary message type: 0x{:02x}", msg_type);
         }
     }
 }

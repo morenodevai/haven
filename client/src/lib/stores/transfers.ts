@@ -4,19 +4,30 @@ import { create, type FileHandle } from "@tauri-apps/plugin-fs";
 import { save } from "@tauri-apps/plugin-dialog";
 import { channelKey } from "./messages";
 import { auth } from "./auth";
+import { CryptoWorkerPool } from "../workers/crypto-pool";
+
+const cryptoPool = new CryptoWorkerPool();
 
 // --- Constants ---
 
 const CHUNK_SIZE = 64 * 1024; // 64KB — WebRTC DataChannel safe max
 const BUFFER_HIGH = 1 * 1024 * 1024; // 1MB — back-pressure threshold
 const BUFFER_LOW = 512 * 1024; // 512KB — resume threshold
+function getTurnServers(): RTCIceServer[] {
+  try {
+    const config = localStorage.getItem("haven_turn_servers");
+    if (config) return JSON.parse(config);
+  } catch {}
+  return [];
+}
+
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
+  // TURN servers — configurable via localStorage key "haven_turn_servers"
+  ...getTurnServers(),
 ];
 const ICE_TIMEOUT = 10_000; // 10s — if P2P fails, fall back to server relay
-const RELAY_CHUNK_SIZE = 128 * 1024; // 128KB relay chunks for high throughput
-const RELAY_WINDOW_SIZE = 200; // max unacked chunks in flight (~25MB)
 const RELAY_ACK_INTERVAL = 50; // receiver acks every N chunks
 
 // --- Types ---
@@ -77,6 +88,25 @@ export const activeTransfers = derived(transfers, ($t) =>
 let gw: Gateway | null = null;
 const internals = new Map<string, TransferInternal>();
 
+// --- UUID binary helpers (for binary WebSocket protocol) ---
+
+function uuidToBytes(uuid: string): Uint8Array {
+    const hex = uuid.replace(/-/g, "");
+    const bytes = new Uint8Array(16);
+    for (let i = 0; i < 16; i++) {
+        bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+    }
+    return bytes;
+}
+
+function bytesToUuid(bytes: Uint8Array): string {
+    let hex = "";
+    for (let i = 0; i < 16; i++) {
+        hex += bytes[i].toString(16).padStart(2, "0");
+    }
+    return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+}
+
 // --- Base64 helpers ---
 
 function arrayBufferToBase64(buf: ArrayBuffer): string {
@@ -94,7 +124,7 @@ function base64ToArrayBuffer(b64: string): ArrayBuffer {
   for (let i = 0; i < binary.length; i++) {
     bytes[i] = binary.charCodeAt(i);
   }
-  return bytes.buffer;
+  return bytes.buffer as ArrayBuffer;
 }
 
 // --- Crypto helpers ---
@@ -124,7 +154,7 @@ async function deriveTransferKey(transferId: string): Promise<CryptoKey> {
 
 function makeNonce(chunkIndex: number): Uint8Array {
   const nonce = new Uint8Array(12);
-  const view = new DataView(nonce.buffer);
+  const view = new DataView(nonce.buffer as ArrayBuffer);
   view.setUint32(4, Math.floor(chunkIndex / 0x100000000));
   view.setUint32(8, chunkIndex >>> 0);
   return nonce;
@@ -136,7 +166,7 @@ async function encryptChunk(
   chunkIndex: number
 ): Promise<ArrayBuffer> {
   const nonce = makeNonce(chunkIndex);
-  return crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, key, chunk);
+  return crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce as unknown as Uint8Array<ArrayBuffer> }, key, chunk as unknown as Uint8Array<ArrayBuffer>);
 }
 
 async function decryptChunk(
@@ -146,7 +176,7 @@ async function decryptChunk(
 ): Promise<ArrayBuffer> {
   const nonce = makeNonce(chunkIndex);
   return crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: nonce },
+    { name: "AES-GCM", iv: nonce as unknown as Uint8Array<ArrayBuffer> },
     key,
     encrypted
   );
@@ -171,6 +201,11 @@ export function initTransfers(gateway: Gateway) {
 }
 
 export function cleanupTransfers() {
+  // Drain the scheduler so it stops sending chunks
+  for (const [id] of internals) {
+    scheduler.removeTransfer(id);
+  }
+
   for (const [id, internal] of internals) {
     if (internal.iceTimer) clearTimeout(internal.iceTimer);
     internal.dc?.close();
@@ -281,6 +316,9 @@ export function rejectTransfer(transferId: string) {
 }
 
 export function cancelTransfer(transferId: string) {
+  // Remove from relay scheduler if active
+  scheduler.removeTransfer(transferId);
+
   const internal = internals.get(transferId);
   if (internal) {
     if (internal.iceTimer) clearTimeout(internal.iceTimer);
@@ -650,16 +688,133 @@ export async function handleFileDone(event: any) {
 export function handleFileAck(event: any) {
   const { transfer_id, ack_chunk_index } = event.data;
 
+  // Route to centralized scheduler for relay transfers
+  scheduler.onAck(transfer_id, ack_chunk_index);
+
+  // Also handle legacy per-transfer acks (P2P fallback path, if ever used)
   const internal = internals.get(transfer_id);
   if (!internal) return;
 
   internal.ackedChunkIndex = ack_chunk_index;
 
-  // Wake up the sender if it's waiting for ack space
   if (internal.ackResolve) {
     internal.ackResolve();
     internal.ackResolve = null;
   }
+}
+
+// --- Binary WebSocket message handler (primary fast path) ---
+
+export function handleBinaryMessage(data: ArrayBuffer) {
+    const view = new DataView(data);
+    const bytes = new Uint8Array(data);
+    if (data.byteLength < 1) return;
+
+    const msgType = bytes[0];
+
+    if (msgType === 0x01) {
+        // FileChunk: [type(1)][from_uid(16)][transfer_id(16)][chunk_idx(4)][payload...]
+        if (data.byteLength < 37) return;
+        const fromUserId = bytesToUuid(bytes.slice(1, 17));
+        const transferId = bytesToUuid(bytes.slice(17, 33));
+        const chunkIndex = view.getUint32(33);
+        const payload = data.slice(37);
+
+        handleBinaryFileChunk(fromUserId, transferId, chunkIndex, payload);
+    } else if (msgType === 0x02) {
+        // FileAck: [type(1)][from_uid(16)][transfer_id(16)][ack_chunk_idx(4)]
+        if (data.byteLength < 37) return;
+        const transferId = bytesToUuid(bytes.slice(17, 33));
+        const ackChunkIndex = view.getUint32(33);
+
+        scheduler.onAck(transferId, ackChunkIndex);
+        // Also handle legacy path
+        const internal = internals.get(transferId);
+        if (internal) {
+            internal.ackedChunkIndex = ackChunkIndex;
+            if (internal.ackResolve) {
+                internal.ackResolve();
+                internal.ackResolve = null;
+            }
+        }
+    } else if (msgType === 0x03) {
+        // FileDone: [type(1)][from_uid(16)][transfer_id(16)]
+        if (data.byteLength < 33) return;
+        const fromUserId = bytesToUuid(bytes.slice(1, 17));
+        const transferId = bytesToUuid(bytes.slice(17, 33));
+
+        handleBinaryFileDone(fromUserId, transferId);
+    }
+}
+
+async function handleBinaryFileChunk(
+    fromUserId: string,
+    transferId: string,
+    chunkIndex: number,
+    encryptedPayload: ArrayBuffer
+) {
+    const internal = internals.get(transferId);
+    if (!internal?.cryptoKey || !internal.fileHandle) return;
+
+    try {
+        // Decrypt using worker pool
+        const decrypted = await cryptoPool.decrypt(
+            internal.cryptoKey,
+            encryptedPayload,
+            chunkIndex
+        );
+
+        await internal.fileHandle.write(new Uint8Array(decrypted));
+
+        const t = getTransfer(transferId);
+        if (t) {
+            updateTransfer(transferId, {
+                bytesTransferred: t.bytesTransferred + decrypted.byteLength,
+                status: "transferring",
+                startTime: t.startTime || Date.now(),
+            });
+        }
+
+        // Send binary ack every RELAY_ACK_INTERVAL chunks
+        if (chunkIndex > 0 && chunkIndex % RELAY_ACK_INTERVAL === 0 && gw) {
+            const targetBytes = uuidToBytes(fromUserId);
+            const transferBytes = uuidToBytes(transferId);
+            const ackFrame = new Uint8Array(37);
+            ackFrame[0] = 0x02; // FileAckSend
+            ackFrame.set(targetBytes, 1);
+            ackFrame.set(transferBytes, 17);
+            const ackView = new DataView(ackFrame.buffer as ArrayBuffer);
+            ackView.setUint32(33, chunkIndex);
+            gw.sendBinary(ackFrame.buffer as ArrayBuffer);
+        }
+    } catch (e) {
+        console.error("[transfers] Binary chunk write error:", e);
+        updateTransfer(transferId, { status: "failed" });
+    }
+}
+
+async function handleBinaryFileDone(fromUserId: string, transferId: string) {
+    const internal = internals.get(transferId);
+    if (internal?.fileHandle) {
+        await internal.fileHandle.close();
+    }
+
+    // Send binary final ack
+    if (gw) {
+        const targetBytes = uuidToBytes(fromUserId);
+        const transferBytes = uuidToBytes(transferId);
+        const ackFrame = new Uint8Array(37);
+        ackFrame[0] = 0x02;
+        ackFrame.set(targetBytes, 1);
+        ackFrame.set(transferBytes, 17);
+        const ackView = new DataView(ackFrame.buffer as ArrayBuffer);
+        ackView.setUint32(33, 0xFFFFFFFF); // sentinel
+        gw.sendBinary(ackFrame.buffer as ArrayBuffer);
+    }
+
+    internals.delete(transferId);
+    updateTransfer(transferId, { status: "completed" });
+    console.log("[transfers] Binary relay transfer complete:", transferId);
 }
 
 // --- File streaming via P2P DataChannel (sender side) ---
@@ -736,127 +891,264 @@ async function streamFile(transferId: string) {
   }
 }
 
-// --- File streaming via server relay (fallback) ---
+// --- Centralized Transfer Scheduler (relay mode) ---
+//
+// Instead of each relay transfer running its own independent async loop
+// that competes for the same WebSocket, this scheduler round-robins chunks
+// across all active relay transfers through a single loop.  This eliminates
+// the "flip-flopping" burst pattern and gives each transfer fair bandwidth.
 
-/** Wait until the send window has room (ack-based flow control). */
-function waitForAckWindow(
-  internal: TransferInternal,
-  chunkIndex: number
-): Promise<void> {
-  const acked = internal.ackedChunkIndex ?? -1;
-  if (chunkIndex - acked <= RELAY_WINDOW_SIZE) {
-    return Promise.resolve();
-  }
-  return new Promise((resolve) => {
-    internal.ackResolve = resolve;
-  });
+interface RelayStream {
+  transferId: string;
+  targetUserId: string;
+  reader: ReadableStreamDefaultReader<Uint8Array>;
+  cryptoKey: CryptoKey;
+  chunkIndex: number;
+  bytesSent: number;
+  totalSize: number;
+  leftover: Uint8Array;
+  done: boolean;
 }
+
+class TransferScheduler {
+  private streams: Map<string, RelayStream> = new Map();
+  private running = false;
+  private globalAcked = new Map<string, number>(); // transferId -> highest acked chunk
+  private ackResolvers = new Map<string, (() => void) | null>();
+
+  // Shared window across ALL transfers
+  private static readonly GLOBAL_WINDOW = 200;
+  private static readonly CHUNK_SIZE = 256 * 1024;
+  private static readonly ACK_INTERVAL = 50;
+
+  addTransfer(
+    transferId: string,
+    targetUserId: string,
+    file: File,
+    cryptoKey: CryptoKey
+  ) {
+    const stream: RelayStream = {
+      transferId,
+      targetUserId,
+      reader: file.stream().getReader(),
+      cryptoKey,
+      chunkIndex: 0,
+      bytesSent: 0,
+      totalSize: file.size,
+      leftover: new Uint8Array(0),
+      done: false,
+    };
+    this.streams.set(transferId, stream);
+    this.globalAcked.set(transferId, -1);
+
+    if (!this.running) {
+      this.running = true;
+      this.run();
+    }
+  }
+
+  removeTransfer(transferId: string) {
+    const stream = this.streams.get(transferId);
+    if (stream) {
+      // Cancel the reader so we don't leak the underlying stream
+      stream.reader.cancel().catch(() => {});
+    }
+    this.streams.delete(transferId);
+    this.globalAcked.delete(transferId);
+    const resolver = this.ackResolvers.get(transferId);
+    if (resolver) {
+      resolver();
+    }
+    this.ackResolvers.delete(transferId);
+  }
+
+  onAck(transferId: string, ackChunkIndex: number) {
+    this.globalAcked.set(transferId, ackChunkIndex);
+    const resolver = this.ackResolvers.get(transferId);
+    if (resolver) {
+      resolver();
+      this.ackResolvers.set(transferId, null);
+    }
+  }
+
+  private totalInFlight(): number {
+    let total = 0;
+    for (const [id, stream] of this.streams) {
+      const acked = this.globalAcked.get(id) ?? -1;
+      total += stream.chunkIndex - acked - 1;
+    }
+    return total;
+  }
+
+  private async run() {
+    while (this.streams.size > 0) {
+      let anyProgress = false;
+
+      // Round-robin: try to send one chunk from each active transfer
+      for (const [id, stream] of this.streams) {
+        if (stream.done) continue;
+
+        // Check global window — if saturated, wait for any ack
+        if (this.totalInFlight() >= TransferScheduler.GLOBAL_WINDOW) {
+          await new Promise<void>((resolve) => {
+            // Set resolver on the transfer with the most in-flight chunks
+            let maxInFlight = -1;
+            let maxId = id;
+            for (const [tid, s] of this.streams) {
+              const acked = this.globalAcked.get(tid) ?? -1;
+              const inFlight = s.chunkIndex - acked - 1;
+              if (inFlight > maxInFlight) {
+                maxInFlight = inFlight;
+                maxId = tid;
+              }
+            }
+            this.ackResolvers.set(maxId, resolve);
+          });
+          continue;
+        }
+
+        // Read next chunk for this transfer
+        const chunk = await this.readNextChunk(stream);
+        if (!chunk) {
+          // This transfer has finished reading its file
+          stream.done = true;
+          if (gw) {
+            const targetBytes = uuidToBytes(stream.targetUserId);
+            const transferBytes = uuidToBytes(stream.transferId);
+            const frame = new Uint8Array(33);
+            frame[0] = 0x03; // FileDoneSend
+            frame.set(targetBytes, 1);
+            frame.set(transferBytes, 17);
+            gw.sendBinary(frame.buffer as ArrayBuffer);
+          }
+          updateTransfer(stream.transferId, {
+            status: "completed",
+            bytesTransferred: stream.bytesSent,
+          });
+          this.streams.delete(id);
+          internals.delete(stream.transferId);
+          console.log(
+            "[transfers] Relay send complete (scheduler):",
+            stream.transferId
+          );
+          continue;
+        }
+
+        // Encrypt using worker pool and send as binary WebSocket frame (no base64, no JSON)
+        const chunkBuffer = chunk.buffer.slice(
+          chunk.byteOffset,
+          chunk.byteOffset + chunk.byteLength
+        ) as ArrayBuffer;
+        const chunkLen = chunk.byteLength;
+        const encrypted = await cryptoPool.encrypt(
+          stream.cryptoKey,
+          chunkBuffer,
+          stream.chunkIndex
+        );
+
+        if (gw) {
+          const targetBytes = uuidToBytes(stream.targetUserId);
+          const transferBytes = uuidToBytes(stream.transferId);
+          const header = new Uint8Array(37 + encrypted.byteLength);
+          header[0] = 0x01; // FileChunkSend
+          header.set(targetBytes, 1);
+          header.set(transferBytes, 17);
+          const view = new DataView(header.buffer as ArrayBuffer);
+          view.setUint32(33, stream.chunkIndex);
+          header.set(new Uint8Array(encrypted), 37);
+          gw.sendBinary(header.buffer as ArrayBuffer);
+        }
+
+        stream.bytesSent += chunkLen;
+        stream.chunkIndex++;
+        anyProgress = true;
+
+        // Update UI periodically (every 4 chunks)
+        if (stream.chunkIndex % 4 === 0) {
+          updateTransfer(stream.transferId, {
+            bytesTransferred: stream.bytesSent,
+          });
+        }
+      }
+
+      // Yield to event loop so acks and other events can be processed
+      if (anyProgress) {
+        await new Promise((r) => setTimeout(r, 0));
+      } else {
+        // No progress — wait a bit before retrying
+        await new Promise((r) => setTimeout(r, 10));
+      }
+    }
+
+    this.running = false;
+  }
+
+  private async readNextChunk(
+    stream: RelayStream
+  ): Promise<Uint8Array | null> {
+    const CHUNK_SIZE = TransferScheduler.CHUNK_SIZE;
+
+    // If we have enough leftover, use it directly
+    if (stream.leftover.length >= CHUNK_SIZE) {
+      const chunk = stream.leftover.slice(0, CHUNK_SIZE);
+      stream.leftover = stream.leftover.slice(CHUNK_SIZE);
+      return chunk;
+    }
+
+    // Read more data from the file stream
+    const { done, value } = await stream.reader.read();
+
+    if (done) {
+      // Return remaining leftover if any
+      if (stream.leftover.length > 0) {
+        const last = stream.leftover;
+        stream.leftover = new Uint8Array(0);
+        return last;
+      }
+      return null;
+    }
+
+    // Combine leftover + new data
+    let data: Uint8Array;
+    if (stream.leftover.length > 0) {
+      data = new Uint8Array(stream.leftover.length + value.length);
+      data.set(stream.leftover, 0);
+      data.set(value, stream.leftover.length);
+    } else {
+      data = value;
+    }
+
+    if (data.length >= CHUNK_SIZE) {
+      const chunk = data.slice(0, CHUNK_SIZE);
+      stream.leftover = data.slice(CHUNK_SIZE);
+      return chunk;
+    } else {
+      stream.leftover = data;
+      // Recurse to accumulate more data until we have a full chunk
+      return this.readNextChunk(stream);
+    }
+  }
+}
+
+const scheduler = new TransferScheduler();
+
+// --- File streaming via server relay (fallback) ---
+//
+// Thin wrapper: instead of running its own loop, just registers with the
+// centralized scheduler so all relay transfers share a single send loop.
 
 async function streamFileRelay(transferId: string, targetUserId: string) {
   const internal = internals.get(transferId);
   if (!internal?.file || !internal.cryptoKey || !gw) return;
 
-  console.log("[transfers] Starting relay stream for:", transferId);
-  internal.ackedChunkIndex = -1;
-  internal.ackResolve = null;
-
-  const key = internal.cryptoKey;
-  const reader = internal.file.stream().getReader();
-  let chunkIndex = 0;
-  let bytesSent = 0;
-  let leftover = new Uint8Array(0);
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-
-      if (done) {
-        if (leftover.length > 0) {
-          await waitForAckWindow(internal, chunkIndex);
-          const encrypted = await encryptChunk(key, leftover, chunkIndex);
-          const b64 = arrayBufferToBase64(encrypted);
-          gw!.send({
-            type: "FileChunkSend",
-            data: {
-              target_user_id: targetUserId,
-              transfer_id: transferId,
-              chunk_index: chunkIndex,
-              data: b64,
-            },
-          });
-          bytesSent += leftover.length;
-          chunkIndex++;
-          updateTransfer(transferId, { bytesTransferred: bytesSent });
-        }
-
-        // Signal completion
-        gw!.send({
-          type: "FileDoneSend",
-          data: {
-            target_user_id: targetUserId,
-            transfer_id: transferId,
-          },
-        });
-        updateTransfer(transferId, {
-          status: "completed",
-          bytesTransferred: bytesSent,
-        });
-        internals.delete(transferId);
-        console.log("[transfers] Relay send complete:", transferId);
-        return;
-      }
-
-      let data: Uint8Array;
-      if (leftover.length > 0) {
-        data = new Uint8Array(leftover.length + value.length);
-        data.set(leftover, 0);
-        data.set(value, leftover.length);
-        leftover = new Uint8Array(0);
-      } else {
-        data = value;
-      }
-
-      let offset = 0;
-      while (offset + RELAY_CHUNK_SIZE <= data.length) {
-        // Flow control: wait if too many chunks are in flight
-        await waitForAckWindow(internal, chunkIndex);
-
-        const chunk = data.slice(offset, offset + RELAY_CHUNK_SIZE);
-        const encrypted = await encryptChunk(key, chunk, chunkIndex);
-        const b64 = arrayBufferToBase64(encrypted);
-
-        gw!.send({
-          type: "FileChunkSend",
-          data: {
-            target_user_id: targetUserId,
-            transfer_id: transferId,
-            chunk_index: chunkIndex,
-            data: b64,
-          },
-        });
-
-        bytesSent += chunk.length;
-        chunkIndex++;
-        offset += RELAY_CHUNK_SIZE;
-
-        if (chunkIndex % 16 === 0) {
-          updateTransfer(transferId, { bytesTransferred: bytesSent });
-        }
-
-        // Yield to event loop every 8 chunks so acks can be processed
-        if (chunkIndex % 8 === 0) {
-          await new Promise((r) => setTimeout(r, 0));
-        }
-      }
-
-      if (offset < data.length) {
-        leftover = data.slice(offset);
-      }
-    }
-  } catch (e) {
-    console.error("[transfers] Relay stream error:", e);
-    updateTransfer(transferId, { status: "failed" });
-  }
+  console.log("[transfers] Adding to relay scheduler:", transferId);
+  internal.relayMode = true;
+  scheduler.addTransfer(
+    transferId,
+    targetUserId,
+    internal.file,
+    internal.cryptoKey
+  );
 }
 
 function waitForBuffer(dc: RTCDataChannel): Promise<void> {

@@ -17,6 +17,7 @@
   let dragOver = $state(false);
   let selectedPeer: { id: string; username: string } | null = $state(null);
   let fileInputEl: HTMLInputElement;
+  let folderInputEl: HTMLInputElement;
 
   // Filter out self from online users
   const otherUsers = $derived(
@@ -55,6 +56,25 @@
     if (!files || !selectedPeer) return;
     for (const file of files) {
       sendFile(selectedPeer.id, selectedPeer.username, file);
+    }
+    target.value = "";
+  }
+
+  function openFolderPicker(peerId: string, peerUsername: string) {
+    selectedPeer = { id: peerId, username: peerUsername };
+    folderInputEl?.click();
+  }
+
+  function handleFolderSelect(e: Event) {
+    const target = e.target as HTMLInputElement;
+    const files = target.files;
+    if (!files || !selectedPeer) return;
+    for (const file of files) {
+      // Use webkitRelativePath to preserve folder structure in filename
+      const relativePath = (file as any).webkitRelativePath || file.name;
+      // Create a new File with the relative path as the name
+      const namedFile = new File([file], relativePath, { type: file.type });
+      sendFile(selectedPeer.id, selectedPeer.username, namedFile);
     }
     target.value = "";
   }
@@ -100,6 +120,14 @@
   multiple
 />
 
+<input
+  type="file"
+  class="hidden-file-input"
+  bind:this={folderInputEl}
+  onchange={handleFolderSelect}
+  webkitdirectory
+/>
+
 <div class="file-channel">
   <div class="panels">
     <!-- Online users panel -->
@@ -117,6 +145,12 @@
               onclick={() => openFilePicker(user.userId, user.username)}
             >
               Send File
+            </button>
+            <button
+              class="send-btn folder-btn"
+              onclick={() => openFolderPicker(user.userId, user.username)}
+            >
+              Send Folder
             </button>
           </div>
         {/each}
@@ -318,6 +352,10 @@
 
   .send-btn:hover {
     opacity: 0.9;
+  }
+
+  .folder-btn {
+    background: var(--accent-secondary, #7c3aed);
   }
 
   /* Transfers */

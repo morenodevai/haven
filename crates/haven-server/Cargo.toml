@@ -19,6 +19,8 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 dotenvy = { workspace = true }
 
+socket2 = { workspace = true }
+
 haven-api = { workspace = true }
 haven-db = { workspace = true }
 haven-gateway = { workspace = true }

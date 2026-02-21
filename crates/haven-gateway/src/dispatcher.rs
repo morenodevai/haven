@@ -2,9 +2,20 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::{RwLock, broadcast, mpsc};
+use tracing::warn;
 use uuid::Uuid;
 
 use haven_types::events::GatewayEvent;
+
+/// Pre-serialized broadcast message. The JSON is serialized once in `broadcast()`
+/// so N connections don't each pay the serialization cost. The `channel_id` is
+/// extracted before serialization so connections can still filter by subscription
+/// without deserializing.
+#[derive(Debug, Clone)]
+pub struct BroadcastMessage {
+    pub channel_id: Option<Uuid>,
+    pub json: Arc<str>,
+}
 
 /// Voice channel participant state.
 #[derive(Debug, Clone)]
@@ -16,6 +27,19 @@ pub struct VoiceParticipant {
     pub self_deaf: bool,
 }
 
+/// Messages that can be sent to a specific user's connection.
+#[derive(Debug, Clone)]
+pub enum UserMessage {
+    /// A gateway event that will be JSON-serialized before sending.
+    Event(GatewayEvent),
+    /// Raw binary data to be sent as a WebSocket binary frame (zero-copy relay).
+    Binary(Vec<u8>),
+}
+
+/// Per-user targeted channel buffer depth. If a client can't keep up with 512
+/// queued events, it is too slow and messages will be dropped with a warning.
+const USER_CHANNEL_CAPACITY: usize = 512;
+
 /// Manages all connected clients and broadcasts events.
 #[derive(Clone)]
 pub struct Dispatcher {
@@ -23,16 +47,18 @@ pub struct Dispatcher {
 }
 
 struct DispatcherInner {
-    /// Broadcast channel for gateway events — all connected clients receive all events.
-    /// Channel-scoped filtering is applied at the connection level, not here.
-    broadcast_tx: broadcast::Sender<GatewayEvent>,
+    /// Broadcast channel for pre-serialized gateway events -- all connected
+    /// clients receive all events. Channel-scoped filtering is applied at
+    /// the connection level, not here.
+    broadcast_tx: broadcast::Sender<BroadcastMessage>,
 
     /// Track online users: user_id -> username
     online_users: RwLock<HashMap<Uuid, String>>,
 
     /// Per-user targeted send channels: user_id -> [(conn_id, sender)]
     /// Multiple connections per user are supported (multi-device).
-    user_channels: RwLock<HashMap<Uuid, Vec<(Uuid, mpsc::UnboundedSender<GatewayEvent>)>>>,
+    /// Bounded to USER_CHANNEL_CAPACITY; overflows are dropped with a warning.
+    user_channels: RwLock<HashMap<Uuid, Vec<(Uuid, mpsc::Sender<UserMessage>)>>>,
 
     /// Voice state: channel_id -> (user_id -> participant)
     voice_states: RwLock<HashMap<Uuid, HashMap<Uuid, VoiceParticipant>>>,
@@ -44,7 +70,7 @@ struct DispatcherInner {
 
 impl Dispatcher {
     pub fn new() -> Self {
-        let (broadcast_tx, _) = broadcast::channel(1024);
+        let (broadcast_tx, _) = broadcast::channel(8192);
         Self {
             inner: Arc::new(DispatcherInner {
                 broadcast_tx,
@@ -56,21 +82,28 @@ impl Dispatcher {
         }
     }
 
-    /// Subscribe to gateway events. Returns a broadcast receiver.
-    pub fn subscribe(&self) -> broadcast::Receiver<GatewayEvent> {
+    /// Subscribe to gateway events. Returns a broadcast receiver of pre-serialized messages.
+    pub fn subscribe(&self) -> broadcast::Receiver<BroadcastMessage> {
         self.inner.broadcast_tx.subscribe()
     }
 
-    /// Broadcast an event to all connected clients.
+    /// Broadcast an event to all connected clients. The event is serialized once
+    /// here; connections receive the pre-serialized JSON via `Arc<str>`.
     pub fn broadcast(&self, event: GatewayEvent) {
-        let _ = self.inner.broadcast_tx.send(event);
+        let channel_id = event.channel_id();
+        let json: Arc<str> = serde_json::to_string(&event)
+            .expect("GatewayEvent serialization must not fail")
+            .into();
+        let msg = BroadcastMessage { channel_id, json };
+        let _ = self.inner.broadcast_tx.send(msg);
     }
 
     /// Register a per-user targeted channel. Returns (conn_id, receiver).
     /// Multiple connections per user are supported for multi-device login.
-    pub async fn register_user_channel(&self, user_id: Uuid) -> (Uuid, mpsc::UnboundedReceiver<GatewayEvent>) {
+    /// The channel is bounded to USER_CHANNEL_CAPACITY.
+    pub async fn register_user_channel(&self, user_id: Uuid) -> (Uuid, mpsc::Receiver<UserMessage>) {
         let conn_id = Uuid::new_v4();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(USER_CHANNEL_CAPACITY);
         self.inner.user_channels.write().await
             .entry(user_id)
             .or_default()
@@ -90,11 +123,45 @@ impl Dispatcher {
     }
 
     /// Send a targeted event to a specific user (all their devices).
+    /// Uses `try_send` -- if a connection's buffer is full, the message is
+    /// dropped with a warning (the client is too slow to keep up).
     pub async fn send_to_user(&self, user_id: Uuid, event: GatewayEvent) {
         let channels = self.inner.user_channels.read().await;
         if let Some(conns) = channels.get(&user_id) {
-            for (_, tx) in conns {
-                let _ = tx.send(event.clone());
+            for (conn_id, tx) in conns {
+                match tx.try_send(UserMessage::Event(event.clone())) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        warn!(
+                            "Dropping targeted event for user {} conn {}: channel full ({} capacity). Client too slow.",
+                            user_id, conn_id, USER_CHANNEL_CAPACITY
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        // Connection is gone; will be cleaned up on disconnect.
+                    }
+                }
+            }
+        }
+    }
+
+    /// Send raw binary data to a specific user (all their devices).
+    /// Used for zero-copy relay of binary WebSocket frames (e.g., file chunks).
+    /// Uses `try_send` -- drops data for slow clients with a warning.
+    pub async fn send_binary_to_user(&self, user_id: Uuid, data: Vec<u8>) {
+        let channels = self.inner.user_channels.read().await;
+        if let Some(conns) = channels.get(&user_id) {
+            for (conn_id, tx) in conns {
+                match tx.try_send(UserMessage::Binary(data.clone())) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        warn!(
+                            "Dropping binary data for user {} conn {}: channel full ({} capacity)",
+                            user_id, conn_id, USER_CHANNEL_CAPACITY
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {}
+                }
             }
         }
     }
@@ -146,11 +213,11 @@ impl Dispatcher {
         };
 
         if remaining > 0 {
-            // Other devices still connected — don't mark offline
+            // Other devices still connected -- don't mark offline
             return;
         }
 
-        // All connections gone — full cleanup
+        // All connections gone -- full cleanup
         let username = self
             .inner
             .online_users
@@ -253,6 +320,7 @@ impl Dispatcher {
     }
 
     /// Relay voice audio data from sender to all other participants in the same channel.
+    /// Uses `try_send` -- drops data for slow clients with a warning.
     pub async fn relay_voice_data(&self, sender_id: Uuid, data: String) {
         let voice_states = self.inner.voice_states.read().await;
         let channels = self.inner.user_channels.read().await;
@@ -266,8 +334,17 @@ impl Dispatcher {
                 for (&uid, _) in participants.iter() {
                     if uid != sender_id {
                         if let Some(conns) = channels.get(&uid) {
-                            for (_, tx) in conns {
-                                let _ = tx.send(event.clone());
+                            for (conn_id, tx) in conns {
+                                match tx.try_send(UserMessage::Event(event.clone())) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        warn!(
+                                            "Dropping voice data for user {} conn {}: channel full",
+                                            uid, conn_id
+                                        );
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {}
+                                }
                             }
                         }
                     }

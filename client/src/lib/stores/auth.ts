@@ -123,15 +123,22 @@ function scheduleTokenRefresh(token: string) {
 }
 
 async function doRefresh() {
-  try {
-    const { token } = await api.refreshToken();
-    const userId = localStorage.getItem("haven_user_id");
-    const username = localStorage.getItem("haven_username");
-    if (userId && username) {
-      saveSession(userId, username, token);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const { token } = await api.refreshToken();
+      const userId = localStorage.getItem("haven_user_id");
+      const username = localStorage.getItem("haven_username");
+      if (userId && username) {
+        saveSession(userId, username, token);
+      }
+      return;
+    } catch (e) {
+      console.warn(`Token refresh attempt ${attempt + 1} failed:`, e);
+      if (attempt < 2) {
+        await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt)));
+      }
     }
-  } catch {
-    // Token expired or server unreachable — force re-login
-    logout();
   }
+  // All retries exhausted — force re-login
+  logout();
 }

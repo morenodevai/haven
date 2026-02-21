@@ -5,7 +5,7 @@
   import { checkForUpdate, updateAvailable, updateVersion, updateProgress, updateError, installUpdate } from "./lib/stores/updater";
   import { activeChannel } from "./lib/stores/channels";
   import { handlePresenceUpdate } from "./lib/stores/presence";
-  import { initTransfers, cleanupTransfers, handleFileOffer, handleFileAccept, handleFileReject, handleFileSignal, handleFileChunk, handleFileDone, handleFileAck } from "./lib/stores/transfers";
+  import { initTransfers, cleanupTransfers, handleFileOffer, handleFileAccept, handleFileReject, handleFileSignal, handleFileChunk, handleFileDone, handleFileAck, handleBinaryMessage } from "./lib/stores/transfers";
   import { Gateway } from "./lib/ipc/gateway";
   import { getBaseUrl } from "./lib/ipc/api";
   import Login from "./lib/components/auth/Login.svelte";
@@ -38,7 +38,7 @@
 
       // Connect WebSocket
       const wsUrl = getBaseUrl().replace("http", "ws") + "/gateway";
-      const gw = new Gateway(wsUrl, $auth.token);
+      const gw = new Gateway(wsUrl, () => $auth.token!);
 
       gw.on("Ready", () => {
         connected = true;
@@ -53,6 +53,8 @@
             ],
           },
         });
+        // Resync messages after reconnect to catch anything missed while offline
+        loadMessages();
       });
 
       gw.on("MessageCreate", (event) => {
@@ -89,6 +91,9 @@
       gw.on("FileChunk", (event) => handleFileChunk(event));
       gw.on("FileDone", (event) => handleFileDone(event));
       gw.on("FileAck", (event) => handleFileAck(event));
+
+      // Binary WebSocket frames (file transfer fast path — no base64, no JSON)
+      gw.on("__binary__", (data) => handleBinaryMessage(data));
 
       // Presence tracking for online users
       gw.on("PresenceUpdate", (event) => handlePresenceUpdate(event));

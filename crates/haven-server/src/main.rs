@@ -10,6 +10,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use socket2::{Domain, Protocol, Socket, Type};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::info;
@@ -48,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // Config — JWT secret is MANDATORY
+    // Config -- JWT secret is MANDATORY
     let jwt_secret = std::env::var("HAVEN_JWT_SECRET").unwrap_or_default();
 
     if jwt_secret.is_empty() || PLACEHOLDER_SECRETS.contains(&jwt_secret.as_str()) {
@@ -84,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
         jwt_secret: jwt_secret.clone(),
     };
 
-    // CORS — restrict to known origins; extend via HAVEN_CORS_ORIGINS env var
+    // CORS -- restrict to known origins; extend via HAVEN_CORS_ORIGINS env var
     let cors = build_cors_layer();
 
     // Routes
@@ -115,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(protected_routes)
         .merge(ws_route)
         .layer(axum::Extension(jwt_extension))
-        // 50 MB body limit — handles images and video file uploads.
+        // 50 MB body limit -- handles images and video file uploads.
         // Tune via HAVEN_MAX_BODY_SIZE env var if needed for larger files.
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .layer(cors)
@@ -124,7 +125,17 @@ async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
     info!("Haven server listening on {}", addr);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // Create listener via socket2 so we can set TCP_NODELAY on the listening socket.
+    // This ensures accepted connections inherit the NODELAY flag, eliminating
+    // Nagle's algorithm latency for small WebSocket frames.
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_nodelay(true)?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    let listener = tokio::net::TcpListener::from_std(socket.into())?;
+
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -170,7 +181,9 @@ async fn ws_upgrade(
     State(state): State<ServerState>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| {
-        connection::handle_connection(socket, state.dispatcher, state.jwt_secret)
-    })
+    ws.max_frame_size(1_048_576)       // 1 MB max frame
+        .max_message_size(2_097_152)   // 2 MB max message
+        .on_upgrade(move |socket| {
+            connection::handle_connection(socket, state.dispatcher, state.jwt_secret)
+        })
 }
