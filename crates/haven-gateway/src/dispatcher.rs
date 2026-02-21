@@ -30,8 +30,9 @@ struct DispatcherInner {
     /// Track online users: user_id -> username
     online_users: RwLock<HashMap<Uuid, String>>,
 
-    /// Per-user targeted send channels: user_id -> (conn_id, sender)
-    user_channels: RwLock<HashMap<Uuid, (Uuid, mpsc::UnboundedSender<GatewayEvent>)>>,
+    /// Per-user targeted send channels: user_id -> [(conn_id, sender)]
+    /// Multiple connections per user are supported (multi-device).
+    user_channels: RwLock<HashMap<Uuid, Vec<(Uuid, mpsc::UnboundedSender<GatewayEvent>)>>>,
 
     /// Voice state: channel_id -> (user_id -> participant)
     voice_states: RwLock<HashMap<Uuid, HashMap<Uuid, VoiceParticipant>>>,
@@ -66,28 +67,35 @@ impl Dispatcher {
     }
 
     /// Register a per-user targeted channel. Returns (conn_id, receiver).
+    /// Multiple connections per user are supported for multi-device login.
     pub async fn register_user_channel(&self, user_id: Uuid) -> (Uuid, mpsc::UnboundedReceiver<GatewayEvent>) {
         let conn_id = Uuid::new_v4();
         let (tx, rx) = mpsc::unbounded_channel();
-        self.inner.user_channels.write().await.insert(user_id, (conn_id, tx));
+        self.inner.user_channels.write().await
+            .entry(user_id)
+            .or_default()
+            .push((conn_id, tx));
         (conn_id, rx)
     }
 
-    /// Unregister a per-user targeted channel, but only if conn_id matches.
+    /// Unregister a specific connection for a user.
     pub async fn unregister_user_channel(&self, user_id: Uuid, conn_id: Uuid) {
         let mut channels = self.inner.user_channels.write().await;
-        if let Some((stored_conn_id, _)) = channels.get(&user_id) {
-            if *stored_conn_id == conn_id {
+        if let Some(conns) = channels.get_mut(&user_id) {
+            conns.retain(|(cid, _)| *cid != conn_id);
+            if conns.is_empty() {
                 channels.remove(&user_id);
             }
         }
     }
 
-    /// Send a targeted event to a specific user.
+    /// Send a targeted event to a specific user (all their devices).
     pub async fn send_to_user(&self, user_id: Uuid, event: GatewayEvent) {
         let channels = self.inner.user_channels.read().await;
-        if let Some((_, tx)) = channels.get(&user_id) {
-            let _ = tx.send(event);
+        if let Some(conns) = channels.get(&user_id) {
+            for (_, tx) in conns {
+                let _ = tx.send(event.clone());
+            }
         }
     }
 
@@ -118,19 +126,31 @@ impl Dispatcher {
         });
     }
 
-    /// Register a user as offline. Only cleans up if conn_id matches.
+    /// Register a user as offline. Removes this connection and only does
+    /// full cleanup (leave voice, broadcast offline) when no connections remain.
     pub async fn user_offline(&self, user_id: Uuid, conn_id: Uuid) {
-        // Only clean up if this connection still owns the user channel
-        let is_current = {
-            let channels = self.inner.user_channels.read().await;
-            channels.get(&user_id).map_or(false, |(cid, _)| *cid == conn_id)
+        // Remove this specific connection from the vec
+        let remaining = {
+            let mut channels = self.inner.user_channels.write().await;
+            if let Some(conns) = channels.get_mut(&user_id) {
+                conns.retain(|(cid, _)| *cid != conn_id);
+                if conns.is_empty() {
+                    channels.remove(&user_id);
+                    0
+                } else {
+                    conns.len()
+                }
+            } else {
+                0
+            }
         };
 
-        if !is_current {
-            // A newer connection has taken over — don't touch anything
+        if remaining > 0 {
+            // Other devices still connected — don't mark offline
             return;
         }
 
+        // All connections gone — full cleanup
         let username = self
             .inner
             .online_users
@@ -151,7 +171,6 @@ impl Dispatcher {
             });
         }
 
-        self.unregister_user_channel(user_id, conn_id).await;
         self.clear_subscriptions(user_id).await;
 
         self.broadcast(GatewayEvent::PresenceUpdate {
@@ -246,8 +265,10 @@ impl Dispatcher {
                 };
                 for (&uid, _) in participants.iter() {
                     if uid != sender_id {
-                        if let Some((_, tx)) = channels.get(&uid) {
-                            let _ = tx.send(event.clone());
+                        if let Some(conns) = channels.get(&uid) {
+                            for (_, tx) in conns {
+                                let _ = tx.send(event.clone());
+                            }
                         }
                     }
                 }

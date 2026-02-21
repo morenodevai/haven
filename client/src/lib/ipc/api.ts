@@ -38,6 +38,12 @@ async function request<T>(
   return res.json();
 }
 
+// -- Token refresh --
+
+export async function refreshToken(): Promise<{ token: string }> {
+  return request("/auth/refresh", { method: "POST" });
+}
+
 // -- Auth --
 
 export interface RegisterResponse {

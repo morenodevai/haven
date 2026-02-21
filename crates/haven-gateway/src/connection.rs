@@ -479,5 +479,26 @@ async fn handle_command(
                 )
                 .await;
         }
+
+        GatewayCommand::FileAckSend {
+            target_user_id,
+            transfer_id,
+            ack_chunk_index,
+        } => {
+            trace!(
+                "{} ({}) -> file ack {} to {}",
+                username, user_id, ack_chunk_index, target_user_id
+            );
+            dispatcher
+                .send_to_user(
+                    target_user_id,
+                    GatewayEvent::FileAck {
+                        from_user_id: user_id,
+                        transfer_id,
+                        ack_chunk_index,
+                    },
+                )
+                .await;
+        }
     }
 }

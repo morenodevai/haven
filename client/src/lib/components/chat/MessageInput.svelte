@@ -88,6 +88,7 @@
         stagedImage = null;
       } catch (e) {
         console.error("Failed to send image:", e);
+        showError("Failed to send image");
       }
       sending = false;
       textareaEl?.focus();
@@ -104,6 +105,7 @@
       input = "";
     } catch (e) {
       console.error("Failed to send:", e);
+      showError("Failed to send message");
     }
     sending = false;
     textareaEl?.focus();

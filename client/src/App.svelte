@@ -5,7 +5,7 @@
   import { checkForUpdate, updateAvailable, updateVersion, updateProgress, updateError, installUpdate } from "./lib/stores/updater";
   import { activeChannel } from "./lib/stores/channels";
   import { handlePresenceUpdate } from "./lib/stores/presence";
-  import { initTransfers, cleanupTransfers, handleFileOffer, handleFileAccept, handleFileReject, handleFileSignal, handleFileChunk, handleFileDone } from "./lib/stores/transfers";
+  import { initTransfers, cleanupTransfers, handleFileOffer, handleFileAccept, handleFileReject, handleFileSignal, handleFileChunk, handleFileDone, handleFileAck } from "./lib/stores/transfers";
   import { Gateway } from "./lib/ipc/gateway";
   import { getBaseUrl } from "./lib/ipc/api";
   import Login from "./lib/components/auth/Login.svelte";
@@ -42,6 +42,17 @@
 
       gw.on("Ready", () => {
         connected = true;
+        // Subscribe to all channels so the server delivers scoped events
+        gw.send({
+          type: "Subscribe",
+          data: {
+            channel_ids: [
+              "00000000-0000-0000-0000-000000000001", // general
+              "00000000-0000-0000-0000-000000000002", // voice
+              "00000000-0000-0000-0000-000000000003", // file-sharing
+            ],
+          },
+        });
       });
 
       gw.on("MessageCreate", (event) => {
@@ -77,6 +88,7 @@
       // Server-relayed file chunks (fallback when P2P fails)
       gw.on("FileChunk", (event) => handleFileChunk(event));
       gw.on("FileDone", (event) => handleFileDone(event));
+      gw.on("FileAck", (event) => handleFileAck(event));
 
       // Presence tracking for online users
       gw.on("PresenceUpdate", (event) => handlePresenceUpdate(event));

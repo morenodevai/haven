@@ -97,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all("./uploads").ok();
 
     let protected_routes = Router::new()
+        .route("/auth/refresh", post(auth::refresh_token))
         .route("/channels/{channel_id}/messages", get(messages::get_messages))
         .route("/channels/{channel_id}/messages", post(messages::send_message))
         .route("/channels/{channel_id}/messages/{message_id}/reactions", post(reactions::toggle_reaction))

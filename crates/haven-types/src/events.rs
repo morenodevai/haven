@@ -110,6 +110,13 @@ pub enum GatewayEvent {
         from_user_id: Uuid,
         transfer_id: String,
     },
+
+    /// Relay flow control: receiver acknowledges chunks received
+    FileAck {
+        from_user_id: Uuid,
+        transfer_id: String,
+        ack_chunk_index: u64,
+    },
 }
 
 impl GatewayEvent {
@@ -198,6 +205,13 @@ pub enum GatewayCommand {
     FileDoneSend {
         target_user_id: Uuid,
         transfer_id: String,
+    },
+
+    /// Acknowledge received file chunks (flow control)
+    FileAckSend {
+        target_user_id: Uuid,
+        transfer_id: String,
+        ack_chunk_index: u64,
     },
 }
 

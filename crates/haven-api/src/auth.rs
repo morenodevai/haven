@@ -191,13 +191,23 @@ pub async fn login(
     }))
 }
 
+/// Refresh a valid JWT — returns a new token with a fresh expiry.
+/// The caller must be authenticated (require_auth middleware).
+pub async fn refresh_token(
+    State(state): State<AppState>,
+    claims: axum::Extension<Claims>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let token = create_token(&state.jwt_secret, claims.sub, &claims.username)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({ "token": token })))
+}
+
 fn create_token(secret: &str, user_id: Uuid, username: &str) -> anyhow::Result<String> {
     let claims = Claims {
         sub: user_id,
         username: username.to_string(),
-        // 24-hour token lifetime. A refresh token flow should be implemented
-        // for production use to avoid forcing re-login while maintaining short-lived access tokens.
-        exp: (chrono::Utc::now() + chrono::Duration::hours(24)).timestamp() as usize,
+        exp: (chrono::Utc::now() + chrono::Duration::days(7)).timestamp() as usize,
     };
 
     let token = encode(

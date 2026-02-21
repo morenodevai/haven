@@ -15,7 +15,9 @@ const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun1.l.google.com:19302" },
 ];
 const ICE_TIMEOUT = 10_000; // 10s — if P2P fails, fall back to server relay
-const RELAY_CHUNK_SIZE = 48 * 1024; // 48KB for relay (smaller due to base64 overhead)
+const RELAY_CHUNK_SIZE = 128 * 1024; // 128KB relay chunks for high throughput
+const RELAY_WINDOW_SIZE = 200; // max unacked chunks in flight (~25MB)
+const RELAY_ACK_INTERVAL = 50; // receiver acks every N chunks
 
 // --- Types ---
 
@@ -48,6 +50,9 @@ interface TransferInternal {
   relayMode?: boolean; // true = using server relay instead of P2P
   relayChunkIndex?: number; // for receiver: next expected chunk
   iceTimer?: number; // timeout handle for ICE fallback
+  // Ack-based flow control for relay sender
+  ackedChunkIndex?: number; // highest acked chunk index (-1 = none)
+  ackResolve?: (() => void) | null; // resolve function when waiting for ack
 }
 
 // --- Stores ---
@@ -599,6 +604,18 @@ export async function handleFileChunk(event: any) {
         startTime: t.startTime || Date.now(),
       });
     }
+
+    // Send ack every RELAY_ACK_INTERVAL chunks for flow control
+    if (chunk_index > 0 && chunk_index % RELAY_ACK_INTERVAL === 0 && gw) {
+      gw.send({
+        type: "FileAckSend",
+        data: {
+          target_user_id: from_user_id,
+          transfer_id,
+          ack_chunk_index: chunk_index,
+        },
+      });
+    }
   } catch (e) {
     console.error("[transfers] Relay chunk write error:", e);
     updateTransfer(transfer_id, { status: "failed" });
@@ -612,9 +629,37 @@ export async function handleFileDone(event: any) {
   if (internal?.fileHandle) {
     await internal.fileHandle.close();
   }
+
+  // Send final ack so sender knows receiver is done
+  if (gw) {
+    gw.send({
+      type: "FileAckSend",
+      data: {
+        target_user_id: from_user_id,
+        transfer_id,
+        ack_chunk_index: 0xFFFFFFFF, // sentinel: all done
+      },
+    });
+  }
+
   internals.delete(transfer_id);
   updateTransfer(transfer_id, { status: "completed" });
   console.log("[transfers] Relay transfer complete:", transfer_id);
+}
+
+export function handleFileAck(event: any) {
+  const { transfer_id, ack_chunk_index } = event.data;
+
+  const internal = internals.get(transfer_id);
+  if (!internal) return;
+
+  internal.ackedChunkIndex = ack_chunk_index;
+
+  // Wake up the sender if it's waiting for ack space
+  if (internal.ackResolve) {
+    internal.ackResolve();
+    internal.ackResolve = null;
+  }
 }
 
 // --- File streaming via P2P DataChannel (sender side) ---
@@ -693,11 +738,28 @@ async function streamFile(transferId: string) {
 
 // --- File streaming via server relay (fallback) ---
 
+/** Wait until the send window has room (ack-based flow control). */
+function waitForAckWindow(
+  internal: TransferInternal,
+  chunkIndex: number
+): Promise<void> {
+  const acked = internal.ackedChunkIndex ?? -1;
+  if (chunkIndex - acked <= RELAY_WINDOW_SIZE) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    internal.ackResolve = resolve;
+  });
+}
+
 async function streamFileRelay(transferId: string, targetUserId: string) {
   const internal = internals.get(transferId);
   if (!internal?.file || !internal.cryptoKey || !gw) return;
 
   console.log("[transfers] Starting relay stream for:", transferId);
+  internal.ackedChunkIndex = -1;
+  internal.ackResolve = null;
+
   const key = internal.cryptoKey;
   const reader = internal.file.stream().getReader();
   let chunkIndex = 0;
@@ -710,6 +772,7 @@ async function streamFileRelay(transferId: string, targetUserId: string) {
 
       if (done) {
         if (leftover.length > 0) {
+          await waitForAckWindow(internal, chunkIndex);
           const encrypted = await encryptChunk(key, leftover, chunkIndex);
           const b64 = arrayBufferToBase64(encrypted);
           gw!.send({
@@ -755,6 +818,9 @@ async function streamFileRelay(transferId: string, targetUserId: string) {
 
       let offset = 0;
       while (offset + RELAY_CHUNK_SIZE <= data.length) {
+        // Flow control: wait if too many chunks are in flight
+        await waitForAckWindow(internal, chunkIndex);
+
         const chunk = data.slice(offset, offset + RELAY_CHUNK_SIZE);
         const encrypted = await encryptChunk(key, chunk, chunkIndex);
         const b64 = arrayBufferToBase64(encrypted);
@@ -777,8 +843,8 @@ async function streamFileRelay(transferId: string, targetUserId: string) {
           updateTransfer(transferId, { bytesTransferred: bytesSent });
         }
 
-        // Yield to event loop periodically to avoid blocking
-        if (chunkIndex % 4 === 0) {
+        // Yield to event loop every 8 chunks so acks can be processed
+        if (chunkIndex % 8 === 0) {
           await new Promise((r) => setTimeout(r, 0));
         }
       }

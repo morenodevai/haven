@@ -33,12 +33,23 @@ const savedToken = localStorage.getItem("haven_token");
 const savedUserId = localStorage.getItem("haven_user_id");
 const savedUsername = localStorage.getItem("haven_username");
 if (savedToken && savedUserId && savedUsername) {
-  auth.set({
-    loggedIn: true,
-    userId: savedUserId,
-    username: savedUsername,
-    token: savedToken,
-  });
+  // Check if token is expired before restoring session
+  const exp = getTokenExp(savedToken);
+  if (exp && exp * 1000 > Date.now()) {
+    auth.set({
+      loggedIn: true,
+      userId: savedUserId,
+      username: savedUsername,
+      token: savedToken,
+    });
+    scheduleTokenRefresh(savedToken);
+  } else {
+    // Token expired — clear and force re-login
+    localStorage.removeItem("haven_token");
+    localStorage.removeItem("haven_user_id");
+    localStorage.removeItem("haven_username");
+    localStorage.removeItem("haven_channel_key");
+  }
 }
 
 export async function register(username: string, password: string) {
@@ -79,4 +90,48 @@ function saveSession(userId: string, username: string, token: string) {
   localStorage.setItem("haven_user_id", userId);
   localStorage.setItem("haven_username", username);
   auth.set({ loggedIn: true, userId, username, token });
+  scheduleTokenRefresh(token);
+}
+
+// Decode JWT payload to get expiry
+function getTokenExp(token: string): number | null {
+  try {
+    const payload = JSON.parse(atob(token.split(".")[1]));
+    return payload.exp ?? null;
+  } catch {
+    return null;
+  }
+}
+
+let refreshTimer: number | null = null;
+
+function scheduleTokenRefresh(token: string) {
+  if (refreshTimer) clearTimeout(refreshTimer);
+
+  const exp = getTokenExp(token);
+  if (!exp) return;
+
+  // Refresh 1 hour before expiry
+  const msUntilRefresh = (exp * 1000) - Date.now() - (60 * 60 * 1000);
+
+  if (msUntilRefresh <= 0) {
+    // Token expires within the hour — refresh now
+    doRefresh();
+  } else {
+    refreshTimer = window.setTimeout(doRefresh, msUntilRefresh);
+  }
+}
+
+async function doRefresh() {
+  try {
+    const { token } = await api.refreshToken();
+    const userId = localStorage.getItem("haven_user_id");
+    const username = localStorage.getItem("haven_username");
+    if (userId && username) {
+      saveSession(userId, username, token);
+    }
+  } catch {
+    // Token expired or server unreachable — force re-login
+    logout();
+  }
 }
