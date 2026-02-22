@@ -642,9 +642,30 @@ function setupVAD(stream: MediaStream) {
 
 // --- WebRTC Peer Connection Management (Video/Screenshare) ---
 
+function getTurnServers(): RTCIceServer[] {
+  try {
+    const config = localStorage.getItem("haven_turn_servers");
+    if (config) return JSON.parse(config);
+  } catch {}
+  return [];
+}
+
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
+  { urls: "stun:stun.relay.metered.ca:80" },
+  // Free TURN servers for NAT traversal (Metered.ca Open Relay Project)
+  {
+    urls: [
+      "turn:openrelay.metered.ca:80",
+      "turn:openrelay.metered.ca:80?transport=tcp",
+      "turn:openrelay.metered.ca:443",
+      "turns:openrelay.metered.ca:443?transport=tcp",
+    ],
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
+  ...getTurnServers(),
 ];
 
 function ensurePeerConnection(remoteUserId: string): RTCPeerConnection {

@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::{SaltString, rand_core::OsRng}};
-use axum::{Json, extract::{ConnectInfo, State}, http::StatusCode, response::IntoResponse};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use uuid::Uuid;
 
@@ -75,13 +75,8 @@ impl Default for AuthRateLimiter {
 
 pub async fn register(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<RegisterRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    // Rate-limit by client IP
-    if !state.auth_rate_limiter.check(addr.ip()) {
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
 
     // Validate input
     if req.username.len() < 3 || req.username.len() > 32 {
@@ -141,14 +136,8 @@ pub async fn register(
 
 pub async fn login(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    // Rate-limit by client IP
-    if !state.auth_rate_limiter.check(addr.ip()) {
-        return Err(StatusCode::TOO_MANY_REQUESTS);
-    }
-
     // Reject excessively long passwords (DoS prevention)
     if req.password.len() > MAX_PASSWORD_LEN {
         return Err(StatusCode::BAD_REQUEST);

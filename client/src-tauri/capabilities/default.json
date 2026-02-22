@@ -4,6 +4,8 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
     "updater:default",
     "process:default",
     "dialog:default",

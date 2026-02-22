@@ -25,11 +25,23 @@ function getTurnServers(): RTCIceServer[] {
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
-  // TURN servers — configurable via localStorage key "haven_turn_servers"
+  { urls: "stun:stun.relay.metered.ca:80" },
+  // Free TURN servers for NAT traversal (Metered.ca Open Relay Project)
+  {
+    urls: [
+      "turn:openrelay.metered.ca:80",
+      "turn:openrelay.metered.ca:80?transport=tcp",
+      "turn:openrelay.metered.ca:443",
+      "turns:openrelay.metered.ca:443?transport=tcp",
+    ],
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
+  // Additional configurable TURN servers via localStorage key "haven_turn_servers"
   ...getTurnServers(),
 ];
-const ICE_TIMEOUT = 10_000; // 10s — if P2P fails, fall back to server relay
-const RELAY_ACK_INTERVAL = 20; // receiver acks every N chunks
+const ICE_TIMEOUT = 15_000; // 15s — if P2P fails, fall back to server relay
+const RELAY_ACK_INTERVAL = 100; // receiver acks every N chunks (was 20)
 
 // --- Types ---
 
@@ -999,11 +1011,11 @@ class TransferScheduler {
   private globalAcked = new Map<string, number>(); // transferId -> highest acked chunk
   private ackResolvers = new Map<string, (() => void) | null>();
 
-  // Shared window across ALL transfers
-  private static readonly GLOBAL_WINDOW = 200;
+  // Shared window across ALL transfers — larger window reduces ACK stalls
+  private static readonly GLOBAL_WINDOW = 800;
   private static readonly CHUNK_SIZE = 256 * 1024;
-  private static readonly ACK_INTERVAL = 20;
-  private static readonly BURST_SIZE = 16;
+  private static readonly ACK_INTERVAL = 100;
+  private static readonly BURST_SIZE = 32;
 
   addTransfer(
     transferId: string,

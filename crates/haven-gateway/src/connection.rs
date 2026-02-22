@@ -361,9 +361,19 @@ async fn handle_command(
             target_user_id,
             signal,
         } => {
+            let signal_desc = match &signal {
+                haven_types::events::VoiceSignalPayload::Offer { .. } => "Offer",
+                haven_types::events::VoiceSignalPayload::Answer { .. } => "Answer",
+                haven_types::events::VoiceSignalPayload::IceCandidate { .. } => "IceCandidate",
+                haven_types::events::VoiceSignalPayload::TrackInfo { track_type, stream_id } => {
+                    info!("{} ({}) -> TrackInfo to {} [type={}, stream={}]",
+                        username, user_id, target_user_id, track_type, stream_id);
+                    "TrackInfo"
+                }
+            };
             info!(
-                "{} ({}) -> voice signal to {}",
-                username, user_id, target_user_id
+                "{} ({}) -> voice {} to {}",
+                username, user_id, signal_desc, target_user_id
             );
             dispatcher
                 .send_to_user(
@@ -453,9 +463,15 @@ async fn handle_command(
             transfer_id,
             signal,
         } => {
-            trace!(
-                "{} ({}) -> file signal to {}",
-                username, user_id, target_user_id
+            let sig_type = match &signal {
+                haven_types::events::VoiceSignalPayload::Offer { .. } => "Offer",
+                haven_types::events::VoiceSignalPayload::Answer { .. } => "Answer",
+                haven_types::events::VoiceSignalPayload::IceCandidate { .. } => "IceCandidate",
+                haven_types::events::VoiceSignalPayload::TrackInfo { .. } => "TrackInfo",
+            };
+            info!(
+                "{} ({}) -> file {} to {} [transfer={}]",
+                username, user_id, sig_type, target_user_id, &transfer_id[..8]
             );
             dispatcher
                 .send_to_user(
@@ -566,6 +582,15 @@ async fn handle_binary_message(
             }
             let target_user_id =
                 Uuid::from_bytes(data[1..17].try_into().unwrap());
+            let chunk_index = u32::from_be_bytes(data[33..37].try_into().unwrap());
+            let payload_len = data.len() - 37;
+
+            if chunk_index % 100 == 0 {
+                info!(
+                    "Binary relay chunk #{} ({} bytes payload) from {} -> {}",
+                    chunk_index, payload_len, sender_user_id, target_user_id
+                );
+            }
 
             // Build outgoing frame: replace target_user_id with sender_user_id.
             // Converted to Bytes for O(1) cloning across multiple user connections.
@@ -612,6 +637,11 @@ async fn handle_binary_message(
             }
             let target_user_id =
                 Uuid::from_bytes(data[1..17].try_into().unwrap());
+
+            info!(
+                "Binary relay DONE from {} -> {}",
+                sender_user_id, target_user_id
+            );
 
             let mut outgoing = Vec::with_capacity(33);
             outgoing.push(0x03);

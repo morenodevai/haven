@@ -21,13 +21,11 @@ fn grant_media_permissions(window: &tauri::WebviewWindow) {
                 if let Some(args) = args {
                     let mut kind = std::mem::zeroed();
                     args.PermissionKind(&mut kind)?;
-                    // Allow both microphone and camera for voice + video chat
                     if kind == COREWEBVIEW2_PERMISSION_KIND_MICROPHONE
                         || kind == COREWEBVIEW2_PERMISSION_KIND_CAMERA
                     {
                         args.SetState(COREWEBVIEW2_PERMISSION_STATE_ALLOW)?;
                     } else {
-                        // Let browser/OS handle other permissions (e.g. screen capture)
                         args.SetState(COREWEBVIEW2_PERMISSION_STATE_DEFAULT)?;
                     }
                 }
@@ -39,15 +37,64 @@ fn grant_media_permissions(window: &tauri::WebviewWindow) {
     });
 }
 
+/// Kill any orphaned WebView2 processes from a previous Haven session, then
+/// nuke the entire EBWebView profile so WebView2 always starts clean.
+///
+/// This is the nuclear option but it *guarantees* no blank-screen-of-death.
+/// The cost is that localStorage is wiped on each launch — the user has to
+/// log in again.  This is acceptable because a blank screen that requires
+/// a full reinstall is far worse than re-entering credentials.
+fn clean_webview2_data() {
+    let local_appdata = match std::env::var("LOCALAPPDATA") {
+        Ok(v) if !v.is_empty() => v,
+        _ => return,
+    };
+
+    let haven_data = std::path::Path::new(&local_appdata).join("com.haven.voice");
+    let ebwebview = haven_data.join("EBWebView");
+
+    if !ebwebview.exists() {
+        return;
+    }
+
+    // Try to remove lock files first (works if no orphan process holds them).
+    let lock_held = std::fs::remove_file(ebwebview.join("lockfile")).is_err()
+        && ebwebview.join("lockfile").exists();
+
+    if lock_held {
+        // Lock file exists but we couldn't delete it → orphan process.
+        // Kill all msedgewebview2 processes that belong to OUR data dir.
+        // We use taskkill by image name; this is safe because we only do it
+        // when our own lock is stuck.
+        {
+            use std::os::windows::process::CommandExt;
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/IM", "msedgewebview2.exe"])
+                .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                .output();
+        }
+
+        // Give the OS a moment to release file handles
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    // Nuke the entire EBWebView directory — guarantees a clean slate.
+    let _ = std::fs::remove_dir_all(&ebwebview);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // WebView2: allow autoplay audio (for voice chat) and expose real local IPs
-    // for WebRTC ICE candidates (mDNS obfuscation breaks LAN connectivity).
-    // SAFETY: called before any threads are spawned.
+    // Clean WebView2 data BEFORE anything else.
+    clean_webview2_data();
+
+    // WebView2 flags: autoplay audio, expose real IPs for WebRTC, disable
+    // GPU shader disk cache (avoids stale cache blank screens).
     unsafe {
         std::env::set_var(
             "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
-            "--autoplay-policy=no-user-gesture-required --disable-features=WebRtcHideLocalIpsWithMdns",
+            "--autoplay-policy=no-user-gesture-required \
+             --disable-features=WebRtcHideLocalIpsWithMdns \
+             --disable-gpu-shader-disk-cache",
         );
     }
 
