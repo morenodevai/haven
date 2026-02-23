@@ -1,0 +1,24 @@
+[package]
+name = "haven-transfer"
+version = "0.1.0"
+edition = "2021"
+description = "High-speed UDP file transfer with delay-based congestion control and AES-256-GCM encryption"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[dependencies]
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

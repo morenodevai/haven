@@ -34,5 +34,4 @@ uploads/
 
 # Runtime / deployment artifacts
 current/
-haven_app/
 *.log
