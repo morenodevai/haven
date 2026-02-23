@@ -37,9 +37,13 @@ fn grant_media_permissions(window: &tauri::WebviewWindow) {
     });
 }
 
-/// Kill any orphaned WebView2 processes from a previous Haven session,
-/// clear stale localStorage/session data, but preserve the GPU cache
-/// so video rendering works.
+/// Kill any orphaned WebView2 processes from a previous Haven session and
+/// clean up stale lock files so WebView2 can start.
+///
+/// We do NOT delete the EBWebView profile or Local Storage — that destroys the
+/// GPU shader cache (causing black-screen video) and wipes auth state.  The
+/// JavaScript layer already handles stale/expired JWT tokens gracefully, so
+/// filesystem-level storage cleanup is unnecessary.
 fn clean_webview2_data() {
     let local_appdata = match std::env::var("LOCALAPPDATA") {
         Ok(v) if !v.is_empty() => v,
@@ -58,8 +62,8 @@ fn clean_webview2_data() {
         && ebwebview.join("lockfile").exists();
 
     if lock_held {
-        // Lock file exists but we couldn't delete it → orphan process.
-        // Kill all msedgewebview2 processes that belong to OUR data dir.
+        // Lock file exists but we couldn't delete it — orphan process.
+        // Kill all msedgewebview2 processes so we can start fresh.
         {
             use std::os::windows::process::CommandExt;
             let _ = std::process::Command::new("taskkill")
@@ -73,15 +77,6 @@ fn clean_webview2_data() {
 
         // Retry lockfile removal after killing orphans
         let _ = std::fs::remove_file(ebwebview.join("lockfile"));
-    }
-
-    // Clear localStorage/session storage so stale auth tokens don't block login,
-    // but keep GPU cache (GPUCache, ShaderCache) intact for video rendering.
-    let default_profile = ebwebview.join("Default");
-    if default_profile.exists() {
-        let _ = std::fs::remove_dir_all(default_profile.join("Local Storage"));
-        let _ = std::fs::remove_dir_all(default_profile.join("Session Storage"));
-        let _ = std::fs::remove_dir_all(default_profile.join("IndexedDB"));
     }
 }
 

@@ -2,7 +2,7 @@ import App from "./App.svelte";
 import { mount } from "svelte";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 
-const HAVEN_VERSION = "0.10.4";
+const HAVEN_VERSION = "0.10.8";
 
 // Detect stale cache: if stored version doesn't match, wipe caches and reload.
 // This prevents the blank-screen-of-death after updates.
