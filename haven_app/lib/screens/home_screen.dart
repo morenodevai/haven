@@ -1,7 +1,9 @@
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:haven_app/config/constants.dart';
+import 'package:haven_app/config/theme.dart';
 import 'package:haven_app/models/channel.dart';
 import 'package:haven_app/providers/auth_provider.dart';
 import 'package:haven_app/providers/channel_provider.dart';
@@ -139,6 +141,13 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   Widget build(BuildContext context) {
     final activeChannel = ref.watch(activeChannelProvider);
 
+    // Listen for incoming file offers globally (regardless of active channel)
+    ref.listen<FileTransferState>(fileTransferProvider, (prev, next) {
+      if (next.pendingOffer != null && prev?.pendingOffer == null) {
+        _showIncomingOfferDialog(context, next.pendingOffer!);
+      }
+    });
+
     return Scaffold(
       body: Row(
         children: [
@@ -151,6 +160,79 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           // Main content area
           Expanded(
             child: _buildContent(activeChannel),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showIncomingOfferDialog(
+      BuildContext context, Map<String, dynamic> offer) {
+    final filename = offer['filename'] as String? ?? 'unknown';
+    final size = offer['size'] as int? ?? 0;
+    final fromUser = offer['from_user_id'] as String? ?? 'unknown';
+
+    String sizeStr;
+    if (size > 1000000000) {
+      sizeStr = '${(size / 1000000000).toStringAsFixed(2)} GB';
+    } else if (size > 1000000) {
+      sizeStr = '${(size / 1000000).toStringAsFixed(1)} MB';
+    } else if (size > 1000) {
+      sizeStr = '${(size / 1000).toStringAsFixed(1)} KB';
+    } else {
+      sizeStr = '$size B';
+    }
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: HavenTheme.surface,
+        title: const Text('Incoming File Transfer',
+            style: TextStyle(color: HavenTheme.textPrimary)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('From: $fromUser',
+                style: TextStyle(color: HavenTheme.textSecondary)),
+            const SizedBox(height: 4),
+            Text('File: $filename',
+                style: TextStyle(color: HavenTheme.textSecondary)),
+            const SizedBox(height: 4),
+            Text('Size: $sizeStr',
+                style: TextStyle(color: HavenTheme.textSecondary)),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              ref.read(fileTransferProvider.notifier).rejectOffer();
+              Navigator.of(ctx).pop();
+            },
+            child:
+                Text('Reject', style: TextStyle(color: HavenTheme.error)),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              Navigator.of(ctx).pop();
+              final savePath = await FilePicker.platform.saveFile(
+                dialogTitle: 'Save file as...',
+                fileName: filename,
+              );
+              if (savePath != null) {
+                ref
+                    .read(fileTransferProvider.notifier)
+                    .acceptOffer(savePath);
+              } else {
+                ref.read(fileTransferProvider.notifier).rejectOffer();
+              }
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: HavenTheme.primaryLight,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('Accept'),
           ),
         ],
       ),

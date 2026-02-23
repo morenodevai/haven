@@ -30,11 +30,8 @@ class _FileTransferScreenState extends ConsumerState<FileTransferScreen> {
         .where((u) => u.id != authState.userId)
         .toList();
 
-    // Listen for incoming offers and show dialog
+    // Listen for errors
     ref.listen<FileTransferState>(fileTransferProvider, (prev, next) {
-      if (next.pendingOffer != null && prev?.pendingOffer == null) {
-        _showIncomingOfferDialog(context, next.pendingOffer!);
-      }
       if (next.error != null && next.error != prev?.error) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text(next.error!)),
