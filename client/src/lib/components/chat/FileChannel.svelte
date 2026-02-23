@@ -13,6 +13,9 @@
     formatSpeed,
     type Transfer,
   } from "../../stores/transfers";
+  import { open as tauriOpen } from "@tauri-apps/plugin-dialog";
+
+  const isTauri = !!(window as any).__TAURI_INTERNALS__;
 
   let dragOver = $state(false);
   let selectedPeer: { id: string; username: string } | null = $state(null);
@@ -45,7 +48,23 @@
     dragOver = false;
   }
 
-  function openFilePicker(peerId: string, peerUsername: string) {
+  async function openFilePicker(peerId: string, peerUsername: string) {
+    if (isTauri) {
+      // Use Tauri native dialog → gives us a file path for native Rust transfer
+      try {
+        const result = await tauriOpen({ multiple: true, title: "Select files to send" });
+        if (result) {
+          const paths = Array.isArray(result) ? result : [result];
+          for (const path of paths) {
+            sendFile(peerId, peerUsername, null, path);
+          }
+        }
+      } catch (e) {
+        console.error("[FileChannel] Native open dialog error:", e);
+      }
+      return;
+    }
+    // Browser fallback
     selectedPeer = { id: peerId, username: peerUsername };
     fileInputEl?.click();
   }

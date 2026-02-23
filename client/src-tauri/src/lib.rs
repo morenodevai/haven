@@ -1,6 +1,6 @@
 mod commands;
 
-use commands::crypto;
+use commands::{crypto, transfer};
 use tauri::Manager;
 
 #[cfg(target_os = "windows")]
@@ -111,12 +111,17 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .manage(crypto::KeyStore::default())
+        .manage(transfer::TransferEngine::default())
         .invoke_handler(tauri::generate_handler![
             crypto::generate_key,
             crypto::encrypt,
             crypto::decrypt,
             crypto::export_key,
             crypto::import_key,
+            transfer::transfer_connect,
+            transfer::transfer_send_file,
+            transfer::transfer_receive_file,
+            transfer::transfer_cancel,
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {

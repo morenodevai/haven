@@ -1,12 +1,26 @@
 import { writable, derived, get } from "svelte/store";
 import type { Gateway } from "../ipc/gateway";
-import { create, type FileHandle } from "@tauri-apps/plugin-fs";
-import { save } from "@tauri-apps/plugin-dialog";
+import { create, stat, type FileHandle } from "@tauri-apps/plugin-fs";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { channelKey } from "./messages";
 import { auth } from "./auth";
 import { CryptoWorkerPool } from "../workers/crypto-pool";
 
 const cryptoPool = new CryptoWorkerPool();
+
+// --- Native transfer (Rust TCP relay) ---
+
+function isNativeTransferAvailable(): boolean {
+  try {
+    return !!(window as any).__TAURI_INTERNALS__;
+  } catch {
+    return false;
+  }
+}
+
+let nativeListenerCleanups: UnlistenFn[] = [];
 
 // --- Constants ---
 
@@ -71,6 +85,8 @@ interface TransferInternal {
   cryptoKey?: CryptoKey;
   fileHandle?: FileHandle;
   file?: File;
+  filePath?: string; // native file path for Rust transfer engine
+  nativeMode?: boolean; // true = using native Rust TCP relay
   relayMode?: boolean; // true = using server relay instead of P2P
   relayChunkIndex?: number; // for receiver: next expected chunk
   iceTimer?: number; // timeout handle for ICE fallback
@@ -213,6 +229,59 @@ function getTransfer(id: string): Transfer | undefined {
 
 export function initTransfers(gateway: Gateway) {
   gw = gateway;
+
+  // Set up native transfer event listeners (Rust -> JS)
+  if (isNativeTransferAvailable()) {
+    setupNativeListeners();
+  }
+}
+
+async function setupNativeListeners() {
+  const unlisten1 = await listen<{ transfer_id: string; bytes_sent: number; total_bytes: number; speed_mbps: number }>(
+    "transfer-progress",
+    (event) => {
+      const { transfer_id, bytes_sent, total_bytes, speed_mbps } = event.payload;
+      const t = getTransfer(transfer_id);
+      if (t) {
+        updateTransfer(transfer_id, {
+          bytesTransferred: bytes_sent,
+          status: "transferring",
+          startTime: t.startTime || Date.now(),
+        });
+      }
+    }
+  );
+
+  const unlisten2 = await listen<{ transfer_id: string }>(
+    "transfer-complete",
+    (event) => {
+      const { transfer_id } = event.payload;
+      updateTransfer(transfer_id, { status: "completed" });
+      internals.delete(transfer_id);
+      console.log("[transfers] Native transfer complete:", transfer_id);
+    }
+  );
+
+  const unlisten3 = await listen<{ transfer_id: string; error: string }>(
+    "transfer-error",
+    (event) => {
+      const { transfer_id, error } = event.payload;
+      console.error("[transfers] Native transfer error:", error);
+      updateTransfer(transfer_id, { status: "failed" });
+      internals.delete(transfer_id);
+    }
+  );
+
+  const unlisten4 = await listen<{ transfer_id: string }>(
+    "transfer-cancelled",
+    (event) => {
+      const { transfer_id } = event.payload;
+      updateTransfer(transfer_id, { status: "cancelled" });
+      internals.delete(transfer_id);
+    }
+  );
+
+  nativeListenerCleanups = [unlisten1, unlisten2, unlisten3, unlisten4];
 }
 
 export function cleanupTransfers() {
@@ -231,14 +300,42 @@ export function cleanupTransfers() {
   }
   internals.clear();
   gw = null;
+
+  // Clean up native transfer event listeners
+  for (const cleanup of nativeListenerCleanups) {
+    cleanup();
+  }
+  nativeListenerCleanups = [];
 }
 
 export async function sendFile(
   peerId: string,
   peerUsername: string,
-  file: File
+  file: File | null,
+  nativeFilePath?: string,
 ) {
   if (!gw) return;
+
+  let filename: string;
+  let fileSize: number;
+
+  if (nativeFilePath) {
+    // Native path — extract filename and size from the filesystem
+    const parts = nativeFilePath.replace(/\\/g, "/").split("/");
+    filename = parts[parts.length - 1] || "file";
+    try {
+      const info = await stat(nativeFilePath);
+      fileSize = info.size;
+    } catch (e) {
+      console.error("[transfers] Failed to stat native file:", e);
+      return;
+    }
+  } else if (file) {
+    filename = file.name;
+    fileSize = file.size;
+  } else {
+    return;
+  }
 
   const transferId = crypto.randomUUID();
 
@@ -246,25 +343,25 @@ export async function sendFile(
     id: transferId,
     peerId,
     peerUsername,
-    filename: file.name,
-    size: file.size,
+    filename,
+    size: fileSize,
     direction: "send",
     status: "pending",
     bytesTransferred: 0,
   };
 
   transfers.update((list) => [...list, transfer]);
-  internals.set(transferId, { file });
+  internals.set(transferId, { file: file || undefined, filePath: nativeFilePath });
 
-  console.log("[transfers] Sending file offer:", file.name, file.size, "bytes to", peerId);
+  console.log("[transfers] Sending file offer:", filename, fileSize, "bytes to", peerId);
 
   gw.send({
     type: "FileOfferSend",
     data: {
       target_user_id: peerId,
       transfer_id: transferId,
-      filename: file.name,
-      size: file.size,
+      filename,
+      size: fileSize,
     },
   });
 }
@@ -292,6 +389,38 @@ export async function acceptTransfer(transferId: string) {
 
   updateTransfer(transferId, { status: "connecting" });
 
+  // Try native Rust transfer first — registers the receive handler in Rust
+  // before sending FileAccept so the sender's chunks don't arrive before we're ready
+  if (isNativeTransferAvailable()) {
+    try {
+      const keyB64 = get(channelKey);
+      if (!keyB64) throw new Error("No channel key");
+
+      await invoke("transfer_receive_file", {
+        savePath,
+        transferId,
+        totalSize: transfer.size,
+        channelKey: keyB64,
+        peerUid: transfer.peerId,
+      });
+
+      internals.set(transferId, { nativeMode: true });
+
+      console.log("[transfers] Native receive registered, sending accept:", transferId);
+      gw.send({
+        type: "FileAcceptSend",
+        data: {
+          target_user_id: transfer.peerId,
+          transfer_id: transferId,
+        },
+      });
+      return;
+    } catch (e) {
+      console.warn("[transfers] Native receive setup failed, falling back to JS:", e);
+    }
+  }
+
+  // Fallback: JS-based receive (browser crypto + Tauri FS plugin)
   try {
     console.log("[transfers] Creating file at:", savePath);
     const fileHandle = await create(savePath);
@@ -331,10 +460,20 @@ export function rejectTransfer(transferId: string) {
 }
 
 export function cancelTransfer(transferId: string) {
+  const internal = internals.get(transferId);
+
+  // Cancel native Rust transfer if active
+  if (internal?.nativeMode && isNativeTransferAvailable()) {
+    const transfer = getTransfer(transferId);
+    invoke("transfer_cancel", {
+      transferId,
+      targetUid: transfer?.peerId || null,
+    }).catch(() => {});
+  }
+
   // Remove from relay scheduler if active
   scheduler.removeTransfer(transferId);
 
-  const internal = internals.get(transferId);
   if (internal) {
     if (internal.iceTimer) clearTimeout(internal.iceTimer);
     internal.dc?.close();
@@ -373,12 +512,39 @@ export async function handleFileAccept(event: any) {
   const transfer = getTransfer(transfer_id);
   if (!transfer || transfer.direction !== "send") return;
 
-  console.log("[transfers] Peer accepted transfer:", transfer_id, "— trying P2P first...");
+  console.log("[transfers] Peer accepted transfer:", transfer_id);
   updateTransfer(transfer_id, { status: "connecting", startTime: Date.now() });
+
+  // Try native Rust transfer first — requires a native file path
+  const internal = internals.get(transfer_id) || {};
+  if (isNativeTransferAvailable() && internal.filePath) {
+    try {
+      const keyB64 = get(channelKey);
+      if (!keyB64) throw new Error("No channel key");
+
+      console.log("[transfers] Using native Rust transfer for:", transfer_id);
+      internal.nativeMode = true;
+      internals.set(transfer_id, internal);
+      updateTransfer(transfer_id, { status: "transferring" });
+
+      await invoke("transfer_send_file", {
+        filePath: internal.filePath,
+        targetUid: from_user_id,
+        transferId: transfer_id,
+        channelKey: keyB64,
+      });
+      return;
+    } catch (e) {
+      console.warn("[transfers] Native send failed, falling back to P2P/relay:", e);
+      internal.nativeMode = false;
+    }
+  }
+
+  // Fallback: WebRTC P2P → WebSocket relay
+  console.log("[transfers] Using P2P/relay fallback for:", transfer_id);
 
   try {
     const cryptoKey = await deriveTransferKey(transfer_id);
-    const internal = internals.get(transfer_id) || {};
     internal.cryptoKey = cryptoKey;
 
     // Try WebRTC P2P first

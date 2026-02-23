@@ -8,6 +8,7 @@
   import { initTransfers, cleanupTransfers, handleFileOffer, handleFileAccept, handleFileReject, handleFileSignal, handleFileChunk, handleFileDone, handleFileAck, handleBinaryMessage } from "./lib/stores/transfers";
   import { Gateway } from "./lib/ipc/gateway";
   import { getBaseUrl } from "./lib/ipc/api";
+  import { invoke } from "@tauri-apps/api/core";
   import Login from "./lib/components/auth/Login.svelte";
   import Sidebar from "./lib/components/sidebar/Sidebar.svelte";
   import MessageList from "./lib/components/chat/MessageList.svelte";
@@ -117,6 +118,27 @@
       gateway = gw;
       initVoice(gw, $auth.userId!);
       initTransfers(gw);
+
+      // Connect native TCP relay for high-speed file transfers
+      if ((window as any).__TAURI_INTERNALS__) {
+        try {
+          const baseUrl = new URL(getBaseUrl());
+          const serverHost = baseUrl.hostname;
+          const httpPort = parseInt(baseUrl.port) || 3000;
+          const relayPort = httpPort + 1;
+          invoke("transfer_connect", {
+            serverHost,
+            relayPort,
+            jwtToken: $auth.token!,
+          }).then(() => {
+            console.log("[App] TCP relay connected on port", relayPort);
+          }).catch((e: any) => {
+            console.warn("[App] TCP relay connect failed (using WS fallback):", e);
+          });
+        } catch (e) {
+          console.warn("[App] TCP relay setup error:", e);
+        }
+      }
 
       return () => {
         cleanupTransfers();
