@@ -100,7 +100,6 @@ const ICE_SERVERS: RTCIceServer[] = [
 ];
 const ICE_TIMEOUT = 15_000; // 15s — if P2P fails, fall back to server relay
 const RELAY_ACK_INTERVAL = 100; // receiver acks every N chunks (was 20)
-const WRITE_BATCH_SIZE = 4 * 1024 * 1024; // 4MB — batch decrypted chunks before disk flush
 
 // --- Types ---
 
@@ -140,9 +139,6 @@ interface TransferInternal {
   ackResolve?: (() => void) | null; // resolve function when waiting for ack
   writeQueue?: Promise<void>; // sequential write chain — prevents race between chunks and FileDone
   lastUiUpdate?: number; // throttle UI store updates to ~10fps
-  writeBuffer?: Uint8Array[]; // buffered decrypted chunks awaiting disk flush
-  writeBufferBytes?: number; // total size of buffered chunks
-  bytesProcessed?: number; // cumulative decrypted bytes (for accurate progress)
 }
 
 // --- Stores ---
@@ -774,6 +770,7 @@ export async function handleFileSignal(event: any) {
         console.log("[transfers] Receiver DataChannel opened (P2P mode)");
 
         let chunkIndex = 0;
+        let lastUiUpdate = Date.now();
 
         dc.onmessage = async (msg) => {
           if (typeof msg.data === "string" && msg.data === "DONE") {
@@ -781,7 +778,6 @@ export async function handleFileSignal(event: any) {
             if (internal.writeQueue) {
               await internal.writeQueue;
             }
-            await flushWriteBuffer(internal);
             if (internal.fileHandle) {
               await internal.fileHandle.close();
             }
@@ -802,33 +798,25 @@ export async function handleFileSignal(event: any) {
               currentChunk
             );
 
-            // Chain: decrypt → buffer → batch-flush (same as relay path)
+            // Chain writes sequentially to prevent interleaved file writes
             const prevQueue = internal.writeQueue || Promise.resolve();
             internal.writeQueue = prevQueue.then(async () => {
               const decrypted = await decryptPromise;
-
-              if (!internal.writeBuffer) {
-                internal.writeBuffer = [];
-                internal.writeBufferBytes = 0;
+              if (internal.fileHandle) {
+                await internal.fileHandle.write(new Uint8Array(decrypted));
               }
-              internal.writeBuffer.push(new Uint8Array(decrypted));
-              internal.writeBufferBytes! += decrypted.byteLength;
-
-              if (internal.writeBufferBytes! >= WRITE_BATCH_SIZE) {
-                await flushWriteBuffer(internal);
-              }
-
-              if (!internal.bytesProcessed) internal.bytesProcessed = 0;
-              internal.bytesProcessed += decrypted.byteLength;
 
               // Throttled UI update (~10fps)
               const now = Date.now();
-              if (!internal.lastUiUpdate || now - internal.lastUiUpdate >= 100) {
-                internal.lastUiUpdate = now;
-                updateTransfer(transfer_id, {
-                  bytesTransferred: internal.bytesProcessed,
-                  status: "transferring",
-                });
+              if (now - lastUiUpdate >= 100) {
+                const t = getTransfer(transfer_id);
+                if (t) {
+                  updateTransfer(transfer_id, {
+                    bytesTransferred: t.bytesTransferred + decrypted.byteLength,
+                    status: "transferring",
+                  });
+                }
+                lastUiUpdate = now;
               }
             });
           } catch (e) {
@@ -901,38 +889,18 @@ export async function handleFileChunk(event: any) {
 
   try {
     const encrypted = base64ToArrayBuffer(data);
+    const decrypted = await decryptChunk(internal.cryptoKey, encrypted, chunk_index);
 
-    // Use worker pool for parallel decryption (was main-thread only)
-    const decryptPromise = cryptoPool.decrypt(internal.cryptoKey, encrypted, chunk_index);
+    await internal.fileHandle.write(new Uint8Array(decrypted));
 
-    const prevQueue = internal.writeQueue || Promise.resolve();
-    internal.writeQueue = prevQueue.then(async () => {
-      const decrypted = await decryptPromise;
-
-      if (!internal.writeBuffer) {
-        internal.writeBuffer = [];
-        internal.writeBufferBytes = 0;
-      }
-      internal.writeBuffer.push(new Uint8Array(decrypted));
-      internal.writeBufferBytes! += decrypted.byteLength;
-
-      if (internal.writeBufferBytes! >= WRITE_BATCH_SIZE) {
-        await flushWriteBuffer(internal);
-      }
-
-      if (!internal.bytesProcessed) internal.bytesProcessed = 0;
-      internal.bytesProcessed += decrypted.byteLength;
-
-      const now = Date.now();
-      if (!internal.lastUiUpdate || now - internal.lastUiUpdate >= 100) {
-        internal.lastUiUpdate = now;
-        updateTransfer(transfer_id, {
-          bytesTransferred: internal.bytesProcessed,
-          status: "transferring",
-          startTime: getTransfer(transfer_id)?.startTime || Date.now(),
-        });
-      }
-    });
+    const t = getTransfer(transfer_id);
+    if (t) {
+      updateTransfer(transfer_id, {
+        bytesTransferred: t.bytesTransferred + decrypted.byteLength,
+        status: "transferring",
+        startTime: t.startTime || Date.now(),
+      });
+    }
 
     // Send ack every RELAY_ACK_INTERVAL chunks for flow control
     if (chunk_index > 0 && chunk_index % RELAY_ACK_INTERVAL === 0 && gw) {
@@ -955,15 +923,6 @@ export async function handleFileDone(event: any) {
   const { from_user_id, transfer_id } = event.data;
 
   const internal = internals.get(transfer_id);
-
-  // Wait for queued writes and flush remaining buffer
-  if (internal?.writeQueue) {
-    await internal.writeQueue;
-  }
-  if (internal) {
-    await flushWriteBuffer(internal);
-  }
-
   if (internal?.fileHandle) {
     await internal.fileHandle.close();
   }
@@ -1047,21 +1006,6 @@ export function handleBinaryMessage(data: ArrayBuffer) {
     }
 }
 
-/** Concatenate buffered decrypted chunks into a single large disk write. */
-async function flushWriteBuffer(internal: TransferInternal): Promise<void> {
-    if (!internal.writeBuffer || internal.writeBuffer.length === 0 || !internal.fileHandle) return;
-    const totalSize = internal.writeBufferBytes || 0;
-    const merged = new Uint8Array(totalSize);
-    let offset = 0;
-    for (const chunk of internal.writeBuffer) {
-        merged.set(chunk, offset);
-        offset += chunk.byteLength;
-    }
-    internal.writeBuffer = [];
-    internal.writeBufferBytes = 0;
-    await internal.fileHandle.write(merged);
-}
-
 async function handleBinaryFileChunk(
     fromUserId: string,
     transferId: string,
@@ -1078,40 +1022,26 @@ async function handleBinaryFileChunk(
         chunkIndex
     );
 
-    // Chain sequentially: decrypt → buffer → batch-flush to disk.
-    // Decrypts run in parallel across workers, but writes are batched into
-    // WRITE_BATCH_SIZE chunks to reduce Tauri IPC overhead (~16x fewer writes).
+    // Chain the file write sequentially — prevents interleaved writes and
+    // ensures FileDone can await all pending writes before closing the handle.
     const prevQueue = internal.writeQueue || Promise.resolve();
     internal.writeQueue = prevQueue.then(async () => {
         try {
             const decrypted = await decryptPromise;
+            await internal.fileHandle!.write(new Uint8Array(decrypted));
 
-            // Buffer the decrypted chunk
-            if (!internal.writeBuffer) {
-                internal.writeBuffer = [];
-                internal.writeBufferBytes = 0;
-            }
-            internal.writeBuffer.push(new Uint8Array(decrypted));
-            internal.writeBufferBytes! += decrypted.byteLength;
-
-            // Flush when buffer reaches threshold (4MB)
-            if (internal.writeBufferBytes! >= WRITE_BATCH_SIZE) {
-                await flushWriteBuffer(internal);
-            }
-
-            // Track cumulative bytes for accurate progress
-            if (!internal.bytesProcessed) internal.bytesProcessed = 0;
-            internal.bytesProcessed += decrypted.byteLength;
-
-            // Throttled UI update (~10fps)
+            // Throttled UI update (~10fps) instead of per-chunk
             const now = Date.now();
             if (!internal.lastUiUpdate || now - internal.lastUiUpdate >= 100) {
                 internal.lastUiUpdate = now;
-                updateTransfer(transferId, {
-                    bytesTransferred: internal.bytesProcessed,
-                    status: "transferring",
-                    startTime: getTransfer(transferId)?.startTime || Date.now(),
-                });
+                const t = getTransfer(transferId);
+                if (t) {
+                    updateTransfer(transferId, {
+                        bytesTransferred: t.bytesTransferred + decrypted.byteLength,
+                        status: "transferring",
+                        startTime: t.startTime || Date.now(),
+                    });
+                }
             }
         } catch (e) {
             console.error("[transfers] Binary chunk write error:", e);
@@ -1141,11 +1071,6 @@ async function handleBinaryFileDone(fromUserId: string, transferId: string) {
     // chunks fail to write → status incorrectly flips to "failed".
     if (internal?.writeQueue) {
         await internal.writeQueue;
-    }
-
-    // Flush any remaining buffered chunks that didn't reach the batch threshold
-    if (internal) {
-        await flushWriteBuffer(internal);
     }
 
     if (internal?.fileHandle) {

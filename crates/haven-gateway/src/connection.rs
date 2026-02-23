@@ -570,6 +570,161 @@ async fn handle_command(
                 )
                 .await;
         }
+
+        // ── HTP (Haven Transfer Protocol) control messages ──
+        // These relay control plane signals between sender and receiver over WebSocket.
+        // The actual file data flows over the UDP relay on port 3211.
+
+        GatewayCommand::HtpOfferSend {
+            target_user_id,
+            session_id,
+            filename,
+            size,
+            chunk_count,
+            salt,
+        } => {
+            info!(
+                "{} ({}) -> HTP offer to {} (session={}, file={}, {} bytes)",
+                username, user_id, target_user_id, session_id, filename, size
+            );
+            dispatcher
+                .send_to_user(
+                    target_user_id,
+                    GatewayEvent::HtpOffer {
+                        from_user_id: user_id,
+                        session_id,
+                        filename,
+                        size,
+                        chunk_count,
+                        salt,
+                    },
+                )
+                .await;
+        }
+
+        GatewayCommand::HtpAcceptSend {
+            target_user_id,
+            session_id,
+        } => {
+            info!(
+                "{} ({}) -> HTP accept to {} (session={})",
+                username, user_id, target_user_id, session_id
+            );
+            dispatcher
+                .send_to_user(
+                    target_user_id,
+                    GatewayEvent::HtpAccept {
+                        from_user_id: user_id,
+                        session_id,
+                    },
+                )
+                .await;
+        }
+
+        GatewayCommand::HtpNackSend {
+            target_user_id,
+            session_id,
+            missing,
+        } => {
+            trace!(
+                "{} ({}) -> HTP NACK to {} (session={}, {} seqs)",
+                username, user_id, target_user_id, session_id, missing.len()
+            );
+            dispatcher
+                .send_to_user(
+                    target_user_id,
+                    GatewayEvent::HtpNack {
+                        from_user_id: user_id,
+                        session_id,
+                        missing,
+                    },
+                )
+                .await;
+        }
+
+        GatewayCommand::HtpRttSend {
+            target_user_id,
+            session_id,
+            rtt_us,
+        } => {
+            trace!(
+                "{} ({}) -> HTP RTT to {} (session={}, {} us)",
+                username, user_id, target_user_id, session_id, rtt_us
+            );
+            dispatcher
+                .send_to_user(
+                    target_user_id,
+                    GatewayEvent::HtpRtt {
+                        from_user_id: user_id,
+                        session_id,
+                        rtt_us,
+                    },
+                )
+                .await;
+        }
+
+        GatewayCommand::HtpAckSend {
+            target_user_id,
+            session_id,
+            up_to,
+        } => {
+            trace!(
+                "{} ({}) -> HTP ACK to {} (session={}, up_to={})",
+                username, user_id, target_user_id, session_id, up_to
+            );
+            dispatcher
+                .send_to_user(
+                    target_user_id,
+                    GatewayEvent::HtpAck {
+                        from_user_id: user_id,
+                        session_id,
+                        up_to,
+                    },
+                )
+                .await;
+        }
+
+        GatewayCommand::HtpDoneSend {
+            target_user_id,
+            session_id,
+            total_bytes,
+        } => {
+            info!(
+                "{} ({}) -> HTP done to {} (session={}, {} bytes)",
+                username, user_id, target_user_id, session_id, total_bytes
+            );
+            dispatcher
+                .send_to_user(
+                    target_user_id,
+                    GatewayEvent::HtpDone {
+                        from_user_id: user_id,
+                        session_id,
+                        total_bytes,
+                    },
+                )
+                .await;
+        }
+
+        GatewayCommand::HtpCancelSend {
+            target_user_id,
+            session_id,
+            reason,
+        } => {
+            info!(
+                "{} ({}) -> HTP cancel to {} (session={}, reason={})",
+                username, user_id, target_user_id, session_id, reason
+            );
+            dispatcher
+                .send_to_user(
+                    target_user_id,
+                    GatewayEvent::HtpCancel {
+                        from_user_id: user_id,
+                        session_id,
+                        reason,
+                    },
+                )
+                .await;
+        }
     }
 }
 

@@ -117,6 +117,60 @@ pub enum GatewayEvent {
         transfer_id: String,
         ack_chunk_index: u64,
     },
+
+    // ── HTP (Haven Transfer Protocol) control messages ──
+    // Data flows over the UDP relay; these control messages flow over WebSocket.
+
+    /// HTP: sender is offering a file transfer via UDP relay
+    HtpOffer {
+        from_user_id: Uuid,
+        session_id: u32,
+        filename: String,
+        size: u64,
+        chunk_count: u64,
+        salt: String, // base64-encoded 32-byte salt
+    },
+
+    /// HTP: receiver accepted the transfer — sender should start sending
+    HtpAccept {
+        from_user_id: Uuid,
+        session_id: u32,
+    },
+
+    /// HTP: receiver reports missing sequences — sender should retransmit
+    HtpNack {
+        from_user_id: Uuid,
+        session_id: u32,
+        missing: Vec<u64>,
+    },
+
+    /// HTP: RTT measurement echo — receiver sends timestamp back to sender
+    HtpRtt {
+        from_user_id: Uuid,
+        session_id: u32,
+        rtt_us: u64,
+    },
+
+    /// HTP: receiver acknowledges receipt up to this sequence
+    HtpAck {
+        from_user_id: Uuid,
+        session_id: u32,
+        up_to: u64,
+    },
+
+    /// HTP: transfer complete
+    HtpDone {
+        from_user_id: Uuid,
+        session_id: u32,
+        total_bytes: u64,
+    },
+
+    /// HTP: transfer cancelled
+    HtpCancel {
+        from_user_id: Uuid,
+        session_id: u32,
+        reason: String,
+    },
 }
 
 impl GatewayEvent {
@@ -212,6 +266,59 @@ pub enum GatewayCommand {
         target_user_id: Uuid,
         transfer_id: String,
         ack_chunk_index: u64,
+    },
+
+    // ── HTP (Haven Transfer Protocol) control commands ──
+
+    /// HTP: offer a file to a peer via UDP relay
+    HtpOfferSend {
+        target_user_id: Uuid,
+        session_id: u32,
+        filename: String,
+        size: u64,
+        chunk_count: u64,
+        salt: String,
+    },
+
+    /// HTP: accept a file transfer — tells the sender to start
+    HtpAcceptSend {
+        target_user_id: Uuid,
+        session_id: u32,
+    },
+
+    /// HTP: report missing sequences to the sender
+    HtpNackSend {
+        target_user_id: Uuid,
+        session_id: u32,
+        missing: Vec<u64>,
+    },
+
+    /// HTP: send RTT measurement to the sender
+    HtpRttSend {
+        target_user_id: Uuid,
+        session_id: u32,
+        rtt_us: u64,
+    },
+
+    /// HTP: acknowledge receipt up to a sequence
+    HtpAckSend {
+        target_user_id: Uuid,
+        session_id: u32,
+        up_to: u64,
+    },
+
+    /// HTP: signal transfer complete
+    HtpDoneSend {
+        target_user_id: Uuid,
+        session_id: u32,
+        total_bytes: u64,
+    },
+
+    /// HTP: cancel a transfer
+    HtpCancelSend {
+        target_user_id: Uuid,
+        session_id: u32,
+        reason: String,
     },
 }
 

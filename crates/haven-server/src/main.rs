@@ -25,6 +25,7 @@ use haven_api::reactions;
 use haven_gateway::connection;
 use haven_gateway::dispatcher::Dispatcher;
 use haven_gateway::tcp_relay::TcpRelayState;
+use haven_gateway::udp_relay::UdpRelayState;
 
 /// Placeholder values that MUST NOT be used as the JWT secret.
 const PLACEHOLDER_SECRETS: &[&str] = &[
@@ -184,6 +185,20 @@ async fn main() -> anyhow::Result<()> {
         info!("TCP file relay listening on {}", relay_addr);
         let relay_state = TcpRelayState::new(jwt_secret.clone());
         tokio::spawn(relay_state.run(relay_listener));
+    }
+
+    // UDP relay for Haven Transfer Protocol (high-speed file transfers)
+    // Defaults to the same port as the TCP relay — clients use UDP to this port.
+    {
+        let udp_relay_port: u16 = std::env::var("HAVEN_UDP_RELAY_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(relay_port);
+        let udp_addr: SocketAddr = format!("{}:{}", host, udp_relay_port).parse()?;
+        let udp_socket = tokio::net::UdpSocket::bind(udp_addr).await?;
+        info!("UDP file relay (HTP) listening on {}", udp_addr);
+        let udp_state = UdpRelayState::new(jwt_secret.clone());
+        tokio::spawn(udp_state.run(Arc::new(udp_socket)));
     }
 
     // #12: into_make_service_with_connect_info to provide SocketAddr for rate limiting
