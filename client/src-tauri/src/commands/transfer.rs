@@ -378,6 +378,14 @@ pub async fn transfer_send_file(
     let transfer_uuid =
         Uuid::parse_str(&transfer_id).map_err(|e| e.to_string())?;
 
+    // Fail fast if TCP relay is not connected
+    {
+        let guard = engine.tcp_write.lock().await;
+        if guard.is_none() {
+            return Err("TCP relay not connected".into());
+        }
+    }
+
     // Derive AES key (must match JS HKDF derivation)
     let aes_key = derive_aes_key(&channel_key, &transfer_id)?;
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&aes_key));
@@ -576,6 +584,16 @@ pub async fn transfer_receive_file(
         Uuid::parse_str(&transfer_id).map_err(|e| e.to_string())?;
     let peer_uuid =
         Uuid::parse_str(&peer_uid).map_err(|e| e.to_string())?;
+
+    // Fail fast if TCP relay is not connected
+    {
+        let handle = engine.reader_handle.lock().await;
+        match handle.as_ref() {
+            None => return Err("TCP relay not connected".into()),
+            Some(h) if h.is_finished() => return Err("TCP relay reader disconnected".into()),
+            _ => {}
+        }
+    }
 
     // Derive AES key
     let aes_key = derive_aes_key(&channel_key, &transfer_id)?;

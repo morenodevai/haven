@@ -1,6 +1,6 @@
 import { writable, derived, get } from "svelte/store";
 import type { Gateway } from "../ipc/gateway";
-import { create, stat, type FileHandle } from "@tauri-apps/plugin-fs";
+import { create, stat, open as fsOpen, type FileHandle } from "@tauri-apps/plugin-fs";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -17,6 +17,50 @@ function isNativeTransferAvailable(): boolean {
     return !!(window as any).__TAURI_INTERNALS__;
   } catch {
     return false;
+  }
+}
+
+/**
+ * File-like wrapper around a native file path. Provides a `.stream()` method
+ * returning a ReadableStream so the P2P and WebSocket relay fallback paths
+ * can stream data without loading the entire file into memory.
+ */
+class NativeFile {
+  name: string;
+  size: number;
+  private path: string;
+
+  constructor(path: string, name: string, size: number) {
+    this.path = path;
+    this.name = name;
+    this.size = size;
+  }
+
+  stream(): ReadableStream<Uint8Array> {
+    const filePath = this.path;
+    let handle: FileHandle | null = null;
+    return new ReadableStream<Uint8Array>({
+      async start() {
+        handle = await fsOpen(filePath, { read: true });
+      },
+      async pull(controller) {
+        if (!handle) {
+          controller.close();
+          return;
+        }
+        const buf = new Uint8Array(1024 * 1024);
+        const n = await handle.read(buf);
+        if (n === null || n === 0) {
+          await handle.close();
+          controller.close();
+        } else {
+          controller.enqueue(buf.subarray(0, n));
+        }
+      },
+      async cancel() {
+        await handle?.close();
+      },
+    });
   }
 }
 
@@ -538,6 +582,22 @@ export async function handleFileAccept(event: any) {
     } catch (e) {
       console.warn("[transfers] Native send failed, falling back to P2P/relay:", e);
       internal.nativeMode = false;
+    }
+  }
+
+  // If we have a native file path but no File object (Tauri dialog),
+  // create a streaming wrapper so the P2P/relay fallback can read the file.
+  if (!internal.file && internal.filePath) {
+    try {
+      const info = await stat(internal.filePath);
+      const parts = internal.filePath.replace(/\\/g, "/").split("/");
+      const name = parts[parts.length - 1] || "file";
+      internal.file = new NativeFile(internal.filePath, name, info.size) as unknown as File;
+      console.log("[transfers] Created NativeFile wrapper for fallback:", name, info.size);
+    } catch (e) {
+      console.error("[transfers] Failed to create file wrapper:", e);
+      updateTransfer(transfer_id, { status: "failed" });
+      return;
     }
   }
 
