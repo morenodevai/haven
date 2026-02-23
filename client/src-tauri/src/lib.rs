@@ -37,13 +37,11 @@ fn grant_media_permissions(window: &tauri::WebviewWindow) {
     });
 }
 
-/// Kill any orphaned WebView2 processes from a previous Haven session and
-/// clean up stale lock files so WebView2 can start.
+/// Kill orphaned WebView2 processes and clean stale locks so WebView2 can start.
 ///
-/// We do NOT delete the EBWebView profile or Local Storage — that destroys the
-/// GPU shader cache (causing black-screen video) and wipes auth state.  The
-/// JavaScript layer already handles stale/expired JWT tokens gracefully, so
-/// filesystem-level storage cleanup is unnecessary.
+/// We preserve Local Storage (auth state) and the GPU shader cache, but
+/// aggressively remove ALL lock files and expendable caches (Service Worker,
+/// Session Storage) that are known to prevent WebView2 from initializing.
 fn clean_webview2_data() {
     let local_appdata = match std::env::var("LOCALAPPDATA") {
         Ok(v) if !v.is_empty() => v,
@@ -57,26 +55,53 @@ fn clean_webview2_data() {
         return;
     }
 
-    // Try to remove lock files first (works if no orphan process holds them).
-    let lock_held = std::fs::remove_file(ebwebview.join("lockfile")).is_err()
-        && ebwebview.join("lockfile").exists();
+    // Always kill orphaned WebView2 processes. This runs before Tauri creates
+    // its own WebView2, so we won't kill our own instance.
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/IM", "msedgewebview2.exe"])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .output();
+    }
 
-    if lock_held {
-        // Lock file exists but we couldn't delete it — orphan process.
-        // Kill all msedgewebview2 processes so we can start fresh.
-        {
-            use std::os::windows::process::CommandExt;
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/IM", "msedgewebview2.exe"])
-                .creation_flags(0x08000000) // CREATE_NO_WINDOW
-                .output();
+    // Wait for OS to fully release file handles
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+
+    // Recursively clean all lock files and expendable caches
+    clean_webview2_locks(&ebwebview);
+}
+
+/// Remove lock files, temp files, and expendable caches throughout the
+/// EBWebView directory tree. Keeps Local Storage and GPU shader cache intact.
+fn clean_webview2_locks(dir: &std::path::Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+        if path.is_dir() {
+            // Nuke expendable directories that can get corrupted and block startup
+            if name == "Service Worker" || name == "Session Storage" {
+                let _ = std::fs::remove_dir_all(&path);
+            } else {
+                clean_webview2_locks(&path);
+            }
+        } else {
+            // Remove lock files and known problematic temp files
+            if name == "lockfile"
+                || name == "lock"
+                || name == "LOCK"
+                || name == "LOG"
+                || name == "LOG.old"
+                || name.ends_with(".tmp")
+            {
+                let _ = std::fs::remove_file(&path);
+            }
         }
-
-        // Give the OS a moment to release file handles
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        // Retry lockfile removal after killing orphans
-        let _ = std::fs::remove_file(ebwebview.join("lockfile"));
     }
 }
 
@@ -129,6 +154,17 @@ pub fn run() {
 
                 #[cfg(target_os = "windows")]
                 grant_media_permissions(&window);
+
+                // Safety net: if JS never calls show() (WebView2 failed to
+                // initialize), force the window visible after 10 seconds so
+                // the user isn't staring at nothing.
+                let win = window.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    if !win.is_visible().unwrap_or(true) {
+                        let _ = win.show();
+                    }
+                });
             }
             Ok(())
         })
