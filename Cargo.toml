@@ -7,7 +7,6 @@ members = [
     "crates/haven-crypto",
     "crates/haven-db",
     "crates/haven-types",
-    "client/src-tauri",
 ]
 
 [workspace.package]

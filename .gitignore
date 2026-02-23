@@ -2,14 +2,8 @@
 target/
 **/*.rs.bk
 
-# Node / Svelte
-client/node_modules/
-client/dist/
-client/.svelte-kit/
-
-# Tauri
-client/src-tauri/target/
-client/src-tauri/gen/
+# Old Tauri/Svelte client (now in haven-desktop repo)
+client/
 
 # Environment & secrets
 .env
@@ -37,3 +31,8 @@ Desktop.ini
 
 # File uploads
 uploads/
+
+# Runtime / deployment artifacts
+current/
+haven_app/
+*.log
