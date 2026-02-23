@@ -37,13 +37,12 @@ fn grant_media_permissions(window: &tauri::WebviewWindow) {
     });
 }
 
-/// Kill any orphaned WebView2 processes from a previous Haven session, then
-/// nuke the entire EBWebView profile so WebView2 always starts clean.
+/// Kill any orphaned WebView2 processes from a previous Haven session and
+/// clean up stale lock files so WebView2 can start.
 ///
-/// This is the nuclear option but it *guarantees* no blank-screen-of-death.
-/// The cost is that localStorage is wiped on each launch — the user has to
-/// log in again.  This is acceptable because a blank screen that requires
-/// a full reinstall is far worse than re-entering credentials.
+/// We no longer nuke the entire EBWebView profile because that destroys the
+/// GPU shader cache, which causes black-screen video rendering on many GPUs.
+/// Only the lockfile and orphan processes are cleaned up.
 fn clean_webview2_data() {
     let local_appdata = match std::env::var("LOCALAPPDATA") {
         Ok(v) if !v.is_empty() => v,
@@ -64,8 +63,6 @@ fn clean_webview2_data() {
     if lock_held {
         // Lock file exists but we couldn't delete it → orphan process.
         // Kill all msedgewebview2 processes that belong to OUR data dir.
-        // We use taskkill by image name; this is safe because we only do it
-        // when our own lock is stuck.
         {
             use std::os::windows::process::CommandExt;
             let _ = std::process::Command::new("taskkill")
@@ -76,10 +73,10 @@ fn clean_webview2_data() {
 
         // Give the OS a moment to release file handles
         std::thread::sleep(std::time::Duration::from_millis(500));
-    }
 
-    // Nuke the entire EBWebView directory — guarantees a clean slate.
-    let _ = std::fs::remove_dir_all(&ebwebview);
+        // Retry lockfile removal after killing orphans
+        let _ = std::fs::remove_file(ebwebview.join("lockfile"));
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -94,14 +91,15 @@ pub fn run() {
         let _ = std::fs::create_dir_all(&dir);
     }
 
-    // WebView2 flags: autoplay audio, expose real IPs for WebRTC, disable
-    // GPU shader disk cache (avoids stale cache blank screens).
+    // WebView2 flags: autoplay audio, expose real IPs for WebRTC, and ensure
+    // GPU hardware acceleration is available for video rendering.
     unsafe {
         std::env::set_var(
             "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
             "--autoplay-policy=no-user-gesture-required \
              --disable-features=WebRtcHideLocalIpsWithMdns \
-             --disable-gpu-shader-disk-cache",
+             --ignore-gpu-blocklist \
+             --enable-gpu-rasterization",
         );
     }
 

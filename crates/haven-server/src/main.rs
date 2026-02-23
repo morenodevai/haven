@@ -88,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
     let max_body_size: usize = std::env::var("HAVEN_MAX_BODY_SIZE")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(10 * 1024 * 1024);
+        .unwrap_or(50 * 1024 * 1024);
 
     // Init database
     let db = haven_db::Database::open(&PathBuf::from(&db_path))?;

@@ -93,23 +93,44 @@
   // Bind video element to stream using an action.
   // Handles autoplay policy: if unmuted autoplay is blocked, mute and retry.
   function streamAction(node: HTMLVideoElement, stream: MediaStream) {
-    node.srcObject = stream;
-    node.play().catch(() => {
-      node.muted = true;
-      node.play().catch(() => {});
-    });
+    function attachStream(s: MediaStream) {
+      node.srcObject = s;
+      // Verify stream has active video tracks
+      const videoTracks = s.getVideoTracks();
+      console.log("[VideoGrid] Attaching stream:", s.id, "video tracks:", videoTracks.length,
+        videoTracks.map(t => `${t.label} (${t.readyState})`).join(", "));
 
-    return {
-      update(newStream: MediaStream) {
-        if (node.srcObject !== newStream) {
-          node.srcObject = newStream;
+      node.onloadedmetadata = () => {
+        node.play().catch((e) => {
+          console.warn("[VideoGrid] play() failed, retrying muted:", e);
+          node.muted = true;
+          node.play().catch((e2) => {
+            console.error("[VideoGrid] play() failed even muted:", e2);
+          });
+        });
+      };
+
+      // Fallback: if loadedmetadata doesn't fire within 1s, try play anyway
+      setTimeout(() => {
+        if (node.paused && node.srcObject) {
           node.play().catch(() => {
             node.muted = true;
             node.play().catch(() => {});
           });
         }
+      }, 1000);
+    }
+
+    attachStream(stream);
+
+    return {
+      update(newStream: MediaStream) {
+        if (node.srcObject !== newStream) {
+          attachStream(newStream);
+        }
       },
       destroy() {
+        node.onloadedmetadata = null;
         node.srcObject = null;
       },
     };

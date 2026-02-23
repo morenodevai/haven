@@ -133,7 +133,7 @@ export async function sendMessage(
   return request(`/channels/${channelId}/messages`, {
     method: "POST",
     body: JSON.stringify({ ciphertext, nonce }),
-  });
+  }, 60000);
 }
 
 export async function getMessages(

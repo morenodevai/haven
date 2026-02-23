@@ -5,6 +5,7 @@
   import { uploadFile } from "../../ipc/api";
   import EmojiPicker from "./EmojiPicker.svelte";
 
+  const MAX_IMAGE_SIZE = 15 * 1024 * 1024; // 15MB (base64 + encryption ~2x overhead)
   const MAX_VIDEO_SIZE = 50 * 1024 * 1024; // 50MB
 
   let input = $state("");
@@ -157,6 +158,11 @@
       stagedImage = null;
     } else {
       // Image file — existing inline behavior
+      if (file.size > MAX_IMAGE_SIZE) {
+        showError("Image too large (max 15 MB)");
+        target.value = "";
+        return;
+      }
       try {
         const dataUrl = await readFileAsDataUrl(file);
         const base64 = dataUrl.split(",")[1];

@@ -864,6 +864,20 @@ export async function toggleCamera() {
           frameRate: { ideal: 24, max: 30 },
         },
       });
+
+      // Verify we got a live video track
+      const tracks = stream.getVideoTracks();
+      console.log("[voice] Camera stream obtained:", stream.id,
+        "tracks:", tracks.length,
+        tracks.map(t => `${t.label} readyState=${t.readyState} enabled=${t.enabled}`).join(", "));
+
+      if (tracks.length === 0 || tracks[0].readyState === "ended") {
+        console.error("[voice] Camera returned dead track");
+        voiceError.set("Camera returned an unusable video track");
+        stream.getTracks().forEach(t => t.stop());
+        return;
+      }
+
       localVideoStream.set(stream);
       videoEnabled.set(true);
 

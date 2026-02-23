@@ -327,8 +327,9 @@ export async function sendFile(
       const info = await stat(nativeFilePath);
       fileSize = info.size;
     } catch (e) {
-      console.error("[transfers] Failed to stat native file:", e);
-      return;
+      console.warn("[transfers] Failed to stat native file, will estimate size:", e);
+      // Proceed anyway — the Rust transfer engine will get the real size
+      fileSize = 0;
     }
   } else if (file) {
     filename = file.name;
