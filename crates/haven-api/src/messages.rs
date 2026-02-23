@@ -23,12 +23,18 @@ use crate::middleware::Claims;
 pub struct MessageQuery {
     #[serde(default = "default_limit")]
     pub limit: u32,
+    /// #11: Cursor-based pagination — pass the `created_at` timestamp of the
+    /// oldest message from the previous page to fetch older messages.
+    pub before: Option<String>,
 }
 
 fn default_limit() -> u32 {
     50
 }
 
+/// #8: Channel authorization model — all authenticated users can access all channels.
+/// This is by design for the current MVP: Haven is a small private server where all
+/// registered users are trusted. Per-channel ACLs are a future feature.
 pub async fn send_message(
     State(state): State<Arc<AppStateInner>>,
     Path(channel_id): Path<Uuid>,
@@ -87,11 +93,13 @@ pub async fn get_messages(
     let db = state.clone();
     let cid = channel_id.to_string();
     let limit = query.limit.min(200);
+    let before = query.before;
 
     let (rows, reaction_rows) = tokio::task::spawn_blocking(move || {
+        // #11: Cursor-based pagination via `before` parameter
         let rows = db
             .db
-            .get_messages(&cid, limit)
+            .get_messages(&cid, limit, before.as_deref())
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let message_ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();

@@ -1,6 +1,6 @@
 use crate::models::{FileRow, MessageRow, ReactionRow, UserRow};
 use crate::Database;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use rusqlite::Connection;
 
 impl Database {
@@ -20,9 +20,7 @@ impl Database {
         self.with_conn(|conn| query_user_by_username(conn, username))
     }
 
-    pub fn get_user_by_id(&self, id: &str) -> Result<Option<UserRow>> {
-        self.with_conn(|conn| query_user_by_id(conn, id))
-    }
+    // #18: get_user_by_id removed — unused in the codebase.
 
     // -- Messages --
 
@@ -43,8 +41,10 @@ impl Database {
         })
     }
 
-    pub fn get_messages(&self, channel_id: &str, limit: u32) -> Result<Vec<MessageRow>> {
-        self.with_conn(|conn| query_messages(conn, channel_id, limit))
+    /// #11: Get messages with optional cursor-based pagination.
+    /// When `before` is provided, only messages with `created_at < before` are returned.
+    pub fn get_messages(&self, channel_id: &str, limit: u32, before: Option<&str>) -> Result<Vec<MessageRow>> {
+        self.with_conn(|conn| query_messages(conn, channel_id, limit, before))
     }
 
     pub fn get_username_by_id(&self, id: &str) -> Result<String> {
@@ -52,7 +52,7 @@ impl Database {
             conn.query_row("SELECT username FROM users WHERE id = ?1", [id], |row| {
                 row.get(0)
             })
-            .map_err(|_| anyhow!("User not found: {}", id))
+            .map_err(|_| anyhow::anyhow!("User not found: {}", id))
         })
     }
 
@@ -89,6 +89,18 @@ impl Database {
                 )?;
                 Ok((true, Some(id.to_string())))
             }
+        })
+    }
+
+    /// #34: Check if a message belongs to a specific channel.
+    pub fn message_belongs_to_channel(&self, message_id: &str, channel_id: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM messages WHERE id = ?1 AND channel_id = ?2",
+                rusqlite::params![message_id, channel_id],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
         })
     }
 
@@ -178,37 +190,41 @@ fn query_user_by_username(conn: &Connection, username: &str) -> Result<Option<Us
     Ok(row)
 }
 
-fn query_user_by_id(conn: &Connection, id: &str) -> Result<Option<UserRow>> {
-    let mut stmt =
-        conn.prepare("SELECT id, username, password, created_at FROM users WHERE id = ?1")?;
+/// #11: Cursor-based pagination — when `before` is provided, add `WHERE created_at < ?` clause.
+fn query_messages(conn: &Connection, channel_id: &str, limit: u32, before: Option<&str>) -> Result<Vec<MessageRow>> {
+    let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match before {
+        Some(before_ts) => (
+            "SELECT m.id, m.channel_id, m.author_id, u.username, m.ciphertext, m.nonce, m.created_at
+             FROM messages m
+             LEFT JOIN users u ON m.author_id = u.id
+             WHERE m.channel_id = ?1 AND m.created_at < ?3
+             ORDER BY m.created_at DESC
+             LIMIT ?2".to_string(),
+            vec![
+                Box::new(channel_id.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                Box::new(limit),
+                Box::new(before_ts.to_string()),
+            ],
+        ),
+        None => (
+            "SELECT m.id, m.channel_id, m.author_id, u.username, m.ciphertext, m.nonce, m.created_at
+             FROM messages m
+             LEFT JOIN users u ON m.author_id = u.id
+             WHERE m.channel_id = ?1
+             ORDER BY m.created_at DESC
+             LIMIT ?2".to_string(),
+            vec![
+                Box::new(channel_id.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                Box::new(limit),
+            ],
+        ),
+    };
 
-    let row = stmt
-        .query_row([id], |row| {
-            Ok(UserRow {
-                id: row.get(0)?,
-                username: row.get(1)?,
-                password: row.get(2)?,
-                created_at: row.get(3)?,
-            })
-        })
-        .optional()?;
-
-    Ok(row)
-}
-
-fn query_messages(conn: &Connection, channel_id: &str, limit: u32) -> Result<Vec<MessageRow>> {
-    // JOIN users to fetch author_username in a single query (eliminates N+1)
-    let mut stmt = conn.prepare(
-        "SELECT m.id, m.channel_id, m.author_id, u.username, m.ciphertext, m.nonce, m.created_at
-         FROM messages m
-         LEFT JOIN users u ON m.author_id = u.id
-         WHERE m.channel_id = ?1
-         ORDER BY m.created_at DESC
-         LIMIT ?2",
-    )?;
+    let mut stmt = conn.prepare(&sql)?;
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
 
     let rows = stmt
-        .query_map(rusqlite::params![channel_id, limit], |row| {
+        .query_map(params_refs.as_slice(), |row| {
             Ok(MessageRow {
                 id: row.get(0)?,
                 channel_id: row.get(1)?,

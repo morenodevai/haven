@@ -34,16 +34,28 @@ pub fn run(conn: &Connection) -> Result<()> {
         return Ok(());
     }
 
+    // #25: Each migration + version bump is wrapped in a transaction.
+    // BEGIN IMMEDIATE acquires a write lock immediately, preventing concurrent
+    // writers from interleaving. On error, the entire migration is rolled back.
     for version in (current + 1)..=CURRENT_VERSION {
         let idx = (version - 1) as usize;
         info!("Applying migration v{}", version);
-        MIGRATIONS[idx](conn)?;
 
-        conn.execute(
-            "INSERT INTO schema_version (version) VALUES (?1)",
-            [version],
-        )?;
-        info!("Migration v{} applied successfully", version);
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        match MIGRATIONS[idx](conn) {
+            Ok(()) => {
+                conn.execute(
+                    "INSERT INTO schema_version (version) VALUES (?1)",
+                    [version],
+                )?;
+                conn.execute_batch("COMMIT")?;
+                info!("Migration v{} applied successfully", version);
+            }
+            Err(e) => {
+                conn.execute_batch("ROLLBACK").ok();
+                return Err(anyhow::anyhow!("Migration v{} failed: {}", version, e));
+            }
+        }
     }
 
     info!("Database migrations complete (now at v{})", CURRENT_VERSION);

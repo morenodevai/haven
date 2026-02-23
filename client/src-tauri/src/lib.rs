@@ -87,6 +87,13 @@ pub fn run() {
     // Clean WebView2 data BEFORE anything else.
     clean_webview2_data();
 
+    // Ensure the Roaming AppData directory exists so the FS plugin can write
+    // the Remember Me credentials file (haven-credentials.json) there.
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let dir = std::path::Path::new(&appdata).join("com.haven.voice");
+        let _ = std::fs::create_dir_all(&dir);
+    }
+
     // WebView2 flags: autoplay audio, expose real IPs for WebRTC, disable
     // GPU shader disk cache (avoids stale cache blank screens).
     unsafe {

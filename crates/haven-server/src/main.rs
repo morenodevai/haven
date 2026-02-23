@@ -4,53 +4,23 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    extract::{State, WebSocketUpgrade, DefaultBodyLimit},
-    http::{Method, HeaderValue},
+    extract::{ConnectInfo, Query, State, WebSocketUpgrade, DefaultBodyLimit},
+    http::{Method, HeaderValue, header::AUTHORIZATION, header::CONTENT_TYPE},
     middleware,
     response::IntoResponse,
     routing::{get, post},
 };
+use jsonwebtoken::{DecodingKey, Validation, decode};
+use serde::Deserialize;
 use socket2::{Domain, Protocol, Socket, Type};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
-/// Wrapper around `TcpListener` that sets TCP_NODELAY on each accepted connection.
-/// This eliminates Nagle's algorithm latency for small WebSocket frames (e.g. ack frames).
-struct NodelayListener(tokio::net::TcpListener);
-
-impl axum::serve::Listener for NodelayListener {
-    type Io = tokio::net::TcpStream;
-    type Addr = SocketAddr;
-
-    fn accept(
-        &mut self,
-    ) -> impl std::future::Future<Output = (Self::Io, Self::Addr)> + Send {
-        async {
-            loop {
-                match self.0.accept().await {
-                    Ok((stream, addr)) => {
-                        let _ = stream.set_nodelay(true);
-                        return (stream, addr);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Accept error: {e}, retrying...");
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    }
-                }
-            }
-        }
-    }
-
-    fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        self.0.local_addr()
-    }
-}
-
 use haven_api::auth::{self, AppState, AppStateInner, AuthRateLimiter};
 use haven_api::files;
 use haven_api::messages;
-use haven_api::middleware::{require_auth, JwtSecret};
+use haven_api::middleware::{require_auth, JwtSecret, Claims};
 use haven_api::reactions;
 use haven_gateway::connection;
 use haven_gateway::dispatcher::Dispatcher;
@@ -63,9 +33,16 @@ const PLACEHOLDER_SECRETS: &[&str] = &[
 
 #[derive(Clone)]
 struct ServerState {
+    #[allow(dead_code)]
     app: AppState,
     dispatcher: Dispatcher,
     jwt_secret: String,
+}
+
+/// Query parameters for the WebSocket upgrade endpoint.
+#[derive(Debug, Deserialize)]
+struct GatewayQuery {
+    token: Option<String>,
 }
 
 #[tokio::main]
@@ -97,6 +74,21 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "3000".into())
         .parse()?;
 
+    // #14: Configurable uploads directory
+    let uploads_dir: PathBuf = std::env::var("HAVEN_UPLOADS_DIR")
+        .unwrap_or_else(|_| "./uploads".into())
+        .into();
+    let uploads_dir = std::fs::canonicalize(&uploads_dir).unwrap_or_else(|_| {
+        std::fs::create_dir_all(&uploads_dir).ok();
+        std::fs::canonicalize(&uploads_dir).unwrap_or_else(|_| uploads_dir.clone())
+    });
+
+    // #5: Configurable body limit (default 10 MB)
+    let max_body_size: usize = std::env::var("HAVEN_MAX_BODY_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10 * 1024 * 1024);
+
     // Init database
     let db = haven_db::Database::open(&PathBuf::from(&db_path))?;
 
@@ -107,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
         jwt_secret: jwt_secret.clone(),
         dispatcher: dispatcher.clone(),
         auth_rate_limiter: AuthRateLimiter::new(),
+        uploads_dir: uploads_dir.clone(),
     });
 
     let jwt_extension = JwtSecret(Arc::from(jwt_secret.as_str()));
@@ -118,6 +111,11 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // CORS -- restrict to known origins; extend via HAVEN_CORS_ORIGINS env var
+    // #23: CSRF protection is not needed because this is a Tauri desktop app that
+    // uses Bearer token authentication (not cookies). Browsers automatically attach
+    // cookies on cross-origin requests (enabling CSRF), but Bearer tokens in the
+    // Authorization header are only sent by explicit JavaScript code. The CSP and
+    // CORS policies prevent third-party scripts from running in the app context.
     let cors = build_cors_layer();
 
     // Routes
@@ -127,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(app_state.clone());
 
     // Create uploads directory for file storage
-    std::fs::create_dir_all("./uploads").ok();
+    std::fs::create_dir_all(&uploads_dir).ok();
 
     let protected_routes = Router::new()
         .route("/auth/refresh", post(auth::refresh_token))
@@ -148,32 +146,52 @@ async fn main() -> anyhow::Result<()> {
         .merge(protected_routes)
         .merge(ws_route)
         .layer(axum::Extension(jwt_extension))
-        // 50 MB body limit -- handles images and video file uploads.
-        // Tune via HAVEN_MAX_BODY_SIZE env var if needed for larger files.
-        .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(max_body_size))
         .layer(cors)
         .layer(TraceLayer::new_for_http());
 
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
     info!("Haven server listening on {}", addr);
 
-    // Create listener via socket2 for custom backlog and address reuse.
+    // Create listener via socket2 for custom backlog, address reuse, and TCP_NODELAY.
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
+    socket.set_nodelay(true)?;
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
     socket.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(socket.into())?;
 
-    // Wrap in NodelayListener to set TCP_NODELAY on each accepted connection,
-    // eliminating Nagle's algorithm latency for small WebSocket frames (e.g. 37-byte ack frames).
+    // #12: into_make_service_with_connect_info to provide SocketAddr for rate limiting
+    // #15: graceful shutdown on Ctrl+C / SIGTERM
     axum::serve(
-        NodelayListener(listener),
-        app.into_make_service(),
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await?;
 
     Ok(())
+}
+
+/// #15: Listen for Ctrl+C / SIGTERM to trigger graceful shutdown.
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => info!("Received Ctrl+C, shutting down..."),
+            _ = sigterm.recv() => info!("Received SIGTERM, shutting down..."),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.ok();
+        info!("Received Ctrl+C, shutting down...");
+    }
 }
 
 /// Build a CORS layer that allows the Tauri client and localhost dev server.
@@ -204,17 +222,49 @@ fn build_cors_layer() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
-        .allow_headers(tower_http::cors::Any)
+        // #27: Only allow headers actually used by the client (not Any)
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE])
         .allow_credentials(false)
 }
 
+/// #6: WebSocket upgrade with JWT authentication BEFORE upgrading.
+/// The token is extracted from `?token=` query param or Authorization header.
+/// If invalid, a 401 is returned without upgrading the connection.
 async fn ws_upgrade(
     State(state): State<ServerState>,
+    ConnectInfo(_addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<GatewayQuery>,
+    headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    ws.max_frame_size(4 * 1024 * 1024)    // 4 MB max frame (supports larger chunk sizes)
+) -> Result<impl IntoResponse, axum::http::StatusCode> {
+    // Extract token from query param or Authorization header
+    let token = query.token.or_else(|| {
+        headers
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .map(|s| s.to_string())
+    });
+
+    let token = token.ok_or(axum::http::StatusCode::UNAUTHORIZED)?;
+
+    // Validate JWT before upgrading
+    let token_data = decode::<Claims>(
+        &token,
+        &DecodingKey::from_secret(state.jwt_secret.as_bytes()),
+        &Validation::default(),
+    )
+    .map_err(|_| axum::http::StatusCode::UNAUTHORIZED)?;
+
+    let user_id = token_data.claims.sub;
+    let username = token_data.claims.username;
+
+    info!("{} ({}) pre-authenticated for WebSocket upgrade", username, user_id);
+
+    Ok(ws
+        .max_frame_size(4 * 1024 * 1024)    // 4 MB max frame (supports larger chunk sizes)
         .max_message_size(8 * 1024 * 1024) // 8 MB max message
         .on_upgrade(move |socket| {
-            connection::handle_connection(socket, state.dispatcher, state.jwt_secret)
-        })
+            connection::handle_connection_authenticated(socket, state.dispatcher, user_id, username)
+        }))
 }

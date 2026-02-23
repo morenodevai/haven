@@ -357,6 +357,38 @@ impl Dispatcher {
         }
     }
 
+    /// #10: Relay binary voice audio data to all other participants in the same channel.
+    /// The frame is already built as [0x04][sender_uid(16)][payload] — just forward
+    /// as a binary WebSocket frame. No base64 encoding, no JSON serialization.
+    pub async fn relay_voice_data_binary(&self, sender_id: Uuid, data: Bytes) {
+        let voice_states = self.inner.voice_states.read().await;
+        let channels = self.inner.user_channels.read().await;
+
+        for (_channel_id, participants) in voice_states.iter() {
+            if participants.contains_key(&sender_id) {
+                for (&uid, _) in participants.iter() {
+                    if uid != sender_id {
+                        if let Some(conns) = channels.get(&uid) {
+                            for (conn_id, tx) in conns {
+                                match tx.try_send(UserMessage::Binary(data.clone())) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        warn!(
+                                            "Dropping binary voice data for user {} conn {}: channel full",
+                                            uid, conn_id
+                                        );
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+        }
+    }
+
     /// Update mute/deaf state. Returns (channel_id, updated participant) if in voice.
     pub async fn voice_update_state(
         &self,

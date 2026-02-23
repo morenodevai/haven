@@ -21,11 +21,26 @@ pub async fn toggle_reaction(
     Extension(claims): Extension<Claims>,
     Json(req): Json<ToggleReactionRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let _ = channel_id; // validated by path extraction
-
     // M2: Validate emoji length — 64 bytes is generous for any real emoji sequence
     if req.emoji.is_empty() || req.emoji.len() > 64 {
         return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // #34: Validate that the message actually belongs to the specified channel.
+    // Without this, a client could toggle a reaction on a message in a different
+    // channel by crafting the request path.
+    let db_check = state.clone();
+    let mid = message_id.to_string();
+    let cid = channel_id.to_string();
+    let belongs = tokio::task::spawn_blocking(move || {
+        db_check.db.message_belongs_to_channel(&mid, &cid)
+    })
+    .await
+    .map_err(|e| { error!("spawn_blocking join error: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if !belongs {
+        return Err(StatusCode::NOT_FOUND);
     }
 
     let reaction_id = Uuid::new_v4();

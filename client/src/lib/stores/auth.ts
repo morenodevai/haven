@@ -127,9 +127,14 @@ export async function tryAutoLogin(): Promise<boolean> {
     return true;
   } catch (e: any) {
     console.warn("[auth] Auto-login failed:", e);
-    // Saved credentials are invalid — clear them
-    await clearRememberMe();
-    rememberMe.set(false);
+    // Only clear saved credentials on actual auth errors (wrong password, account deleted).
+    // Network errors (server down, timeout) should NOT clear credentials — the user may
+    // just be offline and will want auto-login to work when connectivity is restored.
+    const isAuthError = e.message && (e.message.includes("401") || e.message.includes("403"));
+    if (isAuthError) {
+      await clearRememberMe();
+      rememberMe.set(false);
+    }
     return false;
   } finally {
     autoLoginInProgress.set(false);

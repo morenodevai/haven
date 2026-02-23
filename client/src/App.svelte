@@ -48,7 +48,7 @@
       loadMessages();
 
       // Connect WebSocket
-      const wsUrl = getBaseUrl().replace("http", "ws") + "/gateway";
+      const wsUrl = getBaseUrl().replace("http", "ws") + "/gateway?token=" + encodeURIComponent($auth.token!);
       const gw = new Gateway(wsUrl, () => $auth.token!);
 
       gw.on("Ready", () => {

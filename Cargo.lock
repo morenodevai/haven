@@ -1451,11 +1451,8 @@ name = "haven-db"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chrono",
- "haven-types",
  "rusqlite",
  "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -1505,6 +1502,7 @@ dependencies = [
  "haven-db",
  "haven-gateway",
  "haven-types",
+ "jsonwebtoken",
  "serde",
  "serde_json",
  "socket2 0.5.10",
@@ -1520,7 +1518,6 @@ name = "haven-types"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "jsonwebtoken",
  "serde",
  "serde_json",
  "uuid",

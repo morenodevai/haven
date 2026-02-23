@@ -15,8 +15,10 @@ use uuid::Uuid;
 use crate::auth::AppStateInner;
 use crate::middleware::Claims;
 
-/// 50 MB upload limit for files
-const MAX_FILE_SIZE: usize = 50 * 1024 * 1024;
+/// #5: 10 MB upload limit for files (was 50 MB).
+/// The server-level DefaultBodyLimit is also set to 10 MB by default,
+/// configurable via HAVEN_MAX_BODY_SIZE env var.
+const MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
 
 #[derive(Serialize)]
 pub struct UploadResponse {
@@ -25,7 +27,11 @@ pub struct UploadResponse {
 }
 
 /// POST /files — accepts raw encrypted bytes (application/octet-stream),
-/// saves to ./uploads/{id}, inserts DB row, returns { file_id, size }.
+/// saves to {uploads_dir}/{id}, inserts DB row, returns { file_id, size }.
+///
+/// #8: Channel authorization model — all authenticated users can access all files.
+/// This is by design for the current MVP: Haven is a small private server where
+/// all registered users are trusted. Per-channel file ACLs are a future feature.
 pub async fn upload_file(
     State(state): State<Arc<AppStateInner>>,
     Extension(claims): Extension<Claims>,
@@ -42,8 +48,9 @@ pub async fn upload_file(
     let file_id = Uuid::new_v4().to_string();
     let size = bytes.len() as i64;
 
-    // Ensure uploads directory exists
-    tokio::fs::create_dir_all("./uploads")
+    // #14: Use configurable uploads directory from state
+    let uploads_dir = &state.uploads_dir;
+    tokio::fs::create_dir_all(uploads_dir)
         .await
         .map_err(|e| {
             error!("Failed to create uploads directory: {}", e);
@@ -51,13 +58,13 @@ pub async fn upload_file(
         })?;
 
     // Write encrypted blob to disk
-    let file_path = format!("./uploads/{}", file_id);
+    let file_path = uploads_dir.join(&file_id);
     let mut file = tokio::fs::File::create(&file_path).await.map_err(|e| {
-        error!("Failed to create file {}: {}", file_path, e);
+        error!("Failed to create file {:?}: {}", file_path, e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     file.write_all(&bytes).await.map_err(|e| {
-        error!("Failed to write file {}: {}", file_path, e);
+        error!("Failed to write file {:?}: {}", file_path, e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -86,6 +93,8 @@ pub async fn upload_file(
 }
 
 /// GET /files/{file_id} — reads file from disk, streams back the encrypted blob.
+///
+/// #8: All authenticated users can download any file — see upload_file doc comment.
 pub async fn download_file(
     State(state): State<Arc<AppStateInner>>,
     Path(file_id): Path<String>,
@@ -114,10 +123,10 @@ pub async fn download_file(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    // Read from disk
-    let file_path = format!("./uploads/{}", file_id);
+    // #14: Use configurable uploads directory from state
+    let file_path = state.uploads_dir.join(&file_id);
     let bytes = tokio::fs::read(&file_path).await.map_err(|e| {
-        error!("Failed to read file {}: {}", file_path, e);
+        error!("Failed to read file {:?}: {}", file_path, e);
         StatusCode::NOT_FOUND
     })?;
 

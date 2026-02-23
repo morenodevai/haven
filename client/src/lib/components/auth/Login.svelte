@@ -10,7 +10,7 @@
   let isRegistering = $state(false);
   let loading = $state(false);
   let showKeySetup = $state(false);
-  let remember = $state(false);
+  let remember = $state(true);
 
   // Attempt auto-login from saved credentials on mount
   onMount(() => {

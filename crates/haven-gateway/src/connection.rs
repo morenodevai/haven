@@ -6,11 +6,9 @@ use std::time::Duration;
 use axum::extract::ws::{Message, WebSocket};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use jsonwebtoken::{DecodingKey, Validation, decode};
 use tracing::{info, trace, warn};
 use uuid::Uuid;
 
-use haven_types::api::Claims;
 use haven_types::events::{GatewayCommand, GatewayEvent};
 
 use crate::dispatcher::{Dispatcher, UserMessage};
@@ -19,7 +17,38 @@ use crate::dispatcher::{Dispatcher, UserMessage};
 /// If 2 consecutive Pongs are missed (~30s), the connection is dropped.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Handle a single WebSocket connection.
+/// #6: Handle a pre-authenticated WebSocket connection.
+/// The JWT was already validated at the HTTP upgrade layer (main.rs), so we
+/// skip the Identify handshake and go straight to Ready + event loop.
+pub async fn handle_connection_authenticated(
+    socket: WebSocket,
+    dispatcher: Dispatcher,
+    user_id: Uuid,
+    username: String,
+) {
+    let (mut sender, receiver) = socket.split();
+
+    info!("{} ({}) connected to gateway (pre-authenticated)", username, user_id);
+
+    // Send Ready event
+    let ready = GatewayEvent::Ready {
+        user_id,
+        username: username.clone(),
+    };
+    if sender
+        .send(Message::Text(serde_json::to_string(&ready).unwrap().into()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    // Shared connection loop
+    run_connection_loop(sender, receiver, dispatcher, user_id, username).await;
+}
+
+/// Handle a single WebSocket connection (legacy path — uses Identify handshake).
+/// Kept for backwards compatibility with older clients.
 pub async fn handle_connection(socket: WebSocket, dispatcher: Dispatcher, jwt_secret: String) {
     let (mut sender, mut receiver) = socket.split();
 
@@ -47,7 +76,20 @@ pub async fn handle_connection(socket: WebSocket, dispatcher: Dispatcher, jwt_se
         return;
     }
 
-    // Step 3: Register per-user channel and send existing online users, then go online
+    // Shared connection loop
+    run_connection_loop(sender, receiver, dispatcher, user_id, username).await;
+}
+
+/// Shared connection loop — factored out of both handle_connection and
+/// handle_connection_authenticated to avoid code duplication.
+async fn run_connection_loop(
+    mut sender: futures_util::stream::SplitSink<WebSocket, Message>,
+    mut receiver: futures_util::stream::SplitStream<WebSocket>,
+    dispatcher: Dispatcher,
+    user_id: Uuid,
+    username: String,
+) {
+    // Register per-user channel and send existing online users, then go online
     let (conn_id, mut user_rx) = dispatcher.register_user_channel(user_id).await;
 
     // Send existing online users to this client so they see who's already here
@@ -70,27 +112,23 @@ pub async fn handle_connection(socket: WebSocket, dispatcher: Dispatcher, jwt_se
     // Now mark ourselves online (broadcasts to everyone else)
     dispatcher.user_online(user_id, username.clone()).await;
 
-    // Step 4: Subscribe to broadcasts and relay to this client
+    // Subscribe to broadcasts and relay to this client
     let mut broadcast_rx = dispatcher.subscribe();
     let dispatcher_clone = dispatcher.clone();
 
     // Per-connection channel subscriptions (shared between send and recv tasks).
-    // Events scoped to a channel_id are only forwarded if the user has subscribed.
-    // Uses std::sync::RwLock because the critical section is trivial (HashSet lookup)
-    // and never held across await points.
     let subscribed_channels: Arc<std::sync::RwLock<HashSet<Uuid>>> =
         Arc::new(std::sync::RwLock::new(HashSet::new()));
     let send_subscriptions = subscribed_channels.clone();
 
-    // H6: Shared flag for heartbeat -- recv_task sets it on Pong, send_task checks it.
-    let pong_received = Arc::new(AtomicBool::new(true)); // start as true (just connected)
+    // H6: Shared flag for heartbeat
+    let pong_received = Arc::new(AtomicBool::new(true));
     let pong_flag_send = pong_received.clone();
     let pong_flag_recv = pong_received.clone();
 
-    // Spawn task to forward broadcasts + targeted messages -> client, with heartbeat (H6)
+    // Spawn task to forward broadcasts + targeted messages -> client, with heartbeat
     let mut send_task = tokio::spawn(async move {
         let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
-        // Skip the immediate first tick
         heartbeat.tick().await;
         let mut missed_heartbeats: u8 = 0;
 
@@ -106,8 +144,6 @@ pub async fn handle_connection(socket: WebSocket, dispatcher: Dispatcher, jwt_se
                         Err(_) => break,
                     };
 
-                    // H5: Filter channel-scoped events by subscription.
-                    // std::sync::RwLock -- trivial critical section, no await inside.
                     if let Some(channel_id) = msg.channel_id {
                         let subs = send_subscriptions.read()
                             .expect("subscription lock poisoned");
@@ -116,7 +152,6 @@ pub async fn handle_connection(socket: WebSocket, dispatcher: Dispatcher, jwt_se
                         }
                     }
 
-                    // Broadcast messages are pre-serialized -- send the JSON directly.
                     if sender.send(Message::Text(msg.json.to_string().into())).await.is_err() {
                         break;
                     }
@@ -129,14 +164,12 @@ pub async fn handle_connection(socket: WebSocket, dispatcher: Dispatcher, jwt_se
 
                     match msg {
                         UserMessage::Event(event) => {
-                            // Targeted user events are GatewayEvent -- serialize here.
                             let text = serde_json::to_string(&event).unwrap();
                             if sender.send(Message::Text(text.into())).await.is_err() {
                                 break;
                             }
                         }
                         UserMessage::Binary(data) => {
-                            // Binary relay -- send Bytes directly as WebSocket binary frame.
                             if sender.send(Message::Binary(data)).await.is_err() {
                                 break;
                             }
@@ -144,10 +177,7 @@ pub async fn handle_connection(socket: WebSocket, dispatcher: Dispatcher, jwt_se
                     }
                 }
                 _ = heartbeat.tick() => {
-                    // H6: Check if we received a Pong since the last Ping.
-                    // Acquire ordering pairs with the Release store in recv_task.
                     if pong_flag_send.swap(false, Ordering::Acquire) {
-                        // Pong was received -- reset miss counter
                         missed_heartbeats = 0;
                     } else {
                         missed_heartbeats += 1;
@@ -156,7 +186,6 @@ pub async fn handle_connection(socket: WebSocket, dispatcher: Dispatcher, jwt_se
                             break;
                         }
                     }
-                    // Send WebSocket-level ping
                     if sender.send(Message::Ping(vec![].into())).await.is_err() {
                         break;
                     }
@@ -194,7 +223,6 @@ pub async fn handle_connection(socket: WebSocket, dispatcher: Dispatcher, jwt_se
                         }
                     }
                 }
-                // Binary frames: file chunk relay via zero-copy binary protocol.
                 Message::Binary(data) => {
                     handle_binary_message(
                         &dispatcher_clone,
@@ -202,8 +230,6 @@ pub async fn handle_connection(socket: WebSocket, dispatcher: Dispatcher, jwt_se
                         &data,
                     ).await;
                 }
-                // H6: Pong received -- signal the send_task to reset heartbeat counter.
-                // Release ordering pairs with the Acquire swap in send_task.
                 Message::Pong(_) => {
                     pong_flag_recv.store(true, Ordering::Release);
                 }
@@ -227,7 +253,9 @@ async fn wait_for_identify(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
     jwt_secret: &str,
 ) -> Option<(Uuid, String)> {
-    // Give client 10 seconds to identify
+    use jsonwebtoken::{DecodingKey, Validation, decode};
+    use haven_types::api::Claims;
+
     let timeout = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while let Some(Ok(msg)) = receiver.next().await {
             if let Message::Text(text) = msg {
@@ -261,7 +289,6 @@ async fn handle_command(
     match cmd {
         GatewayCommand::Identify { .. } => {} // Already handled
 
-        // H5: Client subscribes to specific channels
         GatewayCommand::Subscribe { channel_ids } => {
             info!(
                 "{} ({}) subscribing to {} channels",
@@ -269,8 +296,6 @@ async fn handle_command(
                 user_id,
                 channel_ids.len()
             );
-            // Update both local connection state and dispatcher state.
-            // std::sync::RwLock -- trivial critical section, no await inside.
             {
                 let mut subs = subscriptions.write()
                     .expect("subscription lock poisoned");
@@ -296,7 +321,6 @@ async fn handle_command(
                 .voice_join(channel_id, user_id, username.to_string(), session_id.clone())
                 .await;
 
-            // Send existing participants to the new joiner so they see who's already here
             for p in &existing {
                 dispatcher
                     .send_to_user(
@@ -313,7 +337,6 @@ async fn handle_command(
                     .await;
             }
 
-            // Broadcast the new joiner to everyone (including themselves)
             dispatcher.broadcast(GatewayEvent::VoiceStateUpdate {
                 channel_id,
                 user_id,
@@ -550,16 +573,21 @@ async fn handle_command(
     }
 }
 
-/// Handle incoming binary WebSocket frames for the file transfer fast path.
+/// Handle incoming binary WebSocket frames for the file transfer fast path
+/// and voice audio binary fast path.
 ///
 /// Binary protocol (all multi-byte integers are big-endian):
 ///
 ///   0x01 FileChunkSend:  [type(1)] [target_uid(16)] [transfer_id(16)] [chunk_idx(4)] [payload...]
 ///   0x02 FileAckSend:    [type(1)] [target_uid(16)] [transfer_id(16)] [ack_chunk_idx(4)]
 ///   0x03 FileDoneSend:   [type(1)] [target_uid(16)] [transfer_id(16)]
+///   0x04 VoiceAudio:     [type(1)] [encrypted_payload...]
 ///
-/// The server swaps `target_user_id` for `sender_user_id` (from_user_id) and
-/// forwards the frame to the target -- zero-copy relay for the encrypted payload.
+/// For 0x01-0x03: The server swaps `target_user_id` for `sender_user_id`
+/// and forwards the frame to the target — zero-copy relay for the encrypted payload.
+///
+/// For 0x04: The server prepends the sender's UUID and relays to all other
+/// voice channel participants as binary frames.
 async fn handle_binary_message(
     dispatcher: &Dispatcher,
     sender_user_id: Uuid,
@@ -592,12 +620,10 @@ async fn handle_binary_message(
                 );
             }
 
-            // Build outgoing frame: replace target_user_id with sender_user_id.
-            // Converted to Bytes for O(1) cloning across multiple user connections.
             let mut outgoing = Vec::with_capacity(data.len());
             outgoing.push(0x01);
             outgoing.extend_from_slice(sender_user_id.as_bytes());
-            outgoing.extend_from_slice(&data[17..]); // transfer_id + chunk_index + payload
+            outgoing.extend_from_slice(&data[17..]);
 
             dispatcher
                 .send_binary_to_user(target_user_id, Bytes::from(outgoing))
@@ -650,6 +676,26 @@ async fn handle_binary_message(
 
             dispatcher
                 .send_binary_to_user(target_user_id, Bytes::from(outgoing))
+                .await;
+        }
+
+        // #10: 0x04: VoiceAudio binary -- [type(1)] [encrypted_payload...]
+        // Server builds [0x04][sender_uid(16)][payload] and relays to all other
+        // voice participants as binary frames (no base64 encoding, no JSON).
+        0x04 => {
+            if data.len() < 2 {
+                return; // Need at least type byte + some payload
+            }
+            let payload = &data[1..];
+
+            // Build outgoing frame: [0x04][sender_uid(16)][payload]
+            let mut outgoing = Vec::with_capacity(1 + 16 + payload.len());
+            outgoing.push(0x04);
+            outgoing.extend_from_slice(sender_user_id.as_bytes());
+            outgoing.extend_from_slice(payload);
+
+            dispatcher
+                .relay_voice_data_binary(sender_user_id, Bytes::from(outgoing))
                 .await;
         }
 
