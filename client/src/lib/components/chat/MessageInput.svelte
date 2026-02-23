@@ -5,8 +5,8 @@
   import { uploadFile } from "../../ipc/api";
   import EmojiPicker from "./EmojiPicker.svelte";
 
-  const MAX_IMAGE_SIZE = 15 * 1024 * 1024; // 15MB (base64 + encryption ~2x overhead)
-  const MAX_VIDEO_SIZE = 50 * 1024 * 1024; // 50MB
+  const MAX_IMAGE_SIZE = 2 * 1024 * 1024 * 1024; // 2GB
+  const MAX_VIDEO_SIZE = 2 * 1024 * 1024 * 1024; // 2GB
 
   let input = $state("");
   let sending = $state(false);
@@ -150,7 +150,7 @@
     if (isVideoFile(file)) {
       // Video file — stage for upload
       if (file.size > MAX_VIDEO_SIZE) {
-        showError("Video too large (max 50 MB)");
+        showError("Video too large (max 2 GB)");
         target.value = "";
         return;
       }
@@ -159,7 +159,7 @@
     } else {
       // Image file — existing inline behavior
       if (file.size > MAX_IMAGE_SIZE) {
-        showError("Image too large (max 15 MB)");
+        showError("Image too large (max 2 GB)");
         target.value = "";
         return;
       }

@@ -15,10 +15,9 @@ use uuid::Uuid;
 use crate::auth::AppStateInner;
 use crate::middleware::Claims;
 
-/// #5: 10 MB upload limit for files (was 50 MB).
-/// The server-level DefaultBodyLimit is also set to 10 MB by default,
-/// configurable via HAVEN_MAX_BODY_SIZE env var.
-const MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
+/// Upload limit for files. The server-level DefaultBodyLimit (HAVEN_MAX_BODY_SIZE)
+/// must be >= this value.
+const MAX_FILE_SIZE: usize = 2 * 1024 * 1024 * 1024;
 
 #[derive(Serialize)]
 pub struct UploadResponse {
