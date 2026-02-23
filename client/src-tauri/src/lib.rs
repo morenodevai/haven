@@ -37,12 +37,9 @@ fn grant_media_permissions(window: &tauri::WebviewWindow) {
     });
 }
 
-/// Kill any orphaned WebView2 processes from a previous Haven session and
-/// clean up stale lock files so WebView2 can start.
-///
-/// We no longer nuke the entire EBWebView profile because that destroys the
-/// GPU shader cache, which causes black-screen video rendering on many GPUs.
-/// Only the lockfile and orphan processes are cleaned up.
+/// Kill any orphaned WebView2 processes from a previous Haven session,
+/// clear stale localStorage/session data, but preserve the GPU cache
+/// so video rendering works.
 fn clean_webview2_data() {
     let local_appdata = match std::env::var("LOCALAPPDATA") {
         Ok(v) if !v.is_empty() => v,
@@ -76,6 +73,15 @@ fn clean_webview2_data() {
 
         // Retry lockfile removal after killing orphans
         let _ = std::fs::remove_file(ebwebview.join("lockfile"));
+    }
+
+    // Clear localStorage/session storage so stale auth tokens don't block login,
+    // but keep GPU cache (GPUCache, ShaderCache) intact for video rendering.
+    let default_profile = ebwebview.join("Default");
+    if default_profile.exists() {
+        let _ = std::fs::remove_dir_all(default_profile.join("Local Storage"));
+        let _ = std::fs::remove_dir_all(default_profile.join("Session Storage"));
+        let _ = std::fs::remove_dir_all(default_profile.join("IndexedDB"));
     }
 }
 
