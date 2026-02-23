@@ -68,11 +68,19 @@ class VoiceNotifier extends StateNotifier<VoiceState> {
         },
       );
 
-      await voiceService.startCapture();
+      // Start playback first — if speakers fail, that's a real error
       await voiceService.startPlayback();
 
+      // Try mic — if unavailable, just auto-mute
+      bool noMic = false;
+      try {
+        await voiceService.startCapture();
+      } on AudioException {
+        noMic = true;
+      }
+
       _voiceService = voiceService;
-      state = state.copyWith(isInVoice: true, selfMute: false, selfDeaf: false);
+      state = state.copyWith(isInVoice: true, selfMute: noMic, selfDeaf: false);
 
       gateway.voiceJoin(HavenConstants.voiceChannelId);
     } on AudioException catch (e) {
