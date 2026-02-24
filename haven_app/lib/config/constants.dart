@@ -22,7 +22,7 @@ class HavenConstants {
   static const String voiceChannelId =
       '00000000-0000-0000-0000-000000000002';
 
-  /// File-sharing channel ID.
+  /// File-sharing channel ID (seeded in server migrations).
   static const String fileChannelId =
       '00000000-0000-0000-0000-000000000003';
 

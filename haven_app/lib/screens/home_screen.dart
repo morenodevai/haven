@@ -1,4 +1,3 @@
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -9,10 +8,11 @@ import 'package:haven_app/providers/auth_provider.dart';
 import 'package:haven_app/providers/channel_provider.dart';
 import 'package:haven_app/providers/gateway_provider.dart';
 import 'package:haven_app/providers/message_provider.dart';
+import 'package:haven_app/providers/file_transfer_provider.dart';
 import 'package:haven_app/providers/presence_provider.dart';
 import 'package:haven_app/providers/typing_provider.dart';
-import 'package:haven_app/providers/file_transfer_provider.dart';
 import 'package:haven_app/providers/voice_provider.dart';
+import 'package:haven_app/services/file_transfer_service.dart';
 import 'package:haven_app/screens/chat_screen.dart';
 import 'package:haven_app/screens/file_transfer_screen.dart';
 import 'package:haven_app/widgets/sidebar.dart';
@@ -53,8 +53,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       // Load initial messages
       ref.read(messageProvider.notifier).loadMessages();
 
-      // Initialize HTP file transfer service
-      ref.read(fileTransferProvider.notifier).init();
     });
 
     gateway.on('MessageCreate', (event) {
@@ -105,25 +103,19 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       ref.read(voiceProvider.notifier).handleAudioData(event);
     });
 
-    // HTP file transfer event handlers
-    for (final event in [
-      'HtpOffer',
-      'HtpAccept',
-      'HtpNack',
-      'HtpRtt',
-      'HtpAck',
-      'HtpDone',
-      'HtpCancel',
-    ]) {
-      gateway.on(event, (data) {
-        ref.read(fileTransferProvider.notifier).handleControlMessage(data);
-      });
-    }
-
     gateway.onDisconnect(() {
       // Clear presence on disconnect — will repopulate on reconnect
       ref.read(presenceProvider.notifier).clear();
     });
+
+    // Initialize file transfer service
+    final authService = ref.read(authServiceProvider);
+    final fileTransferService = FileTransferService(
+      gateway: gateway,
+      getToken: () => authService.token ?? '',
+      getServerUrl: () => authService.serverUrl.replaceFirst(':3210', ':3211'),
+    );
+    ref.read(fileTransferProvider.notifier).init(fileTransferService);
 
     // Connect
     gateway.connect();
@@ -141,13 +133,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   Widget build(BuildContext context) {
     final activeChannel = ref.watch(activeChannelProvider);
 
-    // Listen for incoming file offers globally (regardless of active channel)
-    ref.listen<FileTransferState>(fileTransferProvider, (prev, next) {
-      if (next.pendingOffer != null && prev?.pendingOffer == null) {
-        _showIncomingOfferDialog(context, next.pendingOffer!);
-      }
-    });
-
     return Scaffold(
       body: Row(
         children: [
@@ -160,79 +145,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           // Main content area
           Expanded(
             child: _buildContent(activeChannel),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _showIncomingOfferDialog(
-      BuildContext context, Map<String, dynamic> offer) {
-    final filename = offer['filename'] as String? ?? 'unknown';
-    final size = offer['size'] as int? ?? 0;
-    final fromUser = offer['from_user_id'] as String? ?? 'unknown';
-
-    String sizeStr;
-    if (size > 1000000000) {
-      sizeStr = '${(size / 1000000000).toStringAsFixed(2)} GB';
-    } else if (size > 1000000) {
-      sizeStr = '${(size / 1000000).toStringAsFixed(1)} MB';
-    } else if (size > 1000) {
-      sizeStr = '${(size / 1000).toStringAsFixed(1)} KB';
-    } else {
-      sizeStr = '$size B';
-    }
-
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: HavenTheme.surface,
-        title: const Text('Incoming File Transfer',
-            style: TextStyle(color: HavenTheme.textPrimary)),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('From: $fromUser',
-                style: TextStyle(color: HavenTheme.textSecondary)),
-            const SizedBox(height: 4),
-            Text('File: $filename',
-                style: TextStyle(color: HavenTheme.textSecondary)),
-            const SizedBox(height: 4),
-            Text('Size: $sizeStr',
-                style: TextStyle(color: HavenTheme.textSecondary)),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              ref.read(fileTransferProvider.notifier).rejectOffer();
-              Navigator.of(ctx).pop();
-            },
-            child:
-                Text('Reject', style: TextStyle(color: HavenTheme.error)),
-          ),
-          ElevatedButton(
-            onPressed: () async {
-              Navigator.of(ctx).pop();
-              final savePath = await FilePicker.platform.saveFile(
-                dialogTitle: 'Save file as...',
-                fileName: filename,
-              );
-              if (savePath != null) {
-                ref
-                    .read(fileTransferProvider.notifier)
-                    .acceptOffer(savePath);
-              } else {
-                ref.read(fileTransferProvider.notifier).rejectOffer();
-              }
-            },
-            style: ElevatedButton.styleFrom(
-              backgroundColor: HavenTheme.primaryLight,
-              foregroundColor: Colors.white,
-            ),
-            child: const Text('Accept'),
           ),
         ],
       ),

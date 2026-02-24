@@ -161,6 +161,12 @@ pub async fn get_messages(
                 created_at: row
                     .created_at
                     .parse::<chrono::DateTime<chrono::Utc>>()
+                    .or_else(|_| {
+                        // SQLite stores timestamps as "YYYY-MM-DD HH:MM:SS" without timezone.
+                        // Parse as naive UTC and convert.
+                        chrono::NaiveDateTime::parse_from_str(&row.created_at, "%Y-%m-%d %H:%M:%S")
+                            .map(|ndt| ndt.and_utc())
+                    })
                     .unwrap_or_else(|e| {
                         warn!("Corrupt created_at '{}' on message '{}': {}", row.created_at, row.id, e);
                         chrono::DateTime::default()

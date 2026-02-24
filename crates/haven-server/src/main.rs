@@ -24,8 +24,6 @@ use haven_api::middleware::{require_auth, JwtSecret, Claims};
 use haven_api::reactions;
 use haven_gateway::connection;
 use haven_gateway::dispatcher::Dispatcher;
-use haven_gateway::tcp_relay::TcpRelayState;
-use haven_gateway::udp_relay::UdpRelayState;
 
 /// Placeholder values that MUST NOT be used as the JWT secret.
 const PLACEHOLDER_SECRETS: &[&str] = &[
@@ -39,6 +37,7 @@ struct ServerState {
     app: AppState,
     dispatcher: Dispatcher,
     jwt_secret: String,
+    file_server_url: Option<String>,
 }
 
 /// Query parameters for the WebSocket upgrade endpoint.
@@ -106,10 +105,17 @@ async fn main() -> anyhow::Result<()> {
 
     let jwt_extension = JwtSecret(Arc::from(jwt_secret.as_str()));
 
+    // Optional file server URL — enables store-and-forward file transfers
+    let file_server_url = std::env::var("HAVEN_FILE_SERVER_URL").ok();
+    if let Some(ref url) = file_server_url {
+        info!("File server URL: {}", url);
+    }
+
     let state = ServerState {
         app: app_state.clone(),
         dispatcher: dispatcher.clone(),
         jwt_secret: jwt_secret.clone(),
+        file_server_url,
     };
 
     // CORS -- restrict to known origins; extend via HAVEN_CORS_ORIGINS env var
@@ -163,43 +169,6 @@ async fn main() -> anyhow::Result<()> {
     socket.listen(1024)?;
     socket.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(socket.into())?;
-
-    // TCP relay for native file transfers (bypasses WebSocket/browser bottleneck)
-    let relay_port: u16 = std::env::var("HAVEN_RELAY_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| port + 1);
-    {
-        let relay_addr: SocketAddr = format!("{}:{}", host, relay_port).parse()?;
-        let relay_socket = Socket::new(
-            Domain::for_address(relay_addr),
-            Type::STREAM,
-            Some(Protocol::TCP),
-        )?;
-        relay_socket.set_reuse_address(true)?;
-        relay_socket.set_nodelay(true)?;
-        relay_socket.bind(&relay_addr.into())?;
-        relay_socket.listen(1024)?;
-        relay_socket.set_nonblocking(true)?;
-        let relay_listener = tokio::net::TcpListener::from_std(relay_socket.into())?;
-        info!("TCP file relay listening on {}", relay_addr);
-        let relay_state = TcpRelayState::new(jwt_secret.clone());
-        tokio::spawn(relay_state.run(relay_listener));
-    }
-
-    // UDP relay for Haven Transfer Protocol (high-speed file transfers)
-    // Defaults to the same port as the TCP relay — clients use UDP to this port.
-    {
-        let udp_relay_port: u16 = std::env::var("HAVEN_UDP_RELAY_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(relay_port);
-        let udp_addr: SocketAddr = format!("{}:{}", host, udp_relay_port).parse()?;
-        let udp_socket = tokio::net::UdpSocket::bind(udp_addr).await?;
-        info!("UDP file relay (HTP) listening on {}", udp_addr);
-        let udp_state = UdpRelayState::new(jwt_secret.clone());
-        tokio::spawn(udp_state.run(Arc::new(udp_socket)));
-    }
 
     // #12: into_make_service_with_connect_info to provide SocketAddr for rate limiting
     // #15: graceful shutdown on Ctrl+C / SIGTERM
@@ -300,10 +269,11 @@ async fn ws_upgrade(
 
     info!("{} ({}) pre-authenticated for WebSocket upgrade", username, user_id);
 
+    let file_server_url = state.file_server_url.clone();
     Ok(ws
         .max_frame_size(4 * 1024 * 1024)    // 4 MB max frame (supports larger chunk sizes)
         .max_message_size(8 * 1024 * 1024) // 8 MB max message
         .on_upgrade(move |socket| {
-            connection::handle_connection_authenticated(socket, state.dispatcher, user_id, username)
+            connection::handle_connection_authenticated(socket, state.dispatcher, user_id, username, file_server_url)
         }))
 }

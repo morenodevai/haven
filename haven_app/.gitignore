@@ -43,3 +43,7 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Build artifacts
+installer_output/
+windows/runner/resources/haven_file_client.dll

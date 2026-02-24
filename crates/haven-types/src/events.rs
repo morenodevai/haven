@@ -76,6 +76,15 @@ pub enum GatewayEvent {
         transfer_id: String,
         filename: String,
         size: u64,
+        /// SHA-256 hash of the full encrypted file
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_sha256: Option<String>,
+        /// Per-chunk SHA-256 hashes (in order)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_hashes: Option<Vec<String>>,
+        /// URL of the file server to upload/download from
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_server_url: Option<String>,
     },
 
     /// A peer accepted a file transfer
@@ -118,59 +127,18 @@ pub enum GatewayEvent {
         ack_chunk_index: u64,
     },
 
-    // ── HTP (Haven Transfer Protocol) control messages ──
-    // Data flows over the UDP relay; these control messages flow over WebSocket.
-
-    /// HTP: sender is offering a file transfer via UDP relay
-    HtpOffer {
+    /// Sender notifies receiver that file has been fully uploaded to the file server
+    FileReady {
         from_user_id: Uuid,
-        session_id: u32,
-        filename: String,
-        size: u64,
-        chunk_count: u64,
-        salt: String, // base64-encoded 32-byte salt
+        transfer_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_server_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_sha256: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_hashes: Option<Vec<String>>,
     },
 
-    /// HTP: receiver accepted the transfer — sender should start sending
-    HtpAccept {
-        from_user_id: Uuid,
-        session_id: u32,
-    },
-
-    /// HTP: receiver reports missing sequences — sender should retransmit
-    HtpNack {
-        from_user_id: Uuid,
-        session_id: u32,
-        missing: Vec<u64>,
-    },
-
-    /// HTP: RTT measurement echo — receiver sends timestamp back to sender
-    HtpRtt {
-        from_user_id: Uuid,
-        session_id: u32,
-        rtt_us: u64,
-    },
-
-    /// HTP: receiver acknowledges receipt up to this sequence
-    HtpAck {
-        from_user_id: Uuid,
-        session_id: u32,
-        up_to: u64,
-    },
-
-    /// HTP: transfer complete
-    HtpDone {
-        from_user_id: Uuid,
-        session_id: u32,
-        total_bytes: u64,
-    },
-
-    /// HTP: transfer cancelled
-    HtpCancel {
-        from_user_id: Uuid,
-        session_id: u32,
-        reason: String,
-    },
 }
 
 impl GatewayEvent {
@@ -226,6 +194,12 @@ pub enum GatewayCommand {
         transfer_id: String,
         filename: String,
         size: u64,
+        /// SHA-256 hash of the full encrypted file
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_sha256: Option<String>,
+        /// Per-chunk SHA-256 hashes (in order)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_hashes: Option<Vec<String>>,
     },
 
     /// Accept a file transfer from a peer
@@ -268,58 +242,29 @@ pub enum GatewayCommand {
         ack_chunk_index: u64,
     },
 
-    // ── HTP (Haven Transfer Protocol) control commands ──
-
-    /// HTP: offer a file to a peer via UDP relay
-    HtpOfferSend {
+    /// Notify the receiver that the file has been fully uploaded to the file server
+    FileUploadCompleteSend {
         target_user_id: Uuid,
-        session_id: u32,
-        filename: String,
-        size: u64,
-        chunk_count: u64,
-        salt: String,
+        transfer_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_sha256: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_hashes: Option<Vec<String>>,
     },
 
-    /// HTP: accept a file transfer — tells the sender to start
-    HtpAcceptSend {
-        target_user_id: Uuid,
-        session_id: u32,
+    /// Client log message forwarded to server for centralized debugging
+    LogSend {
+        level: String,
+        tag: String,
+        message: String,
     },
 
-    /// HTP: report missing sequences to the sender
-    HtpNackSend {
-        target_user_id: Uuid,
-        session_id: u32,
-        missing: Vec<u64>,
-    },
-
-    /// HTP: send RTT measurement to the sender
-    HtpRttSend {
-        target_user_id: Uuid,
-        session_id: u32,
-        rtt_us: u64,
-    },
-
-    /// HTP: acknowledge receipt up to a sequence
-    HtpAckSend {
-        target_user_id: Uuid,
-        session_id: u32,
-        up_to: u64,
-    },
-
-    /// HTP: signal transfer complete
-    HtpDoneSend {
-        target_user_id: Uuid,
-        session_id: u32,
-        total_bytes: u64,
-    },
-
-    /// HTP: cancel a transfer
+    /// HTP: client requests cancellation of a transfer session
     HtpCancelSend {
-        target_user_id: Uuid,
-        session_id: u32,
+        session_id: i64,
         reason: String,
     },
+
 }
 
 /// WebRTC signaling payload relayed between peers.

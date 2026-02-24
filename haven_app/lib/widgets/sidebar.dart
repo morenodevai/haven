@@ -20,7 +20,7 @@ class Sidebar extends ConsumerWidget {
       case ChannelType.voice:
         return Icons.headset;
       case ChannelType.file:
-        return Icons.swap_horiz;
+        return Icons.folder_shared;
     }
   }
 

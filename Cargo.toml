@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["haven_app/native/haven_file_client"]
 members = [
     "crates/haven-server",
     "crates/haven-api",
@@ -7,10 +8,11 @@ members = [
     "crates/haven-crypto",
     "crates/haven-db",
     "crates/haven-types",
+    "crates/haven-file-server",
 ]
 
 [workspace.package]
-version = "0.11.0"
+version = "3.0.0"
 edition = "2024"
 license = "MIT"
 
@@ -60,6 +62,21 @@ bytes = "1"
 
 # Config
 dotenvy = "0.15"
+
+# Hashing
+sha2 = "0.10"
+hex = "0.4"
+
+# Streaming
+tokio-util = { version = "0.7", features = ["io"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["stream", "rustls-tls"], default-features = false }
+
+# Streaming helpers
+async-stream = "0.3"
+http-body-util = "0.1"
+futures-util = "0.3"
 
 # Workspace crates
 haven-api = { path = "crates/haven-api" }

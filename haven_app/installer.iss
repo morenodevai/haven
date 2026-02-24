@@ -1,11 +1,11 @@
 [Setup]
 AppName=Haven
-AppVersion=2.3.0
+AppVersion=3.1.0
 AppPublisher=Haven
 DefaultDirName={autopf}\Haven
 DefaultGroupName=Haven
 OutputDir=installer_output
-OutputBaseFilename=Haven_2.3.0_x64-setup
+OutputBaseFilename=Haven_3.1.0_x64-setup
 Compression=lzma2
 SolidCompression=yes
 ArchitecturesAllowed=x64compatible

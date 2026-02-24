@@ -25,6 +25,7 @@ pub async fn handle_connection_authenticated(
     dispatcher: Dispatcher,
     user_id: Uuid,
     username: String,
+    file_server_url: Option<String>,
 ) {
     let (mut sender, receiver) = socket.split();
 
@@ -44,7 +45,7 @@ pub async fn handle_connection_authenticated(
     }
 
     // Shared connection loop
-    run_connection_loop(sender, receiver, dispatcher, user_id, username).await;
+    run_connection_loop(sender, receiver, dispatcher, user_id, username, file_server_url).await;
 }
 
 /// Handle a single WebSocket connection (legacy path — uses Identify handshake).
@@ -76,8 +77,8 @@ pub async fn handle_connection(socket: WebSocket, dispatcher: Dispatcher, jwt_se
         return;
     }
 
-    // Shared connection loop
-    run_connection_loop(sender, receiver, dispatcher, user_id, username).await;
+    // Shared connection loop (legacy path has no file server URL)
+    run_connection_loop(sender, receiver, dispatcher, user_id, username, None).await;
 }
 
 /// Shared connection loop — factored out of both handle_connection and
@@ -88,6 +89,7 @@ async fn run_connection_loop(
     dispatcher: Dispatcher,
     user_id: Uuid,
     username: String,
+    file_server_url: Option<String>,
 ) {
     // Register per-user channel and send existing online users, then go online
     let (conn_id, mut user_rx) = dispatcher.register_user_channel(user_id).await;
@@ -197,6 +199,7 @@ async fn run_connection_loop(
     // Read commands from client
     let username_recv = username.clone();
     let recv_subscriptions = subscribed_channels.clone();
+    let file_server_url_recv = file_server_url.clone();
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
@@ -209,6 +212,7 @@ async fn run_connection_loop(
                                 &username_recv,
                                 cmd,
                                 &recv_subscriptions,
+                                file_server_url_recv.as_deref(),
                             )
                             .await;
                         }
@@ -285,6 +289,7 @@ async fn handle_command(
     username: &str,
     cmd: GatewayCommand,
     subscriptions: &Arc<std::sync::RwLock<HashSet<Uuid>>>,
+    file_server_url: Option<&str>,
 ) {
     match cmd {
         GatewayCommand::Identify { .. } => {} // Already handled
@@ -425,6 +430,8 @@ async fn handle_command(
             transfer_id,
             filename,
             size,
+            file_sha256,
+            chunk_hashes,
         } => {
             info!(
                 "{} ({}) -> file offer to {} ({})",
@@ -438,6 +445,10 @@ async fn handle_command(
                         transfer_id,
                         filename,
                         size,
+                        file_sha256,
+                        chunk_hashes,
+                        // Inject file server URL from server config
+                        file_server_url: file_server_url.map(|s| s.to_string()),
                     },
                 )
                 .await;
@@ -571,160 +582,48 @@ async fn handle_command(
                 .await;
         }
 
-        // ── HTP (Haven Transfer Protocol) control messages ──
-        // These relay control plane signals between sender and receiver over WebSocket.
-        // The actual file data flows over the UDP relay on port 3211.
-
-        GatewayCommand::HtpOfferSend {
+        GatewayCommand::FileUploadCompleteSend {
             target_user_id,
-            session_id,
-            filename,
-            size,
-            chunk_count,
-            salt,
+            transfer_id,
+            file_sha256,
+            chunk_hashes,
         } => {
             info!(
-                "{} ({}) -> HTP offer to {} (session={}, file={}, {} bytes)",
-                username, user_id, target_user_id, session_id, filename, size
+                "{} ({}) -> file upload complete to {} [transfer={}]",
+                username, user_id, target_user_id, &transfer_id[..transfer_id.len().min(8)]
             );
+            // Only include file_server_url if the gateway has one configured.
+            let fsu = file_server_url.as_deref().filter(|s| !s.is_empty()).map(|s| s.to_string());
             dispatcher
                 .send_to_user(
                     target_user_id,
-                    GatewayEvent::HtpOffer {
+                    GatewayEvent::FileReady {
                         from_user_id: user_id,
-                        session_id,
-                        filename,
-                        size,
-                        chunk_count,
-                        salt,
+                        transfer_id,
+                        file_server_url: fsu,
+                        file_sha256,
+                        chunk_hashes,
                     },
                 )
                 .await;
         }
 
-        GatewayCommand::HtpAcceptSend {
-            target_user_id,
-            session_id,
-        } => {
+        GatewayCommand::LogSend { level, tag, message } => {
+            match level.as_str() {
+                "ERROR" => tracing::error!("[{}] {} ({}): {}", level, username, tag, message),
+                "WARN"  => tracing::warn!("[{}] {} ({}): {}", level, username, tag, message),
+                "INFO"  => tracing::info!("[{}] {} ({}): {}", level, username, tag, message),
+                _       => tracing::debug!("[{}] {} ({}): {}", level, username, tag, message),
+            }
+        }
+
+        GatewayCommand::HtpCancelSend { session_id, reason } => {
             info!(
-                "{} ({}) -> HTP accept to {} (session={})",
-                username, user_id, target_user_id, session_id
+                "{} ({}) HTP cancel: session={} reason={}",
+                username, user_id, session_id, reason
             );
-            dispatcher
-                .send_to_user(
-                    target_user_id,
-                    GatewayEvent::HtpAccept {
-                        from_user_id: user_id,
-                        session_id,
-                    },
-                )
-                .await;
         }
 
-        GatewayCommand::HtpNackSend {
-            target_user_id,
-            session_id,
-            missing,
-        } => {
-            trace!(
-                "{} ({}) -> HTP NACK to {} (session={}, {} seqs)",
-                username, user_id, target_user_id, session_id, missing.len()
-            );
-            dispatcher
-                .send_to_user(
-                    target_user_id,
-                    GatewayEvent::HtpNack {
-                        from_user_id: user_id,
-                        session_id,
-                        missing,
-                    },
-                )
-                .await;
-        }
-
-        GatewayCommand::HtpRttSend {
-            target_user_id,
-            session_id,
-            rtt_us,
-        } => {
-            trace!(
-                "{} ({}) -> HTP RTT to {} (session={}, {} us)",
-                username, user_id, target_user_id, session_id, rtt_us
-            );
-            dispatcher
-                .send_to_user(
-                    target_user_id,
-                    GatewayEvent::HtpRtt {
-                        from_user_id: user_id,
-                        session_id,
-                        rtt_us,
-                    },
-                )
-                .await;
-        }
-
-        GatewayCommand::HtpAckSend {
-            target_user_id,
-            session_id,
-            up_to,
-        } => {
-            trace!(
-                "{} ({}) -> HTP ACK to {} (session={}, up_to={})",
-                username, user_id, target_user_id, session_id, up_to
-            );
-            dispatcher
-                .send_to_user(
-                    target_user_id,
-                    GatewayEvent::HtpAck {
-                        from_user_id: user_id,
-                        session_id,
-                        up_to,
-                    },
-                )
-                .await;
-        }
-
-        GatewayCommand::HtpDoneSend {
-            target_user_id,
-            session_id,
-            total_bytes,
-        } => {
-            info!(
-                "{} ({}) -> HTP done to {} (session={}, {} bytes)",
-                username, user_id, target_user_id, session_id, total_bytes
-            );
-            dispatcher
-                .send_to_user(
-                    target_user_id,
-                    GatewayEvent::HtpDone {
-                        from_user_id: user_id,
-                        session_id,
-                        total_bytes,
-                    },
-                )
-                .await;
-        }
-
-        GatewayCommand::HtpCancelSend {
-            target_user_id,
-            session_id,
-            reason,
-        } => {
-            info!(
-                "{} ({}) -> HTP cancel to {} (session={}, reason={})",
-                username, user_id, target_user_id, session_id, reason
-            );
-            dispatcher
-                .send_to_user(
-                    target_user_id,
-                    GatewayEvent::HtpCancel {
-                        from_user_id: user_id,
-                        session_id,
-                        reason,
-                    },
-                )
-                .await;
-        }
     }
 }
 

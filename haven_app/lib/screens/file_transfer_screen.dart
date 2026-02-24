@@ -1,71 +1,41 @@
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:path_provider/path_provider.dart';
 
+import 'package:haven_app/config/constants.dart';
 import 'package:haven_app/config/theme.dart';
-import 'package:haven_app/models/user.dart';
 import 'package:haven_app/providers/auth_provider.dart';
 import 'package:haven_app/providers/file_transfer_provider.dart';
 import 'package:haven_app/providers/presence_provider.dart';
-import 'package:haven_app/services/htp_service.dart';
+import 'package:haven_app/services/file_client_bindings.dart';
+import 'package:haven_app/services/file_transfer_service.dart';
 
-class FileTransferScreen extends ConsumerStatefulWidget {
+class FileTransferScreen extends ConsumerWidget {
   const FileTransferScreen({super.key});
 
   @override
-  ConsumerState<FileTransferScreen> createState() => _FileTransferScreenState();
-}
-
-class _FileTransferScreenState extends ConsumerState<FileTransferScreen> {
-  String? _selectedUserId;
-
-  @override
-  Widget build(BuildContext context) {
-    final ftState = ref.watch(fileTransferProvider);
+  Widget build(BuildContext context, WidgetRef ref) {
+    final transferState = ref.watch(fileTransferProvider);
     final onlineUsers = ref.watch(presenceProvider);
-    final authState = ref.watch(authProvider);
-
-    // Filter out self from online users
-    final recipients = onlineUsers.values
-        .where((u) => u.id != authState.userId)
-        .toList();
-
-    // Listen for errors
-    ref.listen<FileTransferState>(fileTransferProvider, (prev, next) {
-      if (next.error != null && next.error != prev?.error) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(next.error!)),
-        );
-      }
-    });
-
-    // Separate transfers by state
-    final activeTransfers = ftState.transfers.values
-        .where((t) =>
-            t.state == TransferState.active ||
-            t.state == TransferState.pending)
-        .toList();
-    final completedTransfers = ftState.transfers.values
-        .where((t) =>
-            t.state == TransferState.complete ||
-            t.state == TransferState.failed ||
-            t.state == TransferState.cancelled)
-        .toList();
 
     return Column(
       children: [
-        // Header
+        // Header bar
         Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          padding: const EdgeInsets.all(16),
           decoration: const BoxDecoration(
-            border: Border(bottom: BorderSide(color: HavenTheme.divider)),
+            color: HavenTheme.surface,
+            border: Border(
+              bottom: BorderSide(color: HavenTheme.divider),
+            ),
           ),
           child: Row(
             children: [
-              const Icon(Icons.tag, size: 20, color: HavenTheme.textMuted),
+              const Icon(Icons.swap_horiz, color: HavenTheme.primaryLight),
               const SizedBox(width: 8),
               const Text(
-                'file-sharing',
+                'File Transfers',
                 style: TextStyle(
                   fontSize: 16,
                   fontWeight: FontWeight.w600,
@@ -73,429 +43,379 @@ class _FileTransferScreenState extends ConsumerState<FileTransferScreen> {
                 ),
               ),
               const Spacer(),
-              Icon(Icons.lock_outline, size: 16, color: HavenTheme.textMuted),
-              const SizedBox(width: 4),
-              Text(
-                'End-to-end encrypted',
-                style: TextStyle(fontSize: 12, color: HavenTheme.textMuted),
+              ElevatedButton.icon(
+                onPressed: () => _showSendDialog(context, ref, onlineUsers),
+                icon: const Icon(Icons.upload_file, size: 18),
+                label: const Text('Send File'),
+                style: ElevatedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  textStyle: const TextStyle(fontSize: 13),
+                ),
               ),
             ],
           ),
         ),
 
-        // Content
-        Expanded(
-          child: ListView(
-            padding: const EdgeInsets.all(16),
-            children: [
-              // Send File section
-              _SectionHeader(title: 'SEND FILE'),
-              const SizedBox(height: 8),
-              Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: HavenTheme.surfaceVariant.withValues(alpha: 0.3),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: HavenTheme.divider),
+        // Pending offers
+        if (transferState.pendingOffers.isNotEmpty) ...[
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+            child: Row(
+              children: [
+                Text(
+                  'INCOMING OFFERS',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: HavenTheme.textMuted,
+                    letterSpacing: 1.2,
+                  ),
                 ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    // Recipient dropdown
-                    Row(
-                      children: [
-                        Text(
-                          'To:',
-                          style: TextStyle(
-                            fontSize: 14,
-                            color: HavenTheme.textSecondary,
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: _RecipientDropdown(
-                            recipients: recipients,
-                            selectedUserId: _selectedUserId,
-                            onChanged: (userId) {
-                              setState(() => _selectedUserId = userId);
-                            },
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 12),
-                    // Pick file button
-                    ElevatedButton.icon(
-                      onPressed: _selectedUserId == null
-                          ? null
-                          : () => _pickAndSendFile(),
-                      icon: const Icon(Icons.attach_file, size: 18),
-                      label: const Text('Pick File'),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: HavenTheme.primaryLight,
-                        foregroundColor: Colors.white,
-                        disabledBackgroundColor:
-                            HavenTheme.surfaceVariant.withValues(alpha: 0.5),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-
-              const SizedBox(height: 24),
-
-              // Active Transfers
-              if (activeTransfers.isNotEmpty) ...[
-                _SectionHeader(title: 'ACTIVE TRANSFERS'),
-                const SizedBox(height: 8),
-                ...activeTransfers.map((t) => _TransferCard(transfer: t)),
-                const SizedBox(height: 24),
               ],
-
-              // Completed Transfers
-              if (completedTransfers.isNotEmpty) ...[
-                _SectionHeader(title: 'COMPLETED'),
-                const SizedBox(height: 8),
-                ...completedTransfers.map((t) => _CompletedTransferTile(transfer: t)),
-              ],
-            ],
+            ),
           ),
-        ),
+          ...transferState.pendingOffers.map((t) => _PendingOfferTile(transfer: t)),
+        ],
+
+        // Active transfers
+        if (transferState.active.isNotEmpty) ...[
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+            child: Row(
+              children: [
+                Text(
+                  'ACTIVE TRANSFERS',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: HavenTheme.textMuted,
+                    letterSpacing: 1.2,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          ...transferState.active.map((t) => _ActiveTransferTile(transfer: t)),
+        ],
+
+        // Completed transfers
+        if (transferState.completed.isNotEmpty) ...[
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+            child: Row(
+              children: [
+                Text(
+                  'COMPLETED',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: HavenTheme.textMuted,
+                    letterSpacing: 1.2,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          ...transferState.completed.map((t) => _CompletedTransferTile(transfer: t)),
+        ],
+
+        // Empty state
+        if (transferState.transfers.isEmpty)
+          Expanded(
+            child: Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.folder_open, size: 64, color: HavenTheme.textMuted),
+                  const SizedBox(height: 16),
+                  Text(
+                    'No file transfers',
+                    style: TextStyle(
+                      fontSize: 16,
+                      color: HavenTheme.textMuted,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Click "Send File" to transfer a file to another user.',
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: HavenTheme.textMuted,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
       ],
     );
   }
 
-  Future<void> _pickAndSendFile() async {
+  void _showSendDialog(BuildContext context, WidgetRef ref, Map<String, dynamic> onlineUsers) async {
+    // Pick a file first
     final result = await FilePicker.platform.pickFiles();
     if (result == null || result.files.isEmpty) return;
 
-    final filePath = result.files.single.path;
-    if (filePath == null) return;
+    final file = result.files.first;
+    if (file.path == null) return;
 
-    ref
-        .read(fileTransferProvider.notifier)
-        .sendFile(filePath, _selectedUserId!);
-  }
-
-  void _showIncomingOfferDialog(
-      BuildContext context, Map<String, dynamic> offer) {
-    final filename = offer['filename'] as String? ?? 'unknown';
-    final size = offer['size'] as int? ?? 0;
-    final fromUser = offer['from_user_id'] as String? ?? 'unknown';
-
-    final sizeStr = _formatSize(size);
-
-    showDialog(
+    // Show user picker dialog
+    if (!context.mounted) return;
+    final targetUserId = await showDialog<String>(
       context: context,
-      barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: HavenTheme.surface,
-        title: const Text('Incoming File Transfer',
-            style: TextStyle(color: HavenTheme.textPrimary)),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('From: $fromUser',
-                style: TextStyle(color: HavenTheme.textSecondary)),
-            const SizedBox(height: 4),
-            Text('File: $filename',
-                style: TextStyle(color: HavenTheme.textSecondary)),
-            const SizedBox(height: 4),
-            Text('Size: $sizeStr',
-                style: TextStyle(color: HavenTheme.textSecondary)),
-          ],
+      builder: (ctx) => _UserPickerDialog(onlineUsers: onlineUsers),
+    );
+
+    if (targetUserId == null) return;
+
+    // Use default channel key for MVP
+    ref.read(fileTransferProvider.notifier).sendFile(
+      filePath: file.path!,
+      filename: file.name,
+      fileSize: file.size,
+      targetUserId: targetUserId,
+      masterKey: HavenConstants.defaultChannelKey,
+      salt: 'file-transfer',
+    );
+  }
+}
+
+class _UserPickerDialog extends StatelessWidget {
+  final Map<String, dynamic> onlineUsers;
+
+  const _UserPickerDialog({required this.onlineUsers});
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: HavenTheme.surface,
+      title: const Text('Send to...'),
+      content: SizedBox(
+        width: 300,
+        child: ListView(
+          shrinkWrap: true,
+          children: onlineUsers.entries.map((entry) {
+            final username = entry.value.username;
+            return ListTile(
+              leading: CircleAvatar(
+                backgroundColor: HavenTheme.primaryLight,
+                child: Text(
+                  username[0].toUpperCase(),
+                  style: const TextStyle(color: Colors.white),
+                ),
+              ),
+              title: Text(
+                username,
+                style: const TextStyle(color: HavenTheme.textPrimary),
+              ),
+              onTap: () => Navigator.of(context).pop(entry.key),
+            );
+          }).toList(),
         ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              ref.read(fileTransferProvider.notifier).rejectOffer();
-              Navigator.of(ctx).pop();
-            },
-            child:
-                Text('Reject', style: TextStyle(color: HavenTheme.error)),
-          ),
-          ElevatedButton(
-            onPressed: () async {
-              Navigator.of(ctx).pop();
-              final savePath = await FilePicker.platform.saveFile(
-                dialogTitle: 'Save file as...',
-                fileName: filename,
-              );
-              if (savePath != null) {
-                ref
-                    .read(fileTransferProvider.notifier)
-                    .acceptOffer(savePath);
-              } else {
-                ref.read(fileTransferProvider.notifier).rejectOffer();
-              }
-            },
-            style: ElevatedButton.styleFrom(
-              backgroundColor: HavenTheme.primaryLight,
-              foregroundColor: Colors.white,
-            ),
-            child: const Text('Accept'),
-          ),
-        ],
       ),
-    );
-  }
-
-  String _formatSize(int bytes) {
-    if (bytes > 1000000000) {
-      return '${(bytes / 1000000000).toStringAsFixed(2)} GB';
-    } else if (bytes > 1000000) {
-      return '${(bytes / 1000000).toStringAsFixed(1)} MB';
-    } else if (bytes > 1000) {
-      return '${(bytes / 1000).toStringAsFixed(1)} KB';
-    }
-    return '$bytes B';
-  }
-}
-
-// ── Widgets ──
-
-class _SectionHeader extends StatelessWidget {
-  final String title;
-  const _SectionHeader({required this.title});
-
-  @override
-  Widget build(BuildContext context) {
-    return Text(
-      title,
-      style: TextStyle(
-        fontSize: 11,
-        fontWeight: FontWeight.w600,
-        color: HavenTheme.textMuted,
-        letterSpacing: 1.2,
-      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+      ],
     );
   }
 }
 
-class _RecipientDropdown extends StatelessWidget {
-  final List<User> recipients;
-  final String? selectedUserId;
-  final ValueChanged<String?> onChanged;
-
-  const _RecipientDropdown({
-    required this.recipients,
-    required this.selectedUserId,
-    required this.onChanged,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    if (recipients.isEmpty) {
-      return Text(
-        'No users online',
-        style: TextStyle(fontSize: 14, color: HavenTheme.textMuted),
-      );
-    }
-
-    return DropdownButton<String>(
-      value: selectedUserId,
-      hint: Text('Select recipient',
-          style: TextStyle(color: HavenTheme.textMuted)),
-      isExpanded: true,
-      dropdownColor: HavenTheme.surface,
-      style: const TextStyle(color: HavenTheme.textPrimary),
-      underline: Container(height: 1, color: HavenTheme.divider),
-      items: recipients.map((user) {
-        return DropdownMenuItem<String>(
-          value: user.id,
-          child: Text(user.username),
-        );
-      }).toList(),
-      onChanged: onChanged,
-    );
+String _formatBytes(int bytes) {
+  if (bytes < 1024) return '$bytes B';
+  if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+  if (bytes < 1024 * 1024 * 1024) {
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
   }
+  return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
 }
 
-class _TransferCard extends ConsumerWidget {
-  final HtpTransfer transfer;
-  const _TransferCard({required this.transfer});
+class _PendingOfferTile extends ConsumerWidget {
+  final FileTransfer transfer;
+
+  const _PendingOfferTile({required this.transfer});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final directionIcon = transfer.direction == TransferDirection.sending
-        ? Icons.arrow_upward
-        : Icons.arrow_downward;
-    final directionLabel =
-        transfer.direction == TransferDirection.sending ? 'Sending' : 'Receiving';
-
-    final bytesTransferred =
-        (transfer.progress * transfer.fileSize).toInt();
-
-    return Container(
-      margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: HavenTheme.surfaceVariant.withValues(alpha: 0.3),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: HavenTheme.divider),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // File info row
-          Row(
-            children: [
-              Icon(directionIcon, size: 16, color: HavenTheme.primaryLight),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  '$directionLabel: ${transfer.filename}',
-                  style: const TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.w500,
-                    color: HavenTheme.textPrimary,
+    return Card(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      color: HavenTheme.surfaceVariant,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Row(
+          children: [
+            const Icon(Icons.file_present, color: HavenTheme.primaryLight),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    transfer.filename,
+                    style: const TextStyle(
+                      color: HavenTheme.textPrimary,
+                      fontWeight: FontWeight.w500,
+                    ),
                   ),
-                  overflow: TextOverflow.ellipsis,
-                ),
+                  Text(
+                    _formatBytes(transfer.fileSize),
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: HavenTheme.textMuted,
+                    ),
+                  ),
+                ],
               ),
-            ],
-          ),
-          const SizedBox(height: 8),
-
-          // Progress bar
-          ClipRRect(
-            borderRadius: BorderRadius.circular(4),
-            child: LinearProgressIndicator(
-              value: transfer.progress,
-              backgroundColor: HavenTheme.surfaceVariant,
-              valueColor:
-                  AlwaysStoppedAnimation<Color>(HavenTheme.primaryLight),
-              minHeight: 6,
             ),
-          ),
-          const SizedBox(height: 6),
-
-          // Stats row
-          Row(
-            children: [
-              Text(
-                '${(transfer.progress * 100).toStringAsFixed(0)}%',
-                style: TextStyle(
-                    fontSize: 12, color: HavenTheme.textSecondary),
-              ),
-              const SizedBox(width: 12),
-              Text(
-                transfer.rateFormatted,
-                style: TextStyle(
-                    fontSize: 12, color: HavenTheme.textSecondary),
-              ),
-              const Spacer(),
-              Text(
-                '${_formatSize(bytesTransferred)} / ${transfer.sizeFormatted}',
-                style: TextStyle(
-                    fontSize: 12, color: HavenTheme.textMuted),
-              ),
-              if (transfer.retransmits > 0) ...[
-                const SizedBox(width: 8),
-                Text(
-                  '${transfer.retransmits} retransmits',
-                  style: TextStyle(
-                      fontSize: 11, color: HavenTheme.textMuted),
-                ),
-              ],
-              const SizedBox(width: 8),
-              InkWell(
-                onTap: () {
-                  ref
-                      .read(fileTransferProvider.notifier)
-                      .cancelTransfer(transfer.sessionId);
-                },
-                child: Text(
-                  'Cancel',
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: HavenTheme.error,
-                    fontWeight: FontWeight.w500,
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ],
+            IconButton(
+              icon: const Icon(Icons.check_circle, color: HavenTheme.online),
+              onPressed: () async {
+                final initialDir = (await getDownloadsDirectory() ?? await getApplicationDocumentsDirectory()).path;
+                final savePath = await FilePicker.platform.saveFile(
+                  dialogTitle: 'Save ${transfer.filename}',
+                  fileName: transfer.filename,
+                  initialDirectory: initialDir,
+                );
+                if (savePath == null) return;
+                ref.read(fileTransferProvider.notifier).acceptOffer(
+                  transfer.transferId,
+                  savePath,
+                  HavenConstants.defaultChannelKey,
+                  'file-transfer',
+                );
+              },
+              tooltip: 'Accept',
+            ),
+            IconButton(
+              icon: const Icon(Icons.cancel, color: HavenTheme.error),
+              onPressed: () {
+                ref.read(fileTransferProvider.notifier).rejectOffer(transfer.transferId);
+              },
+              tooltip: 'Reject',
+            ),
+          ],
+        ),
       ),
     );
   }
+}
 
-  String _formatSize(int bytes) {
-    if (bytes > 1000000000) {
-      return '${(bytes / 1000000000).toStringAsFixed(2)} GB';
-    } else if (bytes > 1000000) {
-      return '${(bytes / 1000000).toStringAsFixed(1)} MB';
-    } else if (bytes > 1000) {
-      return '${(bytes / 1000).toStringAsFixed(1)} KB';
-    }
-    return '$bytes B';
+class _ActiveTransferTile extends ConsumerWidget {
+  final FileTransfer transfer;
+
+  const _ActiveTransferTile({required this.transfer});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return Card(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      color: HavenTheme.surface,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  transfer.isUpload ? Icons.upload : Icons.download,
+                  color: HavenTheme.primaryLight,
+                  size: 20,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    transfer.filename,
+                    style: const TextStyle(
+                      color: HavenTheme.textPrimary,
+                      fontWeight: FontWeight.w500,
+                    ),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.close, size: 18),
+                  onPressed: () {
+                    ref.read(fileTransferProvider.notifier).cancelTransfer(transfer.transferId);
+                  },
+                  tooltip: 'Cancel',
+                  constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            LinearProgressIndicator(
+              value: transfer.progress,
+              backgroundColor: HavenTheme.divider,
+              valueColor: const AlwaysStoppedAnimation(HavenTheme.primaryLight),
+            ),
+            const SizedBox(height: 4),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  transfer.statusText,
+                  style: TextStyle(fontSize: 12, color: HavenTheme.textMuted),
+                ),
+                Text(
+                  '${_formatBytes(transfer.bytesDone)} / ${_formatBytes(transfer.bytesTotal)}',
+                  style: TextStyle(fontSize: 12, color: HavenTheme.textMuted),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
 
-class _CompletedTransferTile extends StatelessWidget {
-  final HtpTransfer transfer;
+class _CompletedTransferTile extends ConsumerWidget {
+  final FileTransfer transfer;
+
   const _CompletedTransferTile({required this.transfer});
 
   @override
-  Widget build(BuildContext context) {
-    final IconData icon;
-    final Color iconColor;
-
-    switch (transfer.state) {
-      case TransferState.complete:
-        icon = Icons.check_circle_outline;
-        iconColor = HavenTheme.online;
-        break;
-      case TransferState.failed:
-        icon = Icons.error_outline;
-        iconColor = HavenTheme.error;
-        break;
-      case TransferState.cancelled:
-        icon = Icons.cancel_outlined;
-        iconColor = HavenTheme.textMuted;
-        break;
-      default:
-        icon = Icons.help_outline;
-        iconColor = HavenTheme.textMuted;
-    }
-
-    final elapsed = transfer.elapsed;
-    final elapsedStr = elapsed.inSeconds < 60
-        ? '${elapsed.inSeconds}.${(elapsed.inMilliseconds % 1000 ~/ 100)}s'
-        : '${elapsed.inMinutes}m ${elapsed.inSeconds % 60}s';
-
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Row(
-        children: [
-          Icon(icon, size: 16, color: iconColor),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              transfer.filename,
-              style: TextStyle(fontSize: 13, color: HavenTheme.textSecondary),
-              overflow: TextOverflow.ellipsis,
+  Widget build(BuildContext context, WidgetRef ref) {
+    return Card(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      color: HavenTheme.surface,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Row(
+          children: [
+            const Icon(Icons.check_circle, color: HavenTheme.online, size: 20),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    transfer.filename,
+                    style: const TextStyle(
+                      color: HavenTheme.textPrimary,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                  Text(
+                    '${transfer.isUpload ? "Sent" : "Received"} — ${_formatBytes(transfer.fileSize)}',
+                    style: TextStyle(fontSize: 12, color: HavenTheme.textMuted),
+                  ),
+                ],
+              ),
             ),
-          ),
-          Text(
-            transfer.sizeFormatted,
-            style: TextStyle(fontSize: 12, color: HavenTheme.textMuted),
-          ),
-          const SizedBox(width: 12),
-          Text(
-            elapsedStr,
-            style: TextStyle(fontSize: 12, color: HavenTheme.textMuted),
-          ),
-          if (transfer.state == TransferState.complete) ...[
-            const SizedBox(width: 12),
-            Text(
-              transfer.rateFormatted,
-              style: TextStyle(fontSize: 12, color: HavenTheme.textMuted),
+            IconButton(
+              icon: const Icon(Icons.close, size: 16, color: HavenTheme.textMuted),
+              onPressed: () {
+                ref.read(fileTransferProvider.notifier).removeTransfer(transfer.transferId);
+              },
+              tooltip: 'Dismiss',
+              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
             ),
           ],
-        ],
+        ),
       ),
     );
   }
