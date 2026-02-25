@@ -324,10 +324,12 @@ pub async fn upload_chunk(
 ) -> Result<StatusCode, StatusCode> {
     let claims = extract_claims(&headers, &state.jwt_secret)?;
 
-    // Single JOIN query: transfer auth/status + chunk metadata in one round-trip
+    // Single JOIN query: transfer auth/status + chunk metadata in one round-trip.
+    // Uses writer connection to guarantee visibility of just-created transfers
+    // (read-only WAL snapshots may not yet see recent writer commits).
     let (uploader_id, current_status, offset, byte_length, already_received): (String, String, u64, u64, bool) = state
         .db
-        .with_conn(|conn| {
+        .with_conn_mut(|conn| {
             conn.query_row(
                 "SELECT t.uploader_id, t.status, c.byte_offset, c.byte_length, c.received
                  FROM transfers t

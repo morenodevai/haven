@@ -85,6 +85,7 @@ class FileTransferService {
   FileClientBindings? _bindings;
   final _dio = Dio();
   final Map<String, Timer> _pollTimers = {};
+  final Map<String, int> _pollCounts = {};
 
   FileClientBindings? _getBindings() {
     if (_bindings != null) return _bindings;
@@ -228,6 +229,7 @@ class FileTransferService {
       t.cancel();
     }
     _pollTimers.clear();
+    _pollCounts.clear();
     for (final transfer in _transfers.values) {
       if (transfer.nativeHandle != null) {
         _getBindings()?.free(transfer.nativeHandle!);
@@ -238,29 +240,46 @@ class FileTransferService {
 
   void _startStatusPolling(String transferId) {
     _pollTimers[transferId]?.cancel();
+    _pollCounts[transferId] = 0;
     _pollTimers[transferId] = Timer.periodic(
       const Duration(seconds: 5),
       (_) => _pollTransferStatus(transferId),
     );
   }
 
+  void _stopStatusPolling(String transferId) {
+    _pollTimers[transferId]?.cancel();
+    _pollTimers.remove(transferId);
+    _pollCounts.remove(transferId);
+  }
+
   Future<void> _pollTransferStatus(String transferId) async {
     final transfer = _transfers[transferId];
     final pending = _pendingDownloads[transferId];
     if (transfer == null || transfer.isUpload || pending == null) {
-      _pollTimers[transferId]?.cancel();
-      _pollTimers.remove(transferId);
+      _stopStatusPolling(transferId);
       return;
     }
     if (transfer.nativeHandle != null) {
-      _pollTimers[transferId]?.cancel();
-      _pollTimers.remove(transferId);
+      _stopStatusPolling(transferId);
+      return;
+    }
+
+    // Give up after 5 minutes (60 polls × 5 seconds)
+    final count = (_pollCounts[transferId] ?? 0) + 1;
+    _pollCounts[transferId] = count;
+    if (count > 60) {
+      _log('WARN', 'pollTransferStatus: transfer=$transferId timed out after $count polls, giving up');
+      _stopStatusPolling(transferId);
+      _pendingDownloads.remove(transferId);
+      transfer.state = TransferState.error;
+      onProgressUpdate?.call();
       return;
     }
 
     try {
       final serverUrl = transfer.fileServerUrl ?? _getServerUrl();
-      _log('DEBUG', 'pollTransferStatus: transfer=$transferId url=$serverUrl');
+      _log('DEBUG', 'pollTransferStatus: transfer=$transferId url=$serverUrl poll=$count');
       final resp = await _dio.get(
         '$serverUrl/transfers/$transferId',
         options: Options(
@@ -273,8 +292,7 @@ class FileTransferService {
         final status = data['status'] as String?;
         _log('INFO', 'pollTransferStatus: transfer=$transferId status=$status');
         if (status == 'complete') {
-          _pollTimers[transferId]?.cancel();
-          _pollTimers.remove(transferId);
+          _stopStatusPolling(transferId);
           final p = _pendingDownloads.remove(transferId);
           if (p != null &&
               transfer.fileSha256 != null &&
@@ -283,6 +301,13 @@ class FileTransferService {
           } else {
             _log('ERROR', 'pollTransferStatus: transfer=$transferId complete but missing hashes or pending (sha256=${transfer.fileSha256}, chunks=${transfer.chunkHashes?.length}, pending=${p != null})');
           }
+        } else if (status != null && status != 'uploading') {
+          // Unexpected status (e.g. failed, cancelled) — stop polling
+          _log('WARN', 'pollTransferStatus: transfer=$transferId unexpected status=$status, stopping');
+          _stopStatusPolling(transferId);
+          _pendingDownloads.remove(transferId);
+          transfer.state = TransferState.error;
+          onProgressUpdate?.call();
         }
       }
     } catch (e) {
