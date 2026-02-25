@@ -31,6 +31,7 @@ Desktop.ini
 
 # File uploads
 uploads/
+file-storage/
 
 # Runtime / deployment artifacts
 current/
