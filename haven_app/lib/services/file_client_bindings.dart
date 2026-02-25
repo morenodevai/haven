@@ -88,6 +88,9 @@ typedef _GetHashesJsonDart = Pointer<Utf8> Function(Pointer<Void> handle);
 typedef _FreeStringNative = Void Function(Pointer<Utf8> ptr);
 typedef _FreeStringDart = void Function(Pointer<Utf8> ptr);
 
+typedef _GetLastErrorNative = Pointer<Utf8> Function(Pointer<Void> handle);
+typedef _GetLastErrorDart = Pointer<Utf8> Function(Pointer<Void> handle);
+
 // ── Bindings class ───────────────────────────────────────────────────────
 
 class FileClientBindings {
@@ -98,6 +101,7 @@ class FileClientBindings {
   late final _FreeDart _free;
   late final _GetHashesJsonDart _getHashesJson;
   late final _FreeStringDart _freeString;
+  late final _GetLastErrorDart _getLastError;
 
   static FileClientBindings? _instance;
 
@@ -136,6 +140,10 @@ class FileClientBindings {
     _freeString = lib
         .lookup<NativeFunction<_FreeStringNative>>('haven_free_string')
         .asFunction<_FreeStringDart>();
+
+    _getLastError = lib
+        .lookup<NativeFunction<_GetLastErrorNative>>('haven_get_last_error')
+        .asFunction<_GetLastErrorDart>();
   }
 
   static DynamicLibrary _loadLibrary() {
@@ -230,6 +238,17 @@ class FileClientBindings {
   /// pass 1 (hashing) is complete, or null if not ready yet.
   String? getUploadHashesJson(Pointer<Void> handle) {
     final ptr = _getHashesJson(handle);
+    if (ptr == nullptr) return null;
+    try {
+      return ptr.toDartString();
+    } finally {
+      _freeString(ptr);
+    }
+  }
+
+  /// Returns the last error message from the native transfer, or null if no error.
+  String? getLastError(Pointer<Void> handle) {
+    final ptr = _getLastError(handle);
     if (ptr == nullptr) return null;
     try {
       return ptr.toDartString();

@@ -311,6 +311,124 @@ pub async fn upload_data(
     Ok(StatusCode::OK)
 }
 
+/// PUT /transfers/{id}/chunks/{index} — upload a single chunk (parallel-safe).
+///
+/// Idempotent: if the chunk is already received, returns 200 immediately.
+/// Optimized hot path: single JOIN query, direct file I/O (no SHA-256 re-check),
+/// no bytes_received update (set only on completion).
+pub async fn upload_chunk(
+    State(state): State<AppState>,
+    Path((transfer_id, chunk_index)): Path<(String, i64)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, StatusCode> {
+    let claims = extract_claims(&headers, &state.jwt_secret)?;
+
+    // Single JOIN query: transfer auth/status + chunk metadata in one round-trip
+    let (uploader_id, current_status, offset, byte_length, already_received): (String, String, u64, u64, bool) = state
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT t.uploader_id, t.status, c.byte_offset, c.byte_length, c.received
+                 FROM transfers t
+                 JOIN chunks c ON c.transfer_id = t.id
+                 WHERE t.id = ?1 AND c.chunk_index = ?2",
+                rusqlite::params![&transfer_id, chunk_index],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)? as u64,
+                        row.get::<_, i64>(3)? as u64,
+                        row.get::<_, bool>(4)?,
+                    ))
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("Transfer or chunk not found"))
+        })
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    if uploader_id != claims.sub {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if current_status != "uploading" {
+        return Err(StatusCode::CONFLICT);
+    }
+
+    // Idempotent: already received -> 200
+    if already_received {
+        return Ok(StatusCode::OK);
+    }
+
+    // Validate body length matches expected chunk size
+    if body.len() as u64 != byte_length {
+        warn!(
+            "Chunk {} body length {} != expected {}",
+            chunk_index,
+            body.len(),
+            byte_length
+        );
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Write directly to pre-allocated file — no SHA-256 re-verification, no flush.
+    // Client already verified chunk hashes during encryption pass.
+    {
+        let path = state.storage.file_path(&transfer_id);
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .await
+            .map_err(|e| {
+                warn!("Failed to open file for chunk {}: {}", chunk_index, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|e| {
+                warn!("Failed to seek for chunk {}: {}", chunk_index, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        file.write_all(&body).await.map_err(|e| {
+            warn!("Failed to write chunk {}: {}", chunk_index, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        // No flush — OS page cache coalesces writes for pre-allocated file
+    }
+
+    // Mark chunk received + check completion (2 ops, no bytes_received update)
+    let tid = transfer_id.clone();
+    state
+        .db
+        .with_conn_mut(move |conn| {
+            conn.execute(
+                "UPDATE chunks SET received = 1 WHERE transfer_id = ?1 AND chunk_index = ?2",
+                rusqlite::params![&tid, chunk_index],
+            )?;
+
+            let unreceived: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM chunks WHERE transfer_id = ?1 AND received = 0",
+                [&tid],
+                |r| r.get(0),
+            )?;
+            if unreceived == 0 {
+                conn.execute(
+                    "UPDATE transfers SET status = 'complete', bytes_received = file_size WHERE id = ?1",
+                    [&tid],
+                )?;
+            }
+
+            Ok(())
+        })
+        .map_err(|e| {
+            warn!("DB update failed for chunk {}: {}", chunk_index, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(StatusCode::OK)
+}
+
 /// GET /transfers/{id}/data — streaming download.
 ///
 /// Supports HTTP Range header for resume. Serves bytes up to `bytes_received`,

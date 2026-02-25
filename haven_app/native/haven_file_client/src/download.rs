@@ -17,6 +17,8 @@ pub struct DownloadProgress {
     pub bytes_total: AtomicU64,
     pub state: AtomicU8,
     pub cancelled: AtomicU8,
+    /// Last error message, readable from FFI after STATE_ERROR.
+    pub last_error: std::sync::Mutex<Option<String>>,
 }
 
 impl DownloadProgress {
@@ -26,6 +28,7 @@ impl DownloadProgress {
             bytes_total: AtomicU64::new(0),
             state: AtomicU8::new(STATE_IDLE),
             cancelled: AtomicU8::new(0),
+            last_error: std::sync::Mutex::new(None),
         }
     }
 
@@ -52,10 +55,25 @@ pub async fn download_file(
     chunk_hashes: &[String],
     progress: Arc<DownloadProgress>,
 ) -> Result<(), String> {
+    // Validate inputs before doing anything
+    if chunk_hashes.is_empty() {
+        return Err("Download failed: chunk_hashes is empty (offer data missing or corrupted)".into());
+    }
+
     let key = derive_key(master_key, salt);
     let client = Client::new();
 
     progress.state.store(STATE_DOWNLOADING, Ordering::Relaxed);
+
+    // Ensure the parent directory of save_path exists.
+    // FilePicker may return a path whose parent hasn't been created yet.
+    if let Some(parent) = std::path::Path::new(save_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| format!("Cannot create download directory '{}': {}", parent.display(), e))?;
+        }
+    }
 
     // GET the streaming download
     let resp = client
@@ -78,7 +96,7 @@ pub async fn download_file(
     // Create output file
     let mut output_file = tokio::fs::File::create(save_path)
         .await
-        .map_err(|e| format!("Cannot create output file: {}", e))?;
+        .map_err(|e| format!("Cannot create output file '{}': {}", save_path, e))?;
 
     // Stream the response body, splitting into encrypted chunks
     let mut stream = resp.bytes_stream();

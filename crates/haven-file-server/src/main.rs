@@ -84,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/transfers", post(routes::create_transfer))
         .route("/transfers/{id}/data", put(routes::upload_data))
+        .route("/transfers/{id}/chunks/{index}", put(routes::upload_chunk))
         .route("/transfers/{id}/data", get(routes::download_data))
         .route("/transfers/{id}", get(routes::get_transfer_status))
         .route("/transfers/{id}/confirm", post(routes::confirm_transfer))

@@ -34,6 +34,8 @@ class FileTransfer {
   bool offerSent = false;
   // For uploads: true once FileUploadCompleteSend has been dispatched
   bool uploadCompleteSent = false;
+  // For error reporting: true once we've logged the error from the DLL
+  bool errorLogged = false;
 
   FileTransfer({
     required this.transferId,
@@ -77,6 +79,9 @@ class FileTransferService {
   final String Function() _getToken;
   final String Function() _getServerUrl;
 
+  /// Cached result of localhost reachability check. Null = not yet checked.
+  String? _cachedUploadBaseUrl;
+
   FileClientBindings? _bindings;
   final _dio = Dio();
   final Map<String, Timer> _pollTimers = {};
@@ -85,11 +90,14 @@ class FileTransferService {
     if (_bindings != null) return _bindings;
     try {
       _bindings = FileClientBindings();
+      _log('INFO', 'FileClientBindings loaded successfully');
       return _bindings;
-    } catch (_) {
+    } catch (e) {
+      _log('ERROR', 'FileClientBindings failed to load: $e');
       return null;
     }
   }
+
   final Map<String, FileTransfer> _transfers = {};
   final Map<String, _PendingDownload> _pendingDownloads = {};
   final _uuid = const Uuid();
@@ -113,6 +121,13 @@ class FileTransferService {
 
   Map<String, FileTransfer> get transfers => Map.unmodifiable(_transfers);
 
+  void _log(String level, String message) {
+    _gateway.send({
+      'type': 'LogSend',
+      'data': {'level': level, 'tag': 'FileTransfer', 'message': message},
+    });
+  }
+
   /// Offer to send a file to a peer. Returns the transfer ID.
   String offerFile({
     required String filePath,
@@ -123,6 +138,7 @@ class FileTransferService {
     required String salt,
   }) {
     final transferId = _uuid.v4();
+    _log('INFO', 'offerFile: file=$filename size=$fileSize target=$targetUserId transfer=$transferId');
 
     final transfer = FileTransfer(
       transferId: transferId,
@@ -133,9 +149,6 @@ class FileTransferService {
     );
     _transfers[transferId] = transfer;
 
-    // Start hashing immediately. The offer is sent AFTER pass 1 completes
-    // (detected in _pollProgress) so we can include file_sha256 and chunk_hashes.
-    // The receiver will then be able to start downloading in parallel with the upload.
     _startUpload(transfer, filePath, masterKey, salt);
 
     return transferId;
@@ -144,16 +157,18 @@ class FileTransferService {
   /// Accept a file offer — start downloading.
   void acceptOffer(String transferId, String savePath, String masterKey, String salt) {
     final transfer = _transfers[transferId];
-    if (transfer == null) return;
+    if (transfer == null) {
+      _log('ERROR', 'acceptOffer: transfer $transferId not found');
+      return;
+    }
 
-    // Mark as waiting for download so it moves out of pendingOffers
+    _log('INFO', 'acceptOffer: transfer=$transferId file=${transfer.filename} savePath=$savePath serverUrl=${transfer.fileServerUrl} sha256=${transfer.fileSha256} chunks=${transfer.chunkHashes?.length}');
+
     transfer.state = TransferState.hashing;
     transfer.bytesTotal = transfer.fileSize;
 
-    // Stash save info for when FileReady arrives
     _pendingDownloads[transferId] = _PendingDownload(savePath, masterKey, salt);
 
-    // Send accept via WebSocket
     _gateway.send({
       'type': 'FileAcceptSend',
       'data': {
@@ -162,8 +177,6 @@ class FileTransferService {
       },
     });
 
-    // Poll the file server every 5 seconds as a fallback in case FileReady
-    // is never received (e.g. sender's WebSocket dropped during upload).
     _startStatusPolling(transferId);
 
     onProgressUpdate?.call();
@@ -173,6 +186,8 @@ class FileTransferService {
   void rejectOffer(String transferId) {
     final transfer = _transfers[transferId];
     if (transfer == null) return;
+
+    _log('INFO', 'rejectOffer: transfer=$transferId');
 
     _gateway.send({
       'type': 'FileRejectSend',
@@ -189,6 +204,8 @@ class FileTransferService {
   void cancelTransfer(String transferId) {
     final transfer = _transfers[transferId];
     if (transfer == null) return;
+
+    _log('INFO', 'cancelTransfer: transfer=$transferId');
 
     if (transfer.nativeHandle != null) {
       _getBindings()?.cancel(transfer.nativeHandle!);
@@ -235,7 +252,6 @@ class FileTransferService {
       _pollTimers.remove(transferId);
       return;
     }
-    // Already started downloading
     if (transfer.nativeHandle != null) {
       _pollTimers[transferId]?.cancel();
       _pollTimers.remove(transferId);
@@ -244,6 +260,7 @@ class FileTransferService {
 
     try {
       final serverUrl = transfer.fileServerUrl ?? _getServerUrl();
+      _log('DEBUG', 'pollTransferStatus: transfer=$transferId url=$serverUrl');
       final resp = await _dio.get(
         '$serverUrl/transfers/$transferId',
         options: Options(
@@ -254,6 +271,7 @@ class FileTransferService {
       if (resp.statusCode == 200) {
         final data = resp.data as Map<String, dynamic>;
         final status = data['status'] as String?;
+        _log('INFO', 'pollTransferStatus: transfer=$transferId status=$status');
         if (status == 'complete') {
           _pollTimers[transferId]?.cancel();
           _pollTimers.remove(transferId);
@@ -262,20 +280,49 @@ class FileTransferService {
               transfer.fileSha256 != null &&
               transfer.chunkHashes != null) {
             _startDownload(transfer, p.savePath, p.masterKey, p.salt);
+          } else {
+            _log('ERROR', 'pollTransferStatus: transfer=$transferId complete but missing hashes or pending (sha256=${transfer.fileSha256}, chunks=${transfer.chunkHashes?.length}, pending=${p != null})');
           }
         }
       }
-    } catch (_) {
-      // Network error — try again next tick
+    } catch (e) {
+      _log('WARN', 'pollTransferStatus: transfer=$transferId error=$e');
     }
   }
 
   // ── Private methods ──────────────────────────────────────────────────
 
+  void _warmLocalhostCache(String configuredUrl) {
+    if (_cachedUploadBaseUrl != null) return;
+    final uri = Uri.parse(configuredUrl);
+    final localUrl = uri.replace(host: '127.0.0.1').toString();
+    _dio.get(
+      uri.replace(host: '127.0.0.1', path: '/health').toString(),
+      options: Options(
+        receiveTimeout: const Duration(milliseconds: 800),
+        sendTimeout: const Duration(milliseconds: 800),
+      ),
+    ).then((_) {
+      _cachedUploadBaseUrl = localUrl;
+      _log('INFO', 'localhost cache: using 127.0.0.1 ($localUrl)');
+    }).catchError((_) {
+      _cachedUploadBaseUrl = configuredUrl;
+      _log('INFO', 'localhost cache: 127.0.0.1 unreachable, using $configuredUrl');
+    });
+  }
+
   void _startUpload(FileTransfer transfer, String filePath, String masterKey, String salt) {
     final bindings = _getBindings();
-    if (bindings == null) return;
-    final serverUrl = transfer.fileServerUrl ?? _getServerUrl();
+    if (bindings == null) {
+      _log('ERROR', '_startUpload: bindings null (DLL failed to load) transfer=${transfer.transferId}');
+      return;
+    }
+    final configuredUrl = transfer.fileServerUrl ?? _getServerUrl();
+    final serverUrl = _cachedUploadBaseUrl ?? configuredUrl;
+    _warmLocalhostCache(configuredUrl);
+
+    _log('INFO', '_startUpload: transfer=${transfer.transferId} file=$filePath server=$serverUrl');
+
     final handle = bindings.uploadFile(
       filePath: filePath,
       serverUrl: serverUrl,
@@ -285,15 +332,22 @@ class FileTransferService {
       salt: salt,
     );
     transfer.nativeHandle = handle;
+    _log('INFO', '_startUpload: native handle obtained transfer=${transfer.transferId}');
     _startProgressPolling();
   }
 
   void _startDownload(FileTransfer transfer, String savePath, String masterKey, String salt) {
     final bindings = _getBindings();
-    if (bindings == null) return;
+    if (bindings == null) {
+      _log('ERROR', '_startDownload: bindings null transfer=${transfer.transferId}');
+      return;
+    }
     final serverUrl = transfer.fileServerUrl?.isNotEmpty == true
         ? transfer.fileServerUrl!
         : _getServerUrl();
+
+    _log('INFO', '_startDownload: transfer=${transfer.transferId} savePath=$savePath server=$serverUrl sha256=${transfer.fileSha256} chunks=${transfer.chunkHashes?.length}');
+
     final handle = bindings.downloadFile(
       savePath: savePath,
       serverUrl: serverUrl,
@@ -305,6 +359,7 @@ class FileTransferService {
       chunkHashesJson: jsonEncode(transfer.chunkHashes!),
     );
     transfer.nativeHandle = handle;
+    _log('INFO', '_startDownload: native handle obtained transfer=${transfer.transferId}');
     _startProgressPolling();
   }
 
@@ -329,13 +384,18 @@ class FileTransferService {
       final bindings = _getBindings();
       if (bindings == null) continue;
       final result = bindings.getProgress(transfer.nativeHandle!);
+      final prevState = transfer.state;
       transfer.bytesDone = result.bytesDone;
       transfer.bytesTotal = result.bytesTotal;
       transfer.state = result.state;
 
+      // Log state transitions
+      if (transfer.state != prevState) {
+        _log('INFO', 'state transition: transfer=${transfer.transferId} ${_stateName(prevState)}->${_stateName(transfer.state)} done=${transfer.bytesDone} total=${transfer.bytesTotal}');
+      }
+
       // When pass 1 (hashing) completes and pass 2 (upload) starts,
       // read the computed hashes and send the offer to the receiver.
-      // This lets the receiver start downloading in parallel with our upload.
       if (transfer.isUpload &&
           !transfer.offerSent &&
           transfer.state == TransferState.transferring) {
@@ -346,6 +406,7 @@ class FileTransferService {
           transfer.chunkHashes =
               (data['chunk_hashes'] as List<dynamic>).map((e) => e as String).toList();
           transfer.offerSent = true;
+          _log('INFO', 'hashing complete: transfer=${transfer.transferId} sha256=${transfer.fileSha256} chunks=${transfer.chunkHashes?.length} — sending FileOfferSend');
           _gateway.send({
             'type': 'FileOfferSend',
             'data': {
@@ -357,6 +418,8 @@ class FileTransferService {
               'chunk_hashes': transfer.chunkHashes,
             },
           });
+        } else {
+          _log('WARN', 'state=transferring but getUploadHashesJson returned null: transfer=${transfer.transferId}');
         }
       }
 
@@ -366,7 +429,7 @@ class FileTransferService {
           transfer.fileSha256 != null &&
           transfer.chunkHashes != null) {
         transfer.uploadCompleteSent = true;
-        // Notify receiver that upload is complete (triggers FileReady at receiver)
+        _log('INFO', 'upload complete: transfer=${transfer.transferId} — sending FileUploadCompleteSend');
         _gateway.send({
           'type': 'FileUploadCompleteSend',
           'data': {
@@ -376,6 +439,13 @@ class FileTransferService {
             'chunk_hashes': transfer.chunkHashes,
           },
         });
+      }
+
+      // Log error with DLL error message
+      if (transfer.state == TransferState.error && !transfer.errorLogged) {
+        transfer.errorLogged = true;
+        final errMsg = bindings.getLastError(transfer.nativeHandle!);
+        _log('ERROR', 'transfer error: transfer=${transfer.transferId} isUpload=${transfer.isUpload} dllError=$errMsg done=${transfer.bytesDone} total=${transfer.bytesTotal}');
       }
 
       if (transfer.state != TransferState.complete &&
@@ -393,35 +463,59 @@ class FileTransferService {
     }
   }
 
+  String _stateName(int s) {
+    switch (s) {
+      case TransferState.idle: return 'idle';
+      case TransferState.hashing: return 'hashing';
+      case TransferState.transferring: return 'transferring';
+      case TransferState.complete: return 'complete';
+      case TransferState.error: return 'error';
+      case TransferState.cancelled: return 'cancelled';
+      default: return 'unknown($s)';
+    }
+  }
+
   // ── Gateway event handlers ───────────────────────────────────────────
 
   void _handleFileOffer(Map<String, dynamic> event) {
     final data = event['data'] as Map<String, dynamic>;
     final transferId = data['transfer_id'] as String;
+    final filename = data['filename'] as String;
+    final size = data['size'] as int;
+    final fromUserId = data['from_user_id'] as String;
+    final fileServerUrl = data['file_server_url'] as String?;
+    final fileSha256 = data['file_sha256'] as String?;
+    final chunkHashes = (data['chunk_hashes'] as List<dynamic>?)
+        ?.map((e) => e as String)
+        .toList();
+
+    _log('INFO', '_handleFileOffer: transfer=$transferId file=$filename size=$size from=$fromUserId serverUrl=$fileServerUrl sha256=$fileSha256 chunks=${chunkHashes?.length}');
+
     final transfer = FileTransfer(
       transferId: transferId,
-      filename: data['filename'] as String,
-      fileSize: data['size'] as int,
+      filename: filename,
+      fileSize: size,
       isUpload: false,
-      fromUserId: data['from_user_id'] as String,
-      fileServerUrl: data['file_server_url'] as String?,
-      fileSha256: data['file_sha256'] as String?,
-      chunkHashes: (data['chunk_hashes'] as List<dynamic>?)
-          ?.map((e) => e as String)
-          .toList(),
+      fromUserId: fromUserId,
+      fileServerUrl: fileServerUrl,
+      fileSha256: fileSha256,
+      chunkHashes: chunkHashes,
     );
     _transfers[transferId] = transfer;
     onProgressUpdate?.call();
   }
 
   void _handleFileAccept(Map<String, dynamic> event) {
-    // Receiver accepted — upload should already be in progress
+    final data = event['data'] as Map<String, dynamic>? ?? {};
+    final transferId = data['transfer_id'] as String? ?? '?';
+    _log('INFO', '_handleFileAccept: transfer=$transferId — receiver accepted');
     onProgressUpdate?.call();
   }
 
   void _handleFileReject(Map<String, dynamic> event) {
     final data = event['data'] as Map<String, dynamic>;
     final transferId = data['transfer_id'] as String;
+    _log('INFO', '_handleFileReject: transfer=$transferId — receiver rejected');
     final transfer = _transfers[transferId];
     if (transfer != null) {
       cancelTransfer(transferId);
@@ -432,29 +526,32 @@ class FileTransferService {
     final data = event['data'] as Map<String, dynamic>;
     final transferId = data['transfer_id'] as String;
     final transfer = _transfers[transferId];
-    if (transfer == null || transfer.isUpload) return;
 
-    // FileReady carries the file server URL and (on new server) the hashes.
-    // Only update fileServerUrl if the new value is non-null and non-empty
-    // to avoid overwriting a good URL with an empty/null one.
+    _log('INFO', '_handleFileReady: transfer=$transferId fileServerUrl=${data['file_server_url']} sha256=${data['file_sha256']} chunks=${(data['chunk_hashes'] as List<dynamic>?)?.length}');
+
+    if (transfer == null || transfer.isUpload) {
+      _log('WARN', '_handleFileReady: transfer=$transferId not found or is upload — ignoring');
+      return;
+    }
+
     final newUrl = data['file_server_url'] as String?;
     if (newUrl != null && newUrl.isNotEmpty) {
       transfer.fileServerUrl = newUrl;
     }
-    // Prefer values already set from the offer; fall back to FileReady values.
     transfer.fileSha256 ??= data['file_sha256'] as String?;
     if (transfer.chunkHashes == null) {
       final hashes = data['chunk_hashes'] as List<dynamic>?;
       transfer.chunkHashes = hashes?.map((e) => e as String).toList();
     }
 
-    // Start download if user already accepted (pending entry exists).
-    // fileServerUrl may be null — _startDownload falls back to _getServerUrl().
     final pending = _pendingDownloads.remove(transferId);
+    _log('INFO', '_handleFileReady: pending=${pending != null} sha256=${transfer.fileSha256} chunks=${transfer.chunkHashes?.length}');
     if (pending != null &&
         transfer.fileSha256 != null &&
         transfer.chunkHashes != null) {
       _startDownload(transfer, pending.savePath, pending.masterKey, pending.salt);
+    } else {
+      _log('WARN', '_handleFileReady: not starting download — pending=${pending != null} sha256=${transfer.fileSha256} chunks=${transfer.chunkHashes?.length}');
     }
 
     onProgressUpdate?.call();
