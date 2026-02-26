@@ -1,7 +1,7 @@
 name: haven_app
-description: "Haven 3.0 — Encrypted communication, reimagined."
+description: "Haven 4.0 — Encrypted communication, reimagined."
 publish_to: 'none'
-version: 3.2.0+9
+version: 4.0.0+10
 
 environment:
   sdk: ^3.11.0

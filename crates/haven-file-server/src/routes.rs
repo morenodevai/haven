@@ -22,6 +22,9 @@ pub struct AppState {
     pub storage: Arc<Storage>,
     pub jwt_secret: String,
     pub retention_hours: u64,
+    /// Pre-bound UDP socket for fast transfers (fixed port, bound at startup).
+    pub udp_socket: Arc<std::net::UdpSocket>,
+    pub udp_port: u16,
 }
 
 /// JWT claims — must match the messaging server's format.
@@ -62,7 +65,7 @@ pub struct TransferStatus {
 
 // ── Auth helper ─────────────────────────────────────────────────────────
 
-fn extract_claims(headers: &HeaderMap, jwt_secret: &str) -> Result<Claims, StatusCode> {
+pub fn extract_claims(headers: &HeaderMap, jwt_secret: &str) -> Result<Claims, StatusCode> {
     let auth_header = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -631,6 +634,33 @@ pub async fn health() -> &'static str {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
+
+/// GET /fast-transfer — WebSocket upgrade for UDP blast transfer control.
+///
+/// Clients connect here to initiate fast uploads/downloads.
+/// Auth via query parameter: `/fast-transfer?token=...`
+pub async fn fast_transfer_ws(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer_addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    ws: axum::extract::WebSocketUpgrade,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let token = params.get("token").ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let token_data = jsonwebtoken::decode::<Claims>(
+        token,
+        &jsonwebtoken::DecodingKey::from_secret(state.jwt_secret.as_bytes()),
+        &jsonwebtoken::Validation::default(),
+    )
+    .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    let claims = token_data.claims;
+    info!("Fast transfer WS upgrade: user={} peer={}", claims.username, peer_addr);
+
+    Ok(ws.on_upgrade(move |socket| {
+        crate::fast_transfer::handle_fast_transfer_ws(socket, state, claims, peer_addr)
+    }))
+}
 
 fn parse_range_start(headers: &HeaderMap) -> Option<u64> {
     let range = headers.get(header::RANGE)?.to_str().ok()?;

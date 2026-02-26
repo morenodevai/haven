@@ -7,6 +7,7 @@ import 'package:ffi/ffi.dart';
 ///
 /// Provides upload/download/cancel/progress functions that delegate to the
 /// Rust DLL for streaming HTTP file transfers with AES-256-GCM encryption.
+/// Also provides fast UDP blast transfer functions for high-speed LAN transfers.
 
 // ── Native struct ────────────────────────────────────────────────────────
 
@@ -91,6 +92,12 @@ typedef _FreeStringDart = void Function(Pointer<Utf8> ptr);
 typedef _GetLastErrorNative = Pointer<Utf8> Function(Pointer<Void> handle);
 typedef _GetLastErrorDart = Pointer<Utf8> Function(Pointer<Void> handle);
 
+// Fast transfer typedefs (same signatures as regular upload/download)
+typedef _FastUploadNative = _UploadFileNative;
+typedef _FastUploadDart = _UploadFileDart;
+typedef _FastDownloadNative = _DownloadFileNative;
+typedef _FastDownloadDart = _DownloadFileDart;
+
 // ── Bindings class ───────────────────────────────────────────────────────
 
 class FileClientBindings {
@@ -102,6 +109,10 @@ class FileClientBindings {
   late final _GetHashesJsonDart _getHashesJson;
   late final _FreeStringDart _freeString;
   late final _GetLastErrorDart _getLastError;
+
+  // Fast transfer functions
+  late final _FastUploadDart _fastUpload;
+  late final _FastDownloadDart _fastDownload;
 
   static FileClientBindings? _instance;
 
@@ -144,6 +155,15 @@ class FileClientBindings {
     _getLastError = lib
         .lookup<NativeFunction<_GetLastErrorNative>>('haven_get_last_error')
         .asFunction<_GetLastErrorDart>();
+
+    // Fast transfer bindings
+    _fastUpload = lib
+        .lookup<NativeFunction<_FastUploadNative>>('haven_fast_upload')
+        .asFunction<_FastUploadDart>();
+
+    _fastDownload = lib
+        .lookup<NativeFunction<_FastDownloadNative>>('haven_fast_download')
+        .asFunction<_FastDownloadDart>();
   }
 
   static DynamicLibrary _loadLibrary() {
@@ -210,6 +230,73 @@ class FileClientBindings {
 
     try {
       return _downloadFile(
+        pSavePath, pServerUrl, pTransferId, pJwtToken, pMasterKey, pSalt,
+        pFileSha256, pChunkHashes,
+      );
+    } finally {
+      calloc.free(pSavePath);
+      calloc.free(pServerUrl);
+      calloc.free(pTransferId);
+      calloc.free(pJwtToken);
+      calloc.free(pMasterKey);
+      calloc.free(pSalt);
+      calloc.free(pFileSha256);
+      calloc.free(pChunkHashes);
+    }
+  }
+
+  /// Start a fast UDP blast upload. Same interface as uploadFile.
+  Pointer<Void> fastUploadFile({
+    required String filePath,
+    required String serverUrl,
+    required String transferId,
+    required String jwtToken,
+    required String masterKey,
+    required String salt,
+  }) {
+    final pFilePath = filePath.toNativeUtf8();
+    final pServerUrl = serverUrl.toNativeUtf8();
+    final pTransferId = transferId.toNativeUtf8();
+    final pJwtToken = jwtToken.toNativeUtf8();
+    final pMasterKey = masterKey.toNativeUtf8();
+    final pSalt = salt.toNativeUtf8();
+
+    try {
+      return _fastUpload(
+        pFilePath, pServerUrl, pTransferId, pJwtToken, pMasterKey, pSalt,
+      );
+    } finally {
+      calloc.free(pFilePath);
+      calloc.free(pServerUrl);
+      calloc.free(pTransferId);
+      calloc.free(pJwtToken);
+      calloc.free(pMasterKey);
+      calloc.free(pSalt);
+    }
+  }
+
+  /// Start a fast UDP blast download. Same interface as downloadFile.
+  Pointer<Void> fastDownloadFile({
+    required String savePath,
+    required String serverUrl,
+    required String transferId,
+    required String jwtToken,
+    required String masterKey,
+    required String salt,
+    required String fileSha256,
+    required String chunkHashesJson,
+  }) {
+    final pSavePath = savePath.toNativeUtf8();
+    final pServerUrl = serverUrl.toNativeUtf8();
+    final pTransferId = transferId.toNativeUtf8();
+    final pJwtToken = jwtToken.toNativeUtf8();
+    final pMasterKey = masterKey.toNativeUtf8();
+    final pSalt = salt.toNativeUtf8();
+    final pFileSha256 = fileSha256.toNativeUtf8();
+    final pChunkHashes = chunkHashesJson.toNativeUtf8();
+
+    try {
+      return _fastDownload(
         pSavePath, pServerUrl, pTransferId, pJwtToken, pMasterKey, pSalt,
         pFileSha256, pChunkHashes,
       );

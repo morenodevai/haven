@@ -118,6 +118,7 @@ class FileTransferService {
     _gateway.on('FileAccept', _handleFileAccept);
     _gateway.on('FileReject', _handleFileReject);
     _gateway.on('FileReady', _handleFileReady);
+    _gateway.on('FastProgress', _handleFastProgress);
   }
 
   Map<String, FileTransfer> get transfers => Map.unmodifiable(_transfers);
@@ -317,38 +318,41 @@ class FileTransferService {
 
   // ── Private methods ──────────────────────────────────────────────────
 
-  void _warmLocalhostCache(String configuredUrl) {
-    if (_cachedUploadBaseUrl != null) return;
+  Future<String> _resolveServerUrl(String configuredUrl) async {
+    if (_cachedUploadBaseUrl != null) return _cachedUploadBaseUrl!;
     final uri = Uri.parse(configuredUrl);
     final localUrl = uri.replace(host: '127.0.0.1').toString();
-    _dio.get(
-      uri.replace(host: '127.0.0.1', path: '/health').toString(),
-      options: Options(
-        receiveTimeout: const Duration(milliseconds: 800),
-        sendTimeout: const Duration(milliseconds: 800),
-      ),
-    ).then((_) {
+    try {
+      await _dio.get(
+        uri.replace(host: '127.0.0.1', path: '/health').toString(),
+        options: Options(
+          receiveTimeout: const Duration(milliseconds: 800),
+          sendTimeout: const Duration(milliseconds: 800),
+        ),
+      );
       _cachedUploadBaseUrl = localUrl;
-      _log('INFO', 'localhost cache: using 127.0.0.1 ($localUrl)');
-    }).catchError((_) {
+      _log('INFO', 'server resolve: using 127.0.0.1 ($localUrl)');
+      return localUrl;
+    } catch (_) {
       _cachedUploadBaseUrl = configuredUrl;
-      _log('INFO', 'localhost cache: 127.0.0.1 unreachable, using $configuredUrl');
-    });
+      _log('INFO', 'server resolve: 127.0.0.1 unreachable, using $configuredUrl');
+      return configuredUrl;
+    }
   }
 
-  void _startUpload(FileTransfer transfer, String filePath, String masterKey, String salt) {
+  void _startUpload(FileTransfer transfer, String filePath, String masterKey, String salt) async {
     final bindings = _getBindings();
     if (bindings == null) {
       _log('ERROR', '_startUpload: bindings null (DLL failed to load) transfer=${transfer.transferId}');
       return;
     }
     final configuredUrl = transfer.fileServerUrl ?? _getServerUrl();
-    final serverUrl = _cachedUploadBaseUrl ?? configuredUrl;
-    _warmLocalhostCache(configuredUrl);
+    final serverUrl = await _resolveServerUrl(configuredUrl);
 
-    _log('INFO', '_startUpload: transfer=${transfer.transferId} file=$filePath server=$serverUrl');
+    _log('INFO', '_startUpload: transfer=${transfer.transferId} file=$filePath server=$serverUrl useFast=true');
 
-    final handle = bindings.uploadFile(
+    // Use fast UDP blast upload
+    final handle = bindings.fastUploadFile(
       filePath: filePath,
       serverUrl: serverUrl,
       transferId: transfer.transferId,
@@ -357,23 +361,25 @@ class FileTransferService {
       salt: salt,
     );
     transfer.nativeHandle = handle;
-    _log('INFO', '_startUpload: native handle obtained transfer=${transfer.transferId}');
+    _log('INFO', '_startUpload: fast upload handle obtained transfer=${transfer.transferId}');
     _startProgressPolling();
   }
 
-  void _startDownload(FileTransfer transfer, String savePath, String masterKey, String salt) {
+  void _startDownload(FileTransfer transfer, String savePath, String masterKey, String salt) async {
     final bindings = _getBindings();
     if (bindings == null) {
       _log('ERROR', '_startDownload: bindings null transfer=${transfer.transferId}');
       return;
     }
-    final serverUrl = transfer.fileServerUrl?.isNotEmpty == true
+    final configuredUrl = transfer.fileServerUrl?.isNotEmpty == true
         ? transfer.fileServerUrl!
         : _getServerUrl();
+    final serverUrl = await _resolveServerUrl(configuredUrl);
 
-    _log('INFO', '_startDownload: transfer=${transfer.transferId} savePath=$savePath server=$serverUrl sha256=${transfer.fileSha256} chunks=${transfer.chunkHashes?.length}');
+    _log('INFO', '_startDownload: transfer=${transfer.transferId} savePath=$savePath server=$serverUrl sha256=${transfer.fileSha256} chunks=${transfer.chunkHashes?.length} useFast=true');
 
-    final handle = bindings.downloadFile(
+    // Use fast UDP blast download
+    final handle = bindings.fastDownloadFile(
       savePath: savePath,
       serverUrl: serverUrl,
       transferId: transfer.transferId,
@@ -384,7 +390,7 @@ class FileTransferService {
       chunkHashesJson: jsonEncode(transfer.chunkHashes!),
     );
     transfer.nativeHandle = handle;
-    _log('INFO', '_startDownload: native handle obtained transfer=${transfer.transferId}');
+    _log('INFO', '_startDownload: fast download handle obtained transfer=${transfer.transferId}');
     _startProgressPolling();
   }
 
@@ -580,6 +586,24 @@ class FileTransferService {
     }
 
     onProgressUpdate?.call();
+  }
+
+  void _handleFastProgress(Map<String, dynamic> event) {
+    final data = event['data'] as Map<String, dynamic>;
+    final transferId = data['transfer_id'] as String;
+    final bytesDone = data['bytes_done'] as int? ?? 0;
+    final bytesTotal = data['bytes_total'] as int? ?? 0;
+
+    final transfer = _transfers[transferId];
+    if (transfer == null || transfer.isUpload) return;
+
+    // Update receiver's view of sender's upload progress
+    if (transfer.nativeHandle == null) {
+      // Download hasn't started yet — show sender's upload progress
+      transfer.bytesDone = bytesDone;
+      transfer.bytesTotal = bytesTotal;
+      onProgressUpdate?.call();
+    }
   }
 }
 

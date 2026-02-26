@@ -1,11 +1,13 @@
 mod cleanup;
 mod db;
+mod fast_transfer;
 mod routes;
 mod storage;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use socket2::{Domain, Protocol, Socket, Type};
 
 use axum::{Router, extract::DefaultBodyLimit, routing::{get, post, put, delete}};
 use axum::http::{Method, header::{AUTHORIZATION, CONTENT_TYPE, RANGE}};
@@ -30,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "haven_file_server=debug,tower_http=debug".into()),
+                .unwrap_or_else(|_| "haven_file_server=debug,haven_fast_transfer=info,tower_http=debug".into()),
         )
         .init();
 
@@ -62,6 +64,19 @@ async fn main() -> anyhow::Result<()> {
     let db = Arc::new(FileDb::open(&db_path)?);
     let storage = Arc::new(Storage::new(storage_dir).await?);
 
+    // Bind UDP on same port as HTTP (TCP and UDP don't conflict)
+    let udp_bind_addr: SocketAddr = format!("{}:{}", host, port).parse()?;
+    let udp_socket = {
+        let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        sock.set_recv_buffer_size(32 * 1024 * 1024)?;
+        sock.set_nonblocking(false)?;
+        sock.set_read_timeout(Some(std::time::Duration::from_millis(100)))?;
+        sock.bind(&udp_bind_addr.into())?;
+        let std_sock: std::net::UdpSocket = sock.into();
+        Arc::new(std_sock)
+    };
+    info!("UDP fast transfer socket bound on {}", udp_bind_addr);
+
     // Background cleanup task (runs every hour)
     let cleanup_db = db.clone();
     let cleanup_storage = storage.clone();
@@ -72,6 +87,8 @@ async fn main() -> anyhow::Result<()> {
         storage,
         jwt_secret,
         retention_hours,
+        udp_socket,
+        udp_port: port,
     };
 
     // CORS — permissive for file server (clients connect from various origins)
@@ -89,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/transfers/{id}", get(routes::get_transfer_status))
         .route("/transfers/{id}/confirm", post(routes::confirm_transfer))
         .route("/transfers/{id}", delete(routes::delete_transfer))
+        .route("/fast-transfer", get(routes::fast_transfer_ws))
         .route("/health", get(routes::health))
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024 * 1024)) // 4 GB max
         .layer(cors)
@@ -101,9 +119,12 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     Ok(())
 }

@@ -289,6 +289,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -525,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "haven-api"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -549,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "haven-crypto"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -561,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "haven-db"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -569,16 +584,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "haven-fast-transfer"
+version = "4.0.0"
+dependencies = [
+ "aes-gcm",
+ "bytes",
+ "crossbeam-channel",
+ "hex",
+ "sha2",
+ "socket2 0.5.10",
+ "tracing",
+]
+
+[[package]]
 name = "haven-file-server"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "async-stream",
  "axum",
  "bytes",
  "chrono",
+ "crossbeam-channel",
  "dotenvy",
  "futures-util",
+ "haven-fast-transfer",
  "haven-types",
  "hex",
  "http-body-util",
@@ -587,6 +617,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "socket2 0.5.10",
  "tokio",
  "tokio-util",
  "tower",
@@ -598,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "haven-gateway"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -617,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "haven-server"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -639,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "haven-types"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "chrono",
  "serde",

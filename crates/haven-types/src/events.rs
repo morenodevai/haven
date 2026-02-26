@@ -139,6 +139,49 @@ pub enum GatewayEvent {
         chunk_hashes: Option<Vec<String>>,
     },
 
+    // ── Fast Transfer (UDP blast) events ──────────────────────────────
+
+    /// File server tells sender it's ready to receive UDP blast
+    FastUploadReady {
+        transfer_id: String,
+        udp_port: u16,
+    },
+
+    /// File server requests retransmit of missing frames
+    FastNack {
+        transfer_id: String,
+        chunk_idx: u32,
+        missing_frames: Vec<u16>,
+    },
+
+    /// File server confirms a chunk was received and verified
+    FastChunkAck {
+        transfer_id: String,
+        chunk_idx: u32,
+    },
+
+    /// File server confirms all chunks received — upload complete
+    FastUploadDone {
+        transfer_id: String,
+    },
+
+    /// File server tells receiver it's ready to blast
+    FastDownloadReady {
+        transfer_id: String,
+    },
+
+    /// File server confirms all chunks sent to receiver — download complete
+    FastDownloadDone {
+        transfer_id: String,
+    },
+
+    /// Sender relays upload progress to receiver (via gateway)
+    FastProgress {
+        from_user_id: Uuid,
+        transfer_id: String,
+        bytes_done: u64,
+        bytes_total: u64,
+    },
 }
 
 impl GatewayEvent {
@@ -265,6 +308,39 @@ pub enum GatewayCommand {
         reason: String,
     },
 
+    // ── Fast Transfer (UDP blast) commands ────────────────────────────
+
+    /// Sender tells file server to prepare for UDP blast upload
+    FastUploadStart {
+        transfer_id: String,
+        file_size: u64,
+        chunk_count: u32,
+        chunk_size: u64,
+        chunk_hashes: Vec<String>,
+        file_sha256: String,
+    },
+
+    /// Sender retransmits specific frames (response to FastNack, handled natively)
+    /// This command is used by the sender to send NACKs TO the file server
+    FastNackSend {
+        transfer_id: String,
+        chunk_idx: u32,
+        missing_frames: Vec<u16>,
+    },
+
+    /// Receiver tells file server to start blasting download
+    FastDownloadStart {
+        transfer_id: String,
+        udp_port: u16,
+    },
+
+    /// Sender relays upload progress to receiver via gateway
+    FastProgressSend {
+        target_user_id: Uuid,
+        transfer_id: String,
+        bytes_done: u64,
+        bytes_total: u64,
+    },
 }
 
 /// WebRTC signaling payload relayed between peers.

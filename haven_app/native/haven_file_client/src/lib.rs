@@ -2,6 +2,8 @@
 
 pub mod crypto;
 pub mod download;
+pub mod fast_download;
+pub mod fast_upload;
 pub mod upload;
 
 use std::ffi::CStr;
@@ -321,6 +323,139 @@ pub unsafe extern "C" fn haven_upload_hashes_json(handle: Handle) -> *mut std::o
         }
         _ => std::ptr::null_mut(),
     }
+}
+
+// ── Fast transfer FFI exports ──────────────────────────────────────────
+
+/// Start a fast UDP blast upload. Returns a handle for progress polling.
+///
+/// # Safety
+/// All string pointers must be valid null-terminated UTF-8 C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn haven_fast_upload(
+    file_path: *const c_char,
+    server_url: *const c_char,
+    transfer_id: *const c_char,
+    jwt_token: *const c_char,
+    master_key: *const c_char,
+    salt: *const c_char,
+) -> Handle {
+    let file_path = unsafe { cstr_to_str(file_path) }.to_string();
+    let server_url = unsafe { cstr_to_str(server_url) }.to_string();
+    let transfer_id = unsafe { cstr_to_str(transfer_id) }.to_string();
+    let jwt_token = unsafe { cstr_to_str(jwt_token) }.to_string();
+    let master_key = unsafe { cstr_to_bytes(master_key) }.to_vec();
+    let salt = unsafe { cstr_to_bytes(salt) }.to_vec();
+
+    let progress = Arc::new(UploadProgress::new());
+    let progress_clone = progress.clone();
+
+    let handle = Box::new(TransferHandle::Upload(progress));
+    let handle_ptr = Box::into_raw(handle);
+
+    let rt = get_or_create_runtime();
+    rt.spawn(async move {
+        let result = fast_upload::fast_upload_file(
+            &file_path,
+            &server_url,
+            &transfer_id,
+            &jwt_token,
+            &master_key,
+            &salt,
+            progress_clone.clone(),
+        )
+        .await;
+
+        if let Err(e) = result {
+            eprintln!("Fast upload error: {}", e);
+            *progress_clone.last_error.lock().unwrap() = Some(e);
+            let cur = progress_clone.state.load(std::sync::atomic::Ordering::Relaxed);
+            if cur != upload::STATE_COMPLETE && cur != upload::STATE_CANCELLED {
+                progress_clone.state.store(upload::STATE_ERROR, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    });
+
+    handle_ptr
+}
+
+/// Start a fast UDP blast download. Returns a handle for progress polling.
+///
+/// # Safety
+/// All string pointers must be valid null-terminated UTF-8 C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn haven_fast_download(
+    save_path: *const c_char,
+    server_url: *const c_char,
+    transfer_id: *const c_char,
+    jwt_token: *const c_char,
+    master_key: *const c_char,
+    salt: *const c_char,
+    file_sha256: *const c_char,
+    chunk_hashes_json: *const c_char,
+) -> Handle {
+    let save_path = unsafe { cstr_to_str(save_path) }.to_string();
+    let server_url = unsafe { cstr_to_str(server_url) }.to_string();
+    let transfer_id = unsafe { cstr_to_str(transfer_id) }.to_string();
+    let jwt_token = unsafe { cstr_to_str(jwt_token) }.to_string();
+    let master_key = unsafe { cstr_to_bytes(master_key) }.to_vec();
+    let salt = unsafe { cstr_to_bytes(salt) }.to_vec();
+    let file_sha256 = unsafe { cstr_to_str(file_sha256) }.to_string();
+    let hashes_json = unsafe { cstr_to_str(chunk_hashes_json) }.to_string();
+
+    let chunk_hashes: Vec<String> = match serde_json::from_str(&hashes_json) {
+        Ok(v) => v,
+        Err(e) => {
+            let progress = Arc::new(DownloadProgress::new());
+            let err_msg = format!("Failed to parse chunk_hashes: {}", e);
+            eprintln!("Fast download error: {}", err_msg);
+            *progress.last_error.lock().unwrap() = Some(err_msg);
+            progress.state.store(upload::STATE_ERROR, Ordering::Relaxed);
+            let handle = Box::new(TransferHandle::Download(progress));
+            return Box::into_raw(handle);
+        }
+    };
+
+    if chunk_hashes.is_empty() || file_sha256.is_empty() {
+        let progress = Arc::new(DownloadProgress::new());
+        *progress.last_error.lock().unwrap() = Some("Empty hashes or sha256".into());
+        progress.state.store(upload::STATE_ERROR, Ordering::Relaxed);
+        let handle = Box::new(TransferHandle::Download(progress));
+        return Box::into_raw(handle);
+    }
+
+    let progress = Arc::new(DownloadProgress::new());
+    let progress_clone = progress.clone();
+
+    let handle = Box::new(TransferHandle::Download(progress));
+    let handle_ptr = Box::into_raw(handle);
+
+    let rt = get_or_create_runtime();
+    rt.spawn(async move {
+        let result = fast_download::fast_download_file(
+            &save_path,
+            &server_url,
+            &transfer_id,
+            &jwt_token,
+            &master_key,
+            &salt,
+            &file_sha256,
+            &chunk_hashes,
+            progress_clone.clone(),
+        )
+        .await;
+
+        if let Err(e) = result {
+            eprintln!("Fast download error: {}", e);
+            *progress_clone.last_error.lock().unwrap() = Some(e);
+            let cur = progress_clone.state.load(std::sync::atomic::Ordering::Relaxed);
+            if cur != upload::STATE_COMPLETE && cur != upload::STATE_CANCELLED {
+                progress_clone.state.store(upload::STATE_ERROR, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    });
+
+    handle_ptr
 }
 
 /// Free a C string returned by `haven_upload_hashes_json` or `haven_get_last_error`.

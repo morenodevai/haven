@@ -624,6 +624,37 @@ async fn handle_command(
             );
         }
 
+        GatewayCommand::FastUploadStart { .. }
+        | GatewayCommand::FastNackSend { .. }
+        | GatewayCommand::FastDownloadStart { .. } => {
+            // These are handled by the file server's WebSocket, not the gateway.
+            // If they arrive here, it means the client sent them to the wrong endpoint.
+            warn!(
+                "{} ({}) received Fast* command on gateway WS — should go to file server",
+                username, user_id
+            );
+        }
+
+        GatewayCommand::FastProgressSend {
+            target_user_id,
+            transfer_id,
+            bytes_done,
+            bytes_total,
+        } => {
+            // Relay upload progress from sender to receiver
+            dispatcher
+                .send_to_user(
+                    target_user_id,
+                    GatewayEvent::FastProgress {
+                        from_user_id: user_id,
+                        transfer_id,
+                        bytes_done,
+                        bytes_total,
+                    },
+                )
+                .await;
+        }
+
     }
 }
 

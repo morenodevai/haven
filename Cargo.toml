@@ -9,10 +9,11 @@ members = [
     "crates/haven-db",
     "crates/haven-types",
     "crates/haven-file-server",
+    "crates/haven-fast-transfer",
 ]
 
 [workspace.package]
-version = "3.0.0"
+version = "4.0.0"
 edition = "2024"
 license = "MIT"
 
@@ -78,9 +79,16 @@ async-stream = "0.3"
 http-body-util = "0.1"
 futures-util = "0.3"
 
+# Concurrency
+crossbeam-channel = "0.5"
+
+# Encryption
+aes-gcm = "0.10"
+
 # Workspace crates
 haven-api = { path = "crates/haven-api" }
 haven-crypto = { path = "crates/haven-crypto" }
 haven-db = { path = "crates/haven-db" }
+haven-fast-transfer = { path = "crates/haven-fast-transfer" }
 haven-gateway = { path = "crates/haven-gateway" }
 haven-types = { path = "crates/haven-types" }

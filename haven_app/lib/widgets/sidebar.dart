@@ -60,7 +60,7 @@ class Sidebar extends ConsumerWidget {
                 ),
                 const Spacer(),
                 Text(
-                  'v3.2.0',
+                  'v4.0.0',
                   style: TextStyle(
                     fontSize: 12,
                     color: HavenTheme.textMuted,

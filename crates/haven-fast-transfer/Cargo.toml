@@ -1,0 +1,13 @@
+[package]
+name = "haven-fast-transfer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+crossbeam-channel = { workspace = true }
+aes-gcm = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+socket2 = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
