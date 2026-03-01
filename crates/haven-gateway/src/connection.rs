@@ -432,10 +432,12 @@ async fn handle_command(
             size,
             file_sha256,
             chunk_hashes,
+            folder_id,
         } => {
             info!(
-                "{} ({}) -> file offer to {} ({})",
-                username, user_id, target_user_id, filename
+                "{} ({}) -> file offer to {} ({}){}",
+                username, user_id, target_user_id, filename,
+                if folder_id.is_some() { " [folder]" } else { "" }
             );
             dispatcher
                 .send_to_user(
@@ -449,6 +451,7 @@ async fn handle_command(
                         chunk_hashes,
                         // Inject file server URL from server config
                         file_server_url: file_server_url.map(|s| s.to_string()),
+                        folder_id,
                     },
                 )
                 .await;
@@ -633,6 +636,72 @@ async fn handle_command(
                 "{} ({}) received Fast* command on gateway WS — should go to file server",
                 username, user_id
             );
+        }
+
+        GatewayCommand::FolderOfferSend {
+            target_user_id,
+            folder_id,
+            folder_name,
+            total_size,
+            file_count,
+            manifest,
+        } => {
+            info!(
+                "{} ({}) -> folder offer to {} ({}, {} files, {} bytes)",
+                username, user_id, target_user_id, folder_name, file_count, total_size
+            );
+            dispatcher
+                .send_to_user(
+                    target_user_id,
+                    GatewayEvent::FolderOffer {
+                        from_user_id: user_id,
+                        folder_id,
+                        folder_name,
+                        total_size,
+                        file_count,
+                        manifest,
+                        file_server_url: file_server_url.map(|s| s.to_string()),
+                    },
+                )
+                .await;
+        }
+
+        GatewayCommand::FolderAcceptSend {
+            target_user_id,
+            folder_id,
+        } => {
+            info!(
+                "{} ({}) -> folder accept to {} [folder={}]",
+                username, user_id, target_user_id, folder_id
+            );
+            dispatcher
+                .send_to_user(
+                    target_user_id,
+                    GatewayEvent::FolderAccept {
+                        from_user_id: user_id,
+                        folder_id,
+                    },
+                )
+                .await;
+        }
+
+        GatewayCommand::FolderRejectSend {
+            target_user_id,
+            folder_id,
+        } => {
+            info!(
+                "{} ({}) -> folder reject to {} [folder={}]",
+                username, user_id, target_user_id, folder_id
+            );
+            dispatcher
+                .send_to_user(
+                    target_user_id,
+                    GatewayEvent::FolderReject {
+                        from_user_id: user_id,
+                        folder_id,
+                    },
+                )
+                .await;
         }
 
         GatewayCommand::FastProgressSend {

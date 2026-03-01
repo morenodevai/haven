@@ -567,7 +567,7 @@ dependencies = [
 
 [[package]]
 name = "haven-api"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -591,7 +591,7 @@ dependencies = [
 
 [[package]]
 name = "haven-crypto"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -603,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "haven-db"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -612,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "haven-fast-transfer"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -625,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "haven-file-gateway"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -646,7 +646,7 @@ dependencies = [
 
 [[package]]
 name = "haven-file-server"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "haven-gateway"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -696,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "haven-server"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -720,7 +720,7 @@ dependencies = [
 
 [[package]]
 name = "haven-types"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "chrono",
  "serde",

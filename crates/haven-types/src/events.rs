@@ -1,6 +1,13 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// A single file entry in a folder transfer manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderFileEntry {
+    pub relative_path: String,
+    pub size: u64,
+}
+
 /// Events sent over the WebSocket gateway.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
@@ -85,6 +92,9 @@ pub enum GatewayEvent {
         /// URL of the file server to upload/download from
         #[serde(default, skip_serializing_if = "Option::is_none")]
         file_server_url: Option<String>,
+        /// If this file belongs to a folder transfer
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder_id: Option<String>,
     },
 
     /// A peer accepted a file transfer
@@ -137,6 +147,32 @@ pub enum GatewayEvent {
         file_sha256: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chunk_hashes: Option<Vec<String>>,
+    },
+
+    // ── Folder Transfer events ────────────────────────────────────────
+
+    /// A peer is offering to send a folder
+    FolderOffer {
+        from_user_id: Uuid,
+        folder_id: String,
+        folder_name: String,
+        total_size: u64,
+        file_count: u32,
+        manifest: Vec<FolderFileEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_server_url: Option<String>,
+    },
+
+    /// A peer accepted a folder transfer
+    FolderAccept {
+        from_user_id: Uuid,
+        folder_id: String,
+    },
+
+    /// A peer rejected a folder transfer
+    FolderReject {
+        from_user_id: Uuid,
+        folder_id: String,
     },
 
     // ── Fast Transfer (UDP blast) events ──────────────────────────────
@@ -243,6 +279,9 @@ pub enum GatewayCommand {
         /// Per-chunk SHA-256 hashes (in order)
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chunk_hashes: Option<Vec<String>>,
+        /// If this file belongs to a folder transfer
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder_id: Option<String>,
     },
 
     /// Accept a file transfer from a peer
@@ -255,6 +294,28 @@ pub enum GatewayCommand {
     FileRejectSend {
         target_user_id: Uuid,
         transfer_id: String,
+    },
+
+    /// Offer to send a folder to a specific peer
+    FolderOfferSend {
+        target_user_id: Uuid,
+        folder_id: String,
+        folder_name: String,
+        total_size: u64,
+        file_count: u32,
+        manifest: Vec<FolderFileEntry>,
+    },
+
+    /// Accept a folder transfer from a peer
+    FolderAcceptSend {
+        target_user_id: Uuid,
+        folder_id: String,
+    },
+
+    /// Reject a folder transfer from a peer
+    FolderRejectSend {
+        target_user_id: Uuid,
+        folder_id: String,
     },
 
     /// Send WebRTC signaling for a file transfer to a specific peer

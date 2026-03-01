@@ -18,6 +18,9 @@ class FileTransfer {
   final String? targetUserId;
   final String? fromUserId;
 
+  /// If this file belongs to a folder transfer, the parent folder ID.
+  final String? folderId;
+
   // Native handle (null if not started yet)
   Pointer<Void>? nativeHandle;
 
@@ -48,6 +51,7 @@ class FileTransfer {
     this.fileServerUrl,
     this.fileSha256,
     this.chunkHashes,
+    this.folderId,
   });
 
   double get progress =>
@@ -70,6 +74,92 @@ class FileTransfer {
       default:
         return 'Unknown';
     }
+  }
+}
+
+/// Folder transfer state machine.
+class FolderTransferState {
+  static const int pending = 0;
+  static const int active = 1;
+  static const int complete = 2;
+  static const int error = 3;
+  static const int rejected = 4;
+}
+
+/// A single entry in the folder manifest.
+class FolderFileEntry {
+  final String relativePath;
+  final int size;
+  FolderFileEntry({required this.relativePath, required this.size});
+}
+
+/// Represents a folder transfer — groups multiple child FileTransfers.
+class FolderTransfer {
+  final String folderId;
+  final String folderName;
+  final int totalSize;
+  final int fileCount;
+  final bool isUpload;
+  final String? fromUserId;
+  final String? targetUserId;
+  final List<FolderFileEntry> manifest;
+
+  int state = FolderTransferState.pending;
+
+  /// Maps child transfer IDs to their relative paths in the folder.
+  final Map<String, String> transferIdToPath = {};
+
+  // Stored after accept (receiver side) for auto-accepting child files.
+  String? saveDir;
+  String? masterKey;
+  String? salt;
+
+  FolderTransfer({
+    required this.folderId,
+    required this.folderName,
+    required this.totalSize,
+    required this.fileCount,
+    required this.isUpload,
+    required this.manifest,
+    this.fromUserId,
+    this.targetUserId,
+  });
+
+  /// Compute progress from child transfers.
+  double progress(Map<String, FileTransfer> allTransfers) {
+    if (totalSize == 0) return 0.0;
+    return bytesDone(allTransfers) / totalSize;
+  }
+
+  int bytesDone(Map<String, FileTransfer> allTransfers) {
+    int done = 0;
+    for (final tid in transferIdToPath.keys) {
+      final t = allTransfers[tid];
+      if (t != null) done += t.bytesDone;
+    }
+    return done;
+  }
+
+  int filesComplete(Map<String, FileTransfer> allTransfers) {
+    int count = 0;
+    for (final tid in transferIdToPath.keys) {
+      final t = allTransfers[tid];
+      if (t != null && t.state == TransferState.complete) count++;
+    }
+    return count;
+  }
+
+  /// The currently active file (first one that is hashing or transferring).
+  FileTransfer? activeFile(Map<String, FileTransfer> allTransfers) {
+    for (final tid in transferIdToPath.keys) {
+      final t = allTransfers[tid];
+      if (t != null &&
+          (t.state == TransferState.hashing ||
+           t.state == TransferState.transferring)) {
+        return t;
+      }
+    }
+    return null;
   }
 }
 
@@ -101,6 +191,7 @@ class FileTransferService {
   }
 
   final Map<String, FileTransfer> _transfers = {};
+  final Map<String, FolderTransfer> _folders = {};
   final Map<String, _PendingDownload> _pendingDownloads = {};
   final _uuid = const Uuid();
 
@@ -124,9 +215,13 @@ class FileTransferService {
     _gateway.on('FileReject', _handleFileReject);
     _gateway.on('FileReady', _handleFileReady);
     _gateway.on('FastProgress', _handleFastProgress);
+    _gateway.on('FolderOffer', _handleFolderOffer);
+    _gateway.on('FolderAccept', _handleFolderAccept);
+    _gateway.on('FolderReject', _handleFolderReject);
   }
 
   Map<String, FileTransfer> get transfers => Map.unmodifiable(_transfers);
+  Map<String, FolderTransfer> get folders => Map.unmodifiable(_folders);
 
   void _log(String level, String message) {
     _gateway.send({
@@ -175,9 +270,10 @@ class FileTransferService {
     return transferId;
   }
 
-  /// Enumerate all files in a directory and offer each to the target user.
-  /// Returns the list of transfer IDs.
-  List<String> offerFolder({
+  /// Send a folder to a peer. Builds manifest, sends FolderOfferSend,
+  /// then queues individual file uploads tagged with the folder ID.
+  /// Returns the folder ID.
+  String? offerFolder({
     required String folderPath,
     required String targetUserId,
     required String masterKey,
@@ -186,7 +282,7 @@ class FileTransferService {
     final dir = Directory(folderPath);
     if (!dir.existsSync()) {
       _log('ERROR', 'offerFolder: directory not found: $folderPath');
-      return [];
+      return null;
     }
 
     final files = dir
@@ -197,34 +293,88 @@ class FileTransferService {
 
     if (files.isEmpty) {
       _log('WARN', 'offerFolder: no files found in $folderPath');
-      return [];
+      return null;
     }
 
-    _log('INFO', 'offerFolder: ${files.length} files in $folderPath → $targetUserId');
-
-    final ids = <String>[];
+    final folderId = _uuid.v4();
     final basePath = folderPath.replaceAll('\\', '/');
+    final folderName = basePath.split('/').last;
 
+    // Build manifest
+    final manifest = <FolderFileEntry>[];
+    int totalSize = 0;
     for (final file in files) {
       final fullPath = file.path.replaceAll('\\', '/');
-      // Preserve relative path from folder root as the filename
       final relativePath = fullPath.startsWith(basePath)
           ? fullPath.substring(basePath.length + 1)
           : fullPath.split('/').last;
-
-      final id = offerFile(
-        filePath: file.path,
-        filename: relativePath,
-        fileSize: file.lengthSync(),
-        targetUserId: targetUserId,
-        masterKey: masterKey,
-        salt: salt,
-      );
-      ids.add(id);
+      final size = file.lengthSync();
+      manifest.add(FolderFileEntry(relativePath: relativePath, size: size));
+      totalSize += size;
     }
 
-    _log('INFO', 'offerFolder: queued ${ids.length} files');
-    return ids;
+    _log('INFO', 'offerFolder: $folderName ${files.length} files ${totalSize} bytes → $targetUserId folder=$folderId');
+
+    // Create FolderTransfer (upload side, immediately active)
+    final folder = FolderTransfer(
+      folderId: folderId,
+      folderName: folderName,
+      totalSize: totalSize,
+      fileCount: files.length,
+      isUpload: true,
+      manifest: manifest,
+      targetUserId: targetUserId,
+    );
+    folder.state = FolderTransferState.active;
+    _folders[folderId] = folder;
+
+    // Send FolderOfferSend via gateway
+    _gateway.send({
+      'type': 'FolderOfferSend',
+      'data': {
+        'target_user_id': targetUserId,
+        'folder_id': folderId,
+        'folder_name': folderName,
+        'total_size': totalSize,
+        'file_count': files.length,
+        'manifest': manifest
+            .map((e) => {'relative_path': e.relativePath, 'size': e.size})
+            .toList(),
+      },
+    });
+
+    // Queue individual file uploads tagged with folderId
+    for (int i = 0; i < files.length; i++) {
+      final file = files[i];
+      final entry = manifest[i];
+      final transferId = _uuid.v4();
+
+      final transfer = FileTransfer(
+        transferId: transferId,
+        filename: entry.relativePath,
+        fileSize: entry.size,
+        isUpload: true,
+        targetUserId: targetUserId,
+        folderId: folderId,
+      );
+      _transfers[transferId] = transfer;
+      folder.transferIdToPath[transferId] = entry.relativePath;
+
+      if (_activeUploadTransferId == null && i == 0) {
+        _activeUploadTransferId = transferId;
+        _startUpload(transfer, file.path, masterKey, salt);
+      } else {
+        _sendQueue.add(_QueuedSend(
+          transferId: transferId,
+          filePath: file.path,
+          masterKey: masterKey,
+          salt: salt,
+        ));
+      }
+    }
+
+    onProgressUpdate?.call();
+    return folderId;
   }
 
   /// Start the next queued upload if the current one is done.
@@ -299,6 +449,142 @@ class FileTransferService {
     _transfers.remove(transferId);
   }
 
+  /// Accept a folder offer — store save dir and credentials, auto-accept
+  /// any child FileOffers already received, send FolderAcceptSend.
+  void acceptFolder(String folderId, String saveDir, String masterKey, String salt) {
+    final folder = _folders[folderId];
+    if (folder == null) {
+      _log('ERROR', 'acceptFolder: folder $folderId not found');
+      return;
+    }
+
+    _log('INFO', 'acceptFolder: folder=$folderId name=${folder.folderName} saveDir=$saveDir');
+
+    folder.state = FolderTransferState.active;
+    folder.saveDir = saveDir;
+    folder.masterKey = masterKey;
+    folder.salt = salt;
+
+    // Send FolderAcceptSend
+    _gateway.send({
+      'type': 'FolderAcceptSend',
+      'data': {
+        'target_user_id': folder.fromUserId,
+        'folder_id': folderId,
+      },
+    });
+
+    // Auto-accept any child file offers already received
+    for (final entry in folder.transferIdToPath.entries) {
+      final transfer = _transfers[entry.key];
+      if (transfer != null && !transfer.isUpload && transfer.state == TransferState.idle) {
+        final savePath = '$saveDir/${entry.value}'.replaceAll('/', '\\');
+        acceptOffer(entry.key, savePath, masterKey, salt);
+      }
+    }
+
+    onProgressUpdate?.call();
+  }
+
+  /// Reject a folder offer — cancel all child transfers.
+  void rejectFolder(String folderId) {
+    final folder = _folders[folderId];
+    if (folder == null) return;
+
+    _log('INFO', 'rejectFolder: folder=$folderId');
+
+    folder.state = FolderTransferState.rejected;
+
+    // Send FolderRejectSend
+    _gateway.send({
+      'type': 'FolderRejectSend',
+      'data': {
+        'target_user_id': folder.fromUserId,
+        'folder_id': folderId,
+      },
+    });
+
+    // Cancel/remove all child transfers
+    for (final tid in folder.transferIdToPath.keys) {
+      final transfer = _transfers[tid];
+      if (transfer != null) {
+        if (transfer.nativeHandle != null) {
+          _getBindings()?.cancel(transfer.nativeHandle!);
+        }
+        _transfers.remove(tid);
+      }
+    }
+
+    onProgressUpdate?.call();
+  }
+
+  /// Cancel a folder transfer and remove it + all children immediately.
+  void cancelAndRemoveFolder(String folderId) {
+    final folder = _folders[folderId];
+    if (folder == null) return;
+
+    _log('INFO', 'cancelAndRemoveFolder: folder=$folderId name=${folder.folderName}');
+
+    // Cancel + free all child transfers
+    for (final tid in folder.transferIdToPath.keys) {
+      final transfer = _transfers[tid];
+      if (transfer != null) {
+        if (transfer.nativeHandle != null) {
+          _getBindings()?.cancel(transfer.nativeHandle!);
+          _getBindings()?.free(transfer.nativeHandle!);
+        }
+        _stopStatusPolling(tid);
+        _pendingDownloads.remove(tid);
+      }
+      _transfers.remove(tid);
+      // Remove from send queue too
+      _sendQueue.removeWhere((q) => q.transferId == tid);
+    }
+
+    // If active upload was a child of this folder, advance queue
+    if (folder.transferIdToPath.containsKey(_activeUploadTransferId)) {
+      _activeUploadTransferId = null;
+      _processQueue();
+    }
+
+    _folders.remove(folderId);
+    onProgressUpdate?.call();
+  }
+
+  /// Remove a completed/rejected folder and its child transfers.
+  void removeFolder(String folderId) {
+    final folder = _folders.remove(folderId);
+    if (folder == null) return;
+    for (final tid in folder.transferIdToPath.keys) {
+      removeTransfer(tid);
+    }
+  }
+
+  /// Cancel a transfer in progress and remove it immediately.
+  void cancelAndRemoveTransfer(String transferId) {
+    final transfer = _transfers[transferId];
+    if (transfer == null) return;
+
+    _log('INFO', 'cancelAndRemoveTransfer: transfer=$transferId');
+
+    if (transfer.nativeHandle != null) {
+      _getBindings()?.cancel(transfer.nativeHandle!);
+      _getBindings()?.free(transfer.nativeHandle!);
+    }
+    _stopStatusPolling(transferId);
+    _pendingDownloads.remove(transferId);
+    _sendQueue.removeWhere((q) => q.transferId == transferId);
+    _transfers.remove(transferId);
+
+    // Advance queue if this was the active upload
+    if (_activeUploadTransferId == transferId) {
+      _activeUploadTransferId = null;
+      _processQueue();
+    }
+
+    onProgressUpdate?.call();
+  }
+
   /// Cancel a transfer in progress.
   void cancelTransfer(String transferId) {
     final transfer = _transfers[transferId];
@@ -334,6 +620,7 @@ class FileTransferService {
       }
     }
     _transfers.clear();
+    _folders.clear();
   }
 
   void _startStatusPolling(String transferId) {
@@ -528,9 +815,11 @@ class FileTransferService {
 
       // When pass 1 (hashing) completes and pass 2 (upload) starts,
       // read the computed hashes and send the offer to the receiver.
+      // Also handles tiny files that jump straight to complete (skip transferring).
       if (transfer.isUpload &&
           !transfer.offerSent &&
-          transfer.state == TransferState.transferring) {
+          (transfer.state == TransferState.transferring ||
+           transfer.state == TransferState.complete)) {
         final hashesJson = bindings.getUploadHashesJson(transfer.nativeHandle!);
         if (hashesJson != null) {
           final data = jsonDecode(hashesJson) as Map<String, dynamic>;
@@ -539,16 +828,20 @@ class FileTransferService {
               (data['chunk_hashes'] as List<dynamic>).map((e) => e as String).toList();
           transfer.offerSent = true;
           _log('INFO', 'hashing complete: transfer=${transfer.transferId} sha256=${transfer.fileSha256} chunks=${transfer.chunkHashes?.length} — sending FileOfferSend');
+          final offerData = <String, dynamic>{
+            'target_user_id': transfer.targetUserId,
+            'transfer_id': transfer.transferId,
+            'filename': transfer.filename,
+            'size': transfer.fileSize,
+            'file_sha256': transfer.fileSha256,
+            'chunk_hashes': transfer.chunkHashes,
+          };
+          if (transfer.folderId != null) {
+            offerData['folder_id'] = transfer.folderId;
+          }
           _gateway.send({
             'type': 'FileOfferSend',
-            'data': {
-              'target_user_id': transfer.targetUserId,
-              'transfer_id': transfer.transferId,
-              'filename': transfer.filename,
-              'size': transfer.fileSize,
-              'file_sha256': transfer.fileSha256,
-              'chunk_hashes': transfer.chunkHashes,
-            },
+            'data': offerData,
           });
         } else {
           _log('WARN', 'state=transferring but getUploadHashesJson returned null: transfer=${transfer.transferId}');
@@ -585,6 +878,11 @@ class FileTransferService {
         _processQueue();
       }
 
+      // Check if parent folder is complete
+      if (transfer.state == TransferState.complete && transfer.folderId != null) {
+        _checkFolderCompletion(transfer.folderId!);
+      }
+
       // Log error with DLL error message
       if (transfer.state == TransferState.error && !transfer.errorLogged) {
         transfer.errorLogged = true;
@@ -619,7 +917,77 @@ class FileTransferService {
     }
   }
 
+  void _checkFolderCompletion(String folderId) {
+    final folder = _folders[folderId];
+    if (folder == null || folder.state == FolderTransferState.complete) return;
+
+    final allDone = folder.transferIdToPath.keys.every((tid) {
+      final t = _transfers[tid];
+      return t != null && t.state == TransferState.complete;
+    });
+
+    if (allDone && folder.transferIdToPath.isNotEmpty) {
+      folder.state = FolderTransferState.complete;
+      _log('INFO', 'folder complete: folder=$folderId name=${folder.folderName}');
+    }
+  }
+
   // ── Gateway event handlers ───────────────────────────────────────────
+
+  void _handleFolderOffer(Map<String, dynamic> event) {
+    final data = event['data'] as Map<String, dynamic>;
+    final folderId = data['folder_id'] as String;
+    final folderName = data['folder_name'] as String;
+    final totalSize = data['total_size'] as int;
+    final fileCount = data['file_count'] as int;
+    final fromUserId = data['from_user_id'] as String;
+    final manifestRaw = data['manifest'] as List<dynamic>;
+
+    final manifest = manifestRaw.map((e) {
+      final m = e as Map<String, dynamic>;
+      return FolderFileEntry(
+        relativePath: m['relative_path'] as String,
+        size: m['size'] as int,
+      );
+    }).toList();
+
+    _log('INFO', '_handleFolderOffer: folder=$folderId name=$folderName files=$fileCount size=$totalSize from=$fromUserId');
+
+    final folder = FolderTransfer(
+      folderId: folderId,
+      folderName: folderName,
+      totalSize: totalSize,
+      fileCount: fileCount,
+      isUpload: false,
+      manifest: manifest,
+      fromUserId: fromUserId,
+    );
+    _folders[folderId] = folder;
+    onProgressUpdate?.call();
+  }
+
+  void _handleFolderAccept(Map<String, dynamic> event) {
+    final data = event['data'] as Map<String, dynamic>;
+    final folderId = data['folder_id'] as String;
+    _log('INFO', '_handleFolderAccept: folder=$folderId — receiver accepted');
+    onProgressUpdate?.call();
+  }
+
+  void _handleFolderReject(Map<String, dynamic> event) {
+    final data = event['data'] as Map<String, dynamic>;
+    final folderId = data['folder_id'] as String;
+    _log('INFO', '_handleFolderReject: folder=$folderId — receiver rejected');
+
+    final folder = _folders[folderId];
+    if (folder != null) {
+      folder.state = FolderTransferState.rejected;
+      // Cancel all child transfers
+      for (final tid in folder.transferIdToPath.keys) {
+        cancelTransfer(tid);
+      }
+    }
+    onProgressUpdate?.call();
+  }
 
   void _handleFileOffer(Map<String, dynamic> event) {
     final data = event['data'] as Map<String, dynamic>;
@@ -632,8 +1000,9 @@ class FileTransferService {
     final chunkHashes = (data['chunk_hashes'] as List<dynamic>?)
         ?.map((e) => e as String)
         .toList();
+    final folderId = data['folder_id'] as String?;
 
-    _log('INFO', '_handleFileOffer: transfer=$transferId file=$filename size=$size from=$fromUserId serverUrl=$fileServerUrl sha256=$fileSha256 chunks=${chunkHashes?.length}');
+    _log('INFO', '_handleFileOffer: transfer=$transferId file=$filename size=$size from=$fromUserId folder=$folderId sha256=$fileSha256 chunks=${chunkHashes?.length}');
 
     final transfer = FileTransfer(
       transferId: transferId,
@@ -644,8 +1013,29 @@ class FileTransferService {
       fileServerUrl: fileServerUrl,
       fileSha256: fileSha256,
       chunkHashes: chunkHashes,
+      folderId: folderId,
     );
     _transfers[transferId] = transfer;
+
+    // If this file belongs to a folder, register it as a child
+    if (folderId != null) {
+      final folder = _folders[folderId];
+      if (folder != null) {
+        folder.transferIdToPath[transferId] = filename;
+
+        // If folder is already accepted, auto-accept this file
+        if (folder.state == FolderTransferState.active &&
+            folder.saveDir != null &&
+            folder.masterKey != null &&
+            folder.salt != null) {
+          final savePath = '${folder.saveDir}/$filename'.replaceAll('/', '\\');
+          _log('INFO', '_handleFileOffer: auto-accepting folder child transfer=$transferId savePath=$savePath');
+          acceptOffer(transferId, savePath, folder.masterKey!, folder.salt!);
+          return; // Don't trigger UI update for individual pending offer
+        }
+      }
+    }
+
     onProgressUpdate?.call();
   }
 

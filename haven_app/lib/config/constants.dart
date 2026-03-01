@@ -1,4 +1,8 @@
-/// Haven 2.0 configuration constants.
+/// App version — set automatically from pubspec.yaml at startup.
+/// Never hardcode version strings elsewhere; always use this.
+String appVersion = '';
+
+/// Haven configuration constants.
 ///
 /// All server-related constants match the existing Haven Rust server protocol.
 class HavenConstants {

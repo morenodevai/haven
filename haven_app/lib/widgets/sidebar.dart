@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'package:haven_app/config/constants.dart';
 import 'package:haven_app/config/theme.dart';
 import 'package:haven_app/models/channel.dart';
 import 'package:haven_app/models/user.dart';
@@ -60,7 +61,7 @@ class Sidebar extends ConsumerWidget {
                 ),
                 const Spacer(),
                 Text(
-                  'v4.0.0',
+                  appVersion,
                   style: TextStyle(
                     fontSize: 12,
                     color: HavenTheme.textMuted,
