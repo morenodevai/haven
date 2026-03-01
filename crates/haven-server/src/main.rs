@@ -4,12 +4,15 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    extract::{ConnectInfo, Query, State, WebSocketUpgrade, DefaultBodyLimit},
-    http::{Method, HeaderValue, header::AUTHORIZATION, header::CONTENT_TYPE},
+    body::Body,
+    extract::{ConnectInfo, Path, Query, State, WebSocketUpgrade, DefaultBodyLimit},
+    http::{Method, HeaderValue, HeaderMap, StatusCode, header, header::AUTHORIZATION, header::CONTENT_TYPE},
     middleware,
-    response::IntoResponse,
-    routing::{get, post},
+    response::{IntoResponse, Response},
+    routing::{delete, get, post, put},
 };
+use futures_util::TryStreamExt;
+use reqwest::Client;
 use jsonwebtoken::{DecodingKey, Validation, decode};
 use serde::Deserialize;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -38,6 +41,8 @@ struct ServerState {
     dispatcher: Dispatcher,
     jwt_secret: String,
     file_server_url: Option<String>,
+    file_server_internal_url: Option<String>,
+    http_client: Client,
 }
 
 /// Query parameters for the WebSocket upgrade endpoint.
@@ -51,8 +56,9 @@ async fn main() -> anyhow::Result<()> {
     // Load .env if present
     let _ = dotenvy::dotenv();
 
-    // Init logging
+    // Init logging (stderr is unbuffered — logs appear immediately even when redirected to file)
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "haven=debug,tower_http=debug".into()),
@@ -111,11 +117,18 @@ async fn main() -> anyhow::Result<()> {
         info!("File server URL: {}", url);
     }
 
+    let file_server_internal_url = std::env::var("HAVEN_FILE_SERVER_INTERNAL_URL").ok();
+    if let Some(ref url) = file_server_internal_url {
+        info!("File server internal URL (proxy target): {}", url);
+    }
+
     let state = ServerState {
         app: app_state.clone(),
         dispatcher: dispatcher.clone(),
         jwt_secret: jwt_secret.clone(),
         file_server_url,
+        file_server_internal_url,
+        http_client: Client::builder().no_proxy().build()?,
     };
 
     // CORS -- restrict to known origins; extend via HAVEN_CORS_ORIGINS env var
@@ -147,11 +160,24 @@ async fn main() -> anyhow::Result<()> {
 
     let ws_route = Router::new()
         .route("/gateway", get(ws_upgrade))
+        .with_state(state.clone());
+
+    // File transfer proxy routes — forward /ft/* to internal file server (3211)
+    let file_proxy_routes = Router::new()
+        .route("/ft/transfers", post(ft_create_transfer))
+        .route("/ft/transfers/{id}", get(ft_get_transfer))
+        .route("/ft/transfers/{id}", delete(ft_delete_transfer))
+        .route("/ft/transfers/{id}/data", put(ft_upload_data))
+        .route("/ft/transfers/{id}/data", get(ft_download_data))
+        .route("/ft/transfers/{id}/chunks/{index}", put(ft_upload_chunk))
+        .route("/ft/transfers/{id}/confirm", post(ft_confirm_transfer))
+        .layer(middleware::from_fn(require_auth))
         .with_state(state);
 
     let app = Router::new()
         .merge(public_routes)
         .merge(protected_routes)
+        .merge(file_proxy_routes)
         .merge(ws_route)
         .layer(axum::Extension(jwt_extension))
         .layer(DefaultBodyLimit::max(max_body_size))
@@ -276,4 +302,82 @@ async fn ws_upgrade(
         .on_upgrade(move |socket| {
             connection::handle_connection_authenticated(socket, state.dispatcher, user_id, username, file_server_url)
         }))
+}
+
+// ── File transfer proxy ──────────────────────────────────────────────
+
+async fn ft_proxy(
+    state: &ServerState,
+    method: Method,
+    path: &str,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<Response, StatusCode> {
+    let base = state.file_server_internal_url.as_deref().unwrap_or("http://127.0.0.1:3211");
+    let url = format!("{}{}", base, path);
+
+    let mut builder = state.http_client.request(method, &url);
+    if let Some(auth) = headers.get(header::AUTHORIZATION) {
+        builder = builder.header(header::AUTHORIZATION, auth);
+    }
+    if let Some(ct) = headers.get(header::CONTENT_TYPE) {
+        builder = builder.header(header::CONTENT_TYPE, ct);
+    }
+
+    let body_stream = body.into_data_stream();
+    let reqwest_body = reqwest::Body::wrap_stream(body_stream);
+    builder = builder.body(reqwest_body);
+
+    let upstream_resp = builder.send().await.map_err(|e| {
+        tracing::error!(error = %e, upstream = %url, "file proxy: upstream request failed");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    let status = StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+
+    let mut response_builder = Response::builder().status(status);
+    if let Some(ct) = upstream_resp.headers().get(header::CONTENT_TYPE) {
+        response_builder = response_builder.header(header::CONTENT_TYPE, ct);
+    }
+    if let Some(cl) = upstream_resp.headers().get(header::CONTENT_LENGTH) {
+        response_builder = response_builder.header(header::CONTENT_LENGTH, cl);
+    }
+
+    let stream = upstream_resp.bytes_stream().map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, e)
+    });
+    let body = Body::from_stream(stream);
+
+    response_builder.body(body).map_err(|e| {
+        tracing::error!(error = %e, "file proxy: failed to build response");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+async fn ft_create_transfer(State(state): State<ServerState>, headers: HeaderMap, body: Body) -> Result<Response, StatusCode> {
+    ft_proxy(&state, Method::POST, "/transfers", &headers, body).await
+}
+
+async fn ft_get_transfer(State(state): State<ServerState>, Path(id): Path<String>, headers: HeaderMap, body: Body) -> Result<Response, StatusCode> {
+    ft_proxy(&state, Method::GET, &format!("/transfers/{id}"), &headers, body).await
+}
+
+async fn ft_delete_transfer(State(state): State<ServerState>, Path(id): Path<String>, headers: HeaderMap, body: Body) -> Result<Response, StatusCode> {
+    ft_proxy(&state, Method::DELETE, &format!("/transfers/{id}"), &headers, body).await
+}
+
+async fn ft_upload_data(State(state): State<ServerState>, Path(id): Path<String>, headers: HeaderMap, body: Body) -> Result<Response, StatusCode> {
+    ft_proxy(&state, Method::PUT, &format!("/transfers/{id}/data"), &headers, body).await
+}
+
+async fn ft_download_data(State(state): State<ServerState>, Path(id): Path<String>, headers: HeaderMap, body: Body) -> Result<Response, StatusCode> {
+    ft_proxy(&state, Method::GET, &format!("/transfers/{id}/data"), &headers, body).await
+}
+
+async fn ft_upload_chunk(State(state): State<ServerState>, Path((id, index)): Path<(String, String)>, headers: HeaderMap, body: Body) -> Result<Response, StatusCode> {
+    ft_proxy(&state, Method::PUT, &format!("/transfers/{id}/chunks/{index}"), &headers, body).await
+}
+
+async fn ft_confirm_transfer(State(state): State<ServerState>, Path(id): Path<String>, headers: HeaderMap, body: Body) -> Result<Response, StatusCode> {
+    ft_proxy(&state, Method::POST, &format!("/transfers/{id}/confirm"), &headers, body).await
 }

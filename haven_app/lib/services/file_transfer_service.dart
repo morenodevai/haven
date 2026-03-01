@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
+import 'dart:io';
 
 import 'package:dio/dio.dart';
 import 'package:uuid/uuid.dart';
@@ -80,7 +81,7 @@ class FileTransferService {
   final String Function() _getServerUrl;
 
   /// Cached result of localhost reachability check. Null = not yet checked.
-  String? _cachedUploadBaseUrl;
+
 
   FileClientBindings? _bindings;
   final _dio = Dio();
@@ -102,6 +103,10 @@ class FileTransferService {
   final Map<String, FileTransfer> _transfers = {};
   final Map<String, _PendingDownload> _pendingDownloads = {};
   final _uuid = const Uuid();
+
+  // Send queue: files waiting to be uploaded (sequential to avoid UDP blast collision)
+  final List<_QueuedSend> _sendQueue = [];
+  String? _activeUploadTransferId;
 
   Timer? _progressTimer;
   void Function()? onProgressUpdate;
@@ -131,6 +136,7 @@ class FileTransferService {
   }
 
   /// Offer to send a file to a peer. Returns the transfer ID.
+  /// Files are queued and sent sequentially to avoid UDP blast collisions.
   String offerFile({
     required String filePath,
     required String filename,
@@ -151,9 +157,94 @@ class FileTransferService {
     );
     _transfers[transferId] = transfer;
 
-    _startUpload(transfer, filePath, masterKey, salt);
+    if (_activeUploadTransferId == null) {
+      // No active upload — start immediately
+      _activeUploadTransferId = transferId;
+      _startUpload(transfer, filePath, masterKey, salt);
+    } else {
+      // Queue it
+      _log('INFO', 'offerFile: queued (active=$_activeUploadTransferId) transfer=$transferId');
+      _sendQueue.add(_QueuedSend(
+        transferId: transferId,
+        filePath: filePath,
+        masterKey: masterKey,
+        salt: salt,
+      ));
+    }
 
     return transferId;
+  }
+
+  /// Enumerate all files in a directory and offer each to the target user.
+  /// Returns the list of transfer IDs.
+  List<String> offerFolder({
+    required String folderPath,
+    required String targetUserId,
+    required String masterKey,
+    required String salt,
+  }) {
+    final dir = Directory(folderPath);
+    if (!dir.existsSync()) {
+      _log('ERROR', 'offerFolder: directory not found: $folderPath');
+      return [];
+    }
+
+    final files = dir
+        .listSync(recursive: true)
+        .whereType<File>()
+        .toList()
+      ..sort((a, b) => a.path.compareTo(b.path));
+
+    if (files.isEmpty) {
+      _log('WARN', 'offerFolder: no files found in $folderPath');
+      return [];
+    }
+
+    _log('INFO', 'offerFolder: ${files.length} files in $folderPath → $targetUserId');
+
+    final ids = <String>[];
+    final basePath = folderPath.replaceAll('\\', '/');
+
+    for (final file in files) {
+      final fullPath = file.path.replaceAll('\\', '/');
+      // Preserve relative path from folder root as the filename
+      final relativePath = fullPath.startsWith(basePath)
+          ? fullPath.substring(basePath.length + 1)
+          : fullPath.split('/').last;
+
+      final id = offerFile(
+        filePath: file.path,
+        filename: relativePath,
+        fileSize: file.lengthSync(),
+        targetUserId: targetUserId,
+        masterKey: masterKey,
+        salt: salt,
+      );
+      ids.add(id);
+    }
+
+    _log('INFO', 'offerFolder: queued ${ids.length} files');
+    return ids;
+  }
+
+  /// Start the next queued upload if the current one is done.
+  void _processQueue() {
+    if (_sendQueue.isEmpty) {
+      _activeUploadTransferId = null;
+      return;
+    }
+
+    final next = _sendQueue.removeAt(0);
+    final transfer = _transfers[next.transferId];
+    if (transfer == null) {
+      // Transfer was cancelled/removed — skip
+      _processQueue();
+      return;
+    }
+
+    _activeUploadTransferId = next.transferId;
+    _log('INFO', '_processQueue: starting next upload transfer=${next.transferId} remaining=${_sendQueue.length}');
+    _startUpload(transfer, next.filePath, next.masterKey, next.salt);
   }
 
   /// Accept a file offer — start downloading.
@@ -165,6 +256,12 @@ class FileTransferService {
     }
 
     _log('INFO', 'acceptOffer: transfer=$transferId file=${transfer.filename} savePath=$savePath serverUrl=${transfer.fileServerUrl} sha256=${transfer.fileSha256} chunks=${transfer.chunkHashes?.length}');
+
+    // Ensure parent directory exists (for folder transfers with nested paths)
+    final parentDir = Directory(savePath.substring(0, savePath.lastIndexOf(RegExp(r'[/\\]'))));
+    if (!parentDir.existsSync()) {
+      parentDir.createSync(recursive: true);
+    }
 
     transfer.state = TransferState.hashing;
     transfer.bytesTotal = transfer.fileSize;
@@ -279,7 +376,7 @@ class FileTransferService {
     }
 
     try {
-      final serverUrl = transfer.fileServerUrl ?? _getServerUrl();
+      final serverUrl = _getServerUrl();
       _log('DEBUG', 'pollTransferStatus: transfer=$transferId url=$serverUrl poll=$count');
       final resp = await _dio.get(
         '$serverUrl/transfers/$transferId',
@@ -319,25 +416,33 @@ class FileTransferService {
   // ── Private methods ──────────────────────────────────────────────────
 
   Future<String> _resolveServerUrl(String configuredUrl) async {
-    if (_cachedUploadBaseUrl != null) return _cachedUploadBaseUrl!;
     final uri = Uri.parse(configuredUrl);
-    final localUrl = uri.replace(host: '127.0.0.1').toString();
+    final healthOpts = Options(
+      receiveTimeout: const Duration(milliseconds: 800),
+      sendTimeout: const Duration(milliseconds: 800),
+    );
+
+    // Try localhost first (same machine as server)
     try {
-      await _dio.get(
-        uri.replace(host: '127.0.0.1', path: '/health').toString(),
-        options: Options(
-          receiveTimeout: const Duration(milliseconds: 800),
-          sendTimeout: const Duration(milliseconds: 800),
-        ),
-      );
-      _cachedUploadBaseUrl = localUrl;
-      _log('INFO', 'server resolve: using 127.0.0.1 ($localUrl)');
-      return localUrl;
-    } catch (_) {
-      _cachedUploadBaseUrl = configuredUrl;
-      _log('INFO', 'server resolve: 127.0.0.1 unreachable, using $configuredUrl');
-      return configuredUrl;
+      await _dio.get(uri.replace(host: '127.0.0.1', path: '/health').toString(), options: healthOpts);
+      final resolved = uri.replace(host: '127.0.0.1').toString();
+      _log('INFO', 'server resolve: using 127.0.0.1 ($resolved)');
+      return resolved;
+    } catch (_) {}
+
+    // Try the chat server's host (LAN IP the app already connected to)
+    final chatHost = Uri.parse(_getServerUrl()).host;
+    if (chatHost.isNotEmpty && chatHost != uri.host && chatHost != '127.0.0.1') {
+      try {
+        await _dio.get(uri.replace(host: chatHost, path: '/health').toString(), options: healthOpts);
+        final resolved = uri.replace(host: chatHost).toString();
+        _log('INFO', 'server resolve: using chat host $chatHost ($resolved)');
+        return resolved;
+      } catch (_) {}
     }
+
+    _log('INFO', 'server resolve: using configured $configuredUrl');
+    return configuredUrl;
   }
 
   void _startUpload(FileTransfer transfer, String filePath, String masterKey, String salt) async {
@@ -346,13 +451,12 @@ class FileTransferService {
       _log('ERROR', '_startUpload: bindings null (DLL failed to load) transfer=${transfer.transferId}');
       return;
     }
-    final configuredUrl = transfer.fileServerUrl ?? _getServerUrl();
-    final serverUrl = await _resolveServerUrl(configuredUrl);
+    final serverUrl = _getServerUrl();
 
-    _log('INFO', '_startUpload: transfer=${transfer.transferId} file=$filePath server=$serverUrl useFast=true');
+    _log('INFO', '_startUpload: transfer=${transfer.transferId} file=$filePath server=$serverUrl');
 
-    // Use fast UDP blast upload
-    final handle = bindings.fastUploadFile(
+    // Use HTTP upload (works through file gateway proxy for NAT traversal)
+    final handle = bindings.uploadFile(
       filePath: filePath,
       serverUrl: serverUrl,
       transferId: transfer.transferId,
@@ -361,7 +465,7 @@ class FileTransferService {
       salt: salt,
     );
     transfer.nativeHandle = handle;
-    _log('INFO', '_startUpload: fast upload handle obtained transfer=${transfer.transferId}');
+    _log('INFO', '_startUpload: HTTP upload handle obtained transfer=${transfer.transferId}');
     _startProgressPolling();
   }
 
@@ -371,15 +475,12 @@ class FileTransferService {
       _log('ERROR', '_startDownload: bindings null transfer=${transfer.transferId}');
       return;
     }
-    final configuredUrl = transfer.fileServerUrl?.isNotEmpty == true
-        ? transfer.fileServerUrl!
-        : _getServerUrl();
-    final serverUrl = await _resolveServerUrl(configuredUrl);
+    final serverUrl = _getServerUrl();
 
-    _log('INFO', '_startDownload: transfer=${transfer.transferId} savePath=$savePath server=$serverUrl sha256=${transfer.fileSha256} chunks=${transfer.chunkHashes?.length} useFast=true');
+    _log('INFO', '_startDownload: transfer=${transfer.transferId} savePath=$savePath server=$serverUrl sha256=${transfer.fileSha256} chunks=${transfer.chunkHashes?.length}');
 
-    // Use fast UDP blast download
-    final handle = bindings.fastDownloadFile(
+    // Use HTTP download (works through file gateway proxy for NAT traversal)
+    final handle = bindings.downloadFile(
       savePath: savePath,
       serverUrl: serverUrl,
       transferId: transfer.transferId,
@@ -390,7 +491,7 @@ class FileTransferService {
       chunkHashesJson: jsonEncode(transfer.chunkHashes!),
     );
     transfer.nativeHandle = handle;
-    _log('INFO', '_startDownload: fast download handle obtained transfer=${transfer.transferId}');
+    _log('INFO', '_startDownload: HTTP download handle obtained transfer=${transfer.transferId}');
     _startProgressPolling();
   }
 
@@ -470,6 +571,18 @@ class FileTransferService {
             'chunk_hashes': transfer.chunkHashes,
           },
         });
+
+        // Start next queued upload
+        if (_activeUploadTransferId == transfer.transferId) {
+          _processQueue();
+        }
+      }
+
+      // Also advance queue on upload error/cancel
+      if ((transfer.state == TransferState.error || transfer.state == TransferState.cancelled) &&
+          transfer.isUpload &&
+          _activeUploadTransferId == transfer.transferId) {
+        _processQueue();
       }
 
       // Log error with DLL error message
@@ -612,4 +725,17 @@ class _PendingDownload {
   final String masterKey;
   final String salt;
   _PendingDownload(this.savePath, this.masterKey, this.salt);
+}
+
+class _QueuedSend {
+  final String transferId;
+  final String filePath;
+  final String masterKey;
+  final String salt;
+  _QueuedSend({
+    required this.transferId,
+    required this.filePath,
+    required this.masterKey,
+    required this.salt,
+  });
 }

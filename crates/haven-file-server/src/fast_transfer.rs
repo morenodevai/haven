@@ -329,11 +329,60 @@ pub async fn handle_fast_transfer_ws(
                     ((file_size as f64 / chunk_size as f64).ceil()) as u32
                 };
 
-                // Target address: peer's IP + their specified UDP port
-                let target_addr = SocketAddr::new(peer_addr.ip(), udp_port);
+                // Wait for UDP hole-punch packet from client to learn their NAT-mapped address.
+                // We bind a temporary UDP socket to receive the punch, avoiding conflicts
+                // with the main upload receiver on port 3211.
+                let transfer_id_bytes = parse_transfer_id_bytes(&transfer_id);
+                let target_addr = {
+                    // Bind a temporary socket on an ephemeral port for punch detection
+                    let punch_socket = std::net::UdpSocket::bind("0.0.0.0:0")
+                        .map_err(|e| format!("Punch socket bind: {}", e));
+
+                    match punch_socket {
+                        Ok(punch_sock) => {
+                            let punch_port = punch_sock.local_addr().unwrap().port();
+                            info!("FastDownloadStart: punch socket on port {}, telling client", punch_port);
+
+                            // Tell client which port to punch via WS
+                            let punch_msg = serde_json::json!({
+                                "type": "FastPunchPort",
+                                "data": { "port": punch_port }
+                            });
+                            let _ = ws_tx.send(Message::Text(
+                                serde_json::to_string(&punch_msg).unwrap().into()
+                            )).await;
+
+                            punch_sock.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+                            let mut punch_addr: Option<SocketAddr> = None;
+                            let mut buf = [0u8; 64];
+                            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                            while std::time::Instant::now() < deadline {
+                                match punch_sock.recv_from(&mut buf) {
+                                    Ok((n, src)) if n >= 16 && buf[..16] == transfer_id_bytes => {
+                                        info!("FastDownloadStart: punch from {} (transfer matches)", src);
+                                        punch_addr = Some(src);
+                                        break;
+                                    }
+                                    Ok((_, src)) => {
+                                        info!("FastDownloadStart: ignoring punch from {} (wrong payload)", src);
+                                        continue;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            punch_addr.unwrap_or_else(|| {
+                                warn!("FastDownloadStart: no punch received, falling back to {}:{}", peer_addr.ip(), udp_port);
+                                SocketAddr::new(peer_addr.ip(), udp_port)
+                            })
+                        }
+                        Err(e) => {
+                            warn!("FastDownloadStart: punch socket failed ({}), using fallback", e);
+                            SocketAddr::new(peer_addr.ip(), udp_port)
+                        }
+                    }
+                };
 
                 let file_path = state.storage.file_path(&transfer_id);
-                let transfer_id_bytes = parse_transfer_id_bytes(&transfer_id);
 
                 info!(
                     "Starting download blast: {} ({} bytes, {} chunks) to {}",

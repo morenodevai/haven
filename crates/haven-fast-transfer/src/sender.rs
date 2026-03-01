@@ -650,6 +650,21 @@ pub fn run_raw_sender(
     let mut send_buf = vec![0u8; FRAME_MAX];
     let mut rate_bps = INITIAL_RATE_BPS;
     let transfer_id = config.transfer_id;
+    let blast_start = Instant::now();
+    let mut total_retransmits: u64 = 0;
+
+    if let Some(ref logger) = config.logger {
+        logger.log(TransferLog {
+            component: "raw_sender",
+            transfer_id,
+            event: TransferEvent::BlastStarted {
+                target: config.target_addr.to_string(),
+                rate_bps,
+                chunk_count: config.chunk_count,
+                file_size: config.file_size,
+            },
+        });
+    }
 
     for idx in 0..config.chunk_count {
         if progress.is_cancelled() {
@@ -693,6 +708,7 @@ pub fn run_raw_sender(
         )?;
 
         if let Some(ref logger) = config.logger {
+            // Log per-chunk at debug, but progress every 50 chunks at info
             logger.log(TransferLog {
                 component: "raw_sender",
                 transfer_id,
@@ -701,6 +717,17 @@ pub fn run_raw_sender(
                     frame_count,
                 },
             });
+            if idx == 0 || (idx + 1) % 50 == 0 || idx == config.chunk_count - 1 {
+                logger.log(TransferLog {
+                    component: "raw_sender",
+                    transfer_id,
+                    event: TransferEvent::BlastProgress {
+                        chunks_sent: idx + 1,
+                        chunks_total: config.chunk_count,
+                        rate_bps,
+                    },
+                });
+            }
         }
 
         progress
@@ -721,14 +748,39 @@ pub fn run_raw_sender(
                     &nack.missing_frames,
                     &mut send_buf,
                 )?;
+                let retransmit_count = nack.missing_frames.len() as u64;
+                total_retransmits += retransmit_count;
                 progress
                     .retransmits
-                    .fetch_add(nack.missing_frames.len() as u64, Ordering::Relaxed);
+                    .fetch_add(retransmit_count, Ordering::Relaxed);
+
+                if let Some(ref logger) = config.logger {
+                    logger.log(TransferLog {
+                        component: "raw_sender",
+                        transfer_id,
+                        event: TransferEvent::RetransmitSent {
+                            chunk_idx: nack.chunk_index,
+                            frame_count: nack.missing_frames.len() as u16,
+                        },
+                    });
+                }
 
                 let loss_pct = nack.missing_frames.len() as f64 / fc as f64;
                 if loss_pct > LOSS_THRESHOLD_HIGH {
+                    let old_rate = rate_bps;
                     rate_bps = (rate_bps as f64 * RATE_DECREASE) as u64;
                     progress.rate_bps.store(rate_bps, Ordering::Relaxed);
+                    if let Some(ref logger) = config.logger {
+                        logger.log(TransferLog {
+                            component: "raw_sender",
+                            transfer_id,
+                            event: TransferEvent::RateAdjusted {
+                                old_rate_bps: old_rate,
+                                new_rate_bps: rate_bps,
+                                loss_pct,
+                            },
+                        });
+                    }
                 }
             }
         }
@@ -737,12 +789,38 @@ pub fn run_raw_sender(
         while let Ok(ack) = ack_rx.try_recv() {
             acked.insert(ack.chunk_index);
             progress.chunks_complete.fetch_add(1, Ordering::Relaxed);
+            let old_rate = rate_bps;
             rate_bps = (rate_bps as f64 * RATE_INCREASE).min(INITIAL_RATE_BPS as f64) as u64;
             progress.rate_bps.store(rate_bps, Ordering::Relaxed);
+            if rate_bps != old_rate {
+                if let Some(ref logger) = config.logger {
+                    logger.log(TransferLog {
+                        component: "raw_sender",
+                        transfer_id,
+                        event: TransferEvent::RateAdjusted {
+                            old_rate_bps: old_rate,
+                            new_rate_bps: rate_bps,
+                            loss_pct: 0.0,
+                        },
+                    });
+                }
+            }
         }
     }
 
     // Wait for remaining NACKs/ACKs
+    if let Some(ref logger) = config.logger {
+        logger.log(TransferLog {
+            component: "raw_sender",
+            transfer_id,
+            event: TransferEvent::BlastProgress {
+                chunks_sent: config.chunk_count,
+                chunks_total: config.chunk_count,
+                rate_bps,
+            },
+        });
+    }
+
     let deadline = Instant::now() + std::time::Duration::from_secs(60);
     while acked.len() < config.chunk_count as usize && Instant::now() < deadline {
         if progress.is_cancelled() {
@@ -761,12 +839,48 @@ pub fn run_raw_sender(
                     &nack.missing_frames,
                     &mut send_buf,
                 )?;
+                let retransmit_count = nack.missing_frames.len() as u64;
+                total_retransmits += retransmit_count;
+                progress
+                    .retransmits
+                    .fetch_add(retransmit_count, Ordering::Relaxed);
+
+                if let Some(ref logger) = config.logger {
+                    logger.log(TransferLog {
+                        component: "raw_sender",
+                        transfer_id,
+                        event: TransferEvent::RetransmitSent {
+                            chunk_idx: nack.chunk_index,
+                            frame_count: nack.missing_frames.len() as u16,
+                        },
+                    });
+                }
             }
         }
         while let Ok(ack) = ack_rx.try_recv() {
             acked.insert(ack.chunk_index);
             progress.chunks_complete.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    let duration_ms = blast_start.elapsed().as_millis() as u64;
+    let effective_mbps = if duration_ms > 0 {
+        config.file_size as f64 * 8.0 / duration_ms as f64 / 1000.0
+    } else {
+        0.0
+    };
+
+    if let Some(ref logger) = config.logger {
+        logger.log(TransferLog {
+            component: "raw_sender",
+            transfer_id,
+            event: TransferEvent::BlastComplete {
+                chunks_sent: config.chunk_count,
+                duration_ms,
+                retransmits: total_retransmits,
+                effective_mbps,
+            },
+        });
     }
 
     progress.state.store(STATE_COMPLETE, Ordering::Relaxed);

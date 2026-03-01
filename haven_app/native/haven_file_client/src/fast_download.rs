@@ -83,9 +83,8 @@ pub async fn fast_download_file(
     // Parse transfer ID bytes
     let transfer_id_bytes = parse_transfer_id_bytes(transfer_id);
 
-    // Fixed UDP port for receiving downloads (matches file server convention)
-    const CLIENT_UDP_PORT: u16 = 3211;
-    let actual_bind_addr: std::net::SocketAddr = format!("0.0.0.0:{}", CLIENT_UDP_PORT).parse().unwrap();
+    // Bind UDP on port 0 (OS-assigned) so multiple downloads can run concurrently
+    let actual_bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
     let udp_socket = {
         use socket2::{Domain, Protocol, Socket, Type};
         let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
@@ -93,11 +92,12 @@ pub async fn fast_download_file(
         sock.set_recv_buffer_size(32 * 1024 * 1024)
             .map_err(|e| format!("UDP recv buffer: {}", e))?;
         sock.bind(&actual_bind_addr.into())
-            .map_err(|e| format!("UDP bind on port {}: {}", CLIENT_UDP_PORT, e))?;
+            .map_err(|e| format!("UDP bind: {}", e))?;
         let std_sock: std::net::UdpSocket = sock.into();
         std_sock
     };
-    let udp_port = CLIENT_UDP_PORT;
+    let udp_port = udp_socket.local_addr()
+        .map_err(|e| format!("Get local UDP port: {}", e))?.port();
 
     // Connect to file server WS
     let ws_url = format!(
@@ -112,7 +112,22 @@ pub async fn fast_download_file(
 
     let (mut ws_tx, mut ws_rx) = futures_util::StreamExt::split(ws_stream);
 
-    // Send FastDownloadStart with our UDP port
+    // Send UDP hole-punch packets to the server so NAT creates a mapping.
+    // The server will read our actual external address from these packets.
+    let server_uri: url::Url = file_server_url.parse()
+        .map_err(|e| format!("Bad server URL: {}", e))?;
+    let server_host = server_uri.host_str().ok_or("No host in server URL")?;
+    let server_port = server_uri.port().unwrap_or(3211);
+    let server_udp_addr = format!("{}:{}", server_host, server_port);
+
+    // Send a few punch packets (transfer_id as payload so server can match)
+    let punch_payload = parse_transfer_id_bytes(transfer_id);
+    for _ in 0..5 {
+        let _ = udp_socket.send_to(&punch_payload, &server_udp_addr);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // Send FastDownloadStart with our local UDP port (server will use punch address instead)
     let start_msg = serde_json::json!({
         "type": "FastDownloadStart",
         "data": {
@@ -167,7 +182,7 @@ pub async fn fast_download_file(
         chunk_size: encrypted_chunk_size,
         chunk_hashes: chunk_hashes.to_vec(),
         file_sha256: file_sha256.to_string(),
-        bind_addr: actual_bind_addr,
+        bind_addr: format!("0.0.0.0:{}", udp_port).parse().unwrap(),
         logger: Some(Arc::new(TracingLogger)),
         pre_bound_socket: Some(udp_socket),
     };

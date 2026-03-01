@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:file_picker/file_picker.dart';
@@ -44,6 +46,16 @@ class FileTransferScreen extends ConsumerWidget {
               ),
               const Spacer(),
               ElevatedButton.icon(
+                onPressed: () => _showSendFolderDialog(context, ref, onlineUsers),
+                icon: const Icon(Icons.folder, size: 18),
+                label: const Text('Send Folder'),
+                style: ElevatedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  textStyle: const TextStyle(fontSize: 13),
+                ),
+              ),
+              const SizedBox(width: 8),
+              ElevatedButton.icon(
                 onPressed: () => _showSendDialog(context, ref, onlineUsers),
                 icon: const Icon(Icons.upload_file, size: 18),
                 label: const Text('Send File'),
@@ -71,6 +83,17 @@ class FileTransferScreen extends ConsumerWidget {
                     letterSpacing: 1.2,
                   ),
                 ),
+                const Spacer(),
+                if (transferState.pendingOffers.length > 1)
+                  TextButton.icon(
+                    onPressed: () => _acceptAll(context, ref),
+                    icon: const Icon(Icons.done_all, size: 16),
+                    label: Text('Accept All (${transferState.pendingOffers.length})'),
+                    style: TextButton.styleFrom(
+                      textStyle: const TextStyle(fontSize: 12),
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    ),
+                  ),
               ],
             ),
           ),
@@ -176,6 +199,48 @@ class FileTransferScreen extends ConsumerWidget {
       targetUserId: targetUserId,
       masterKey: HavenConstants.defaultChannelKey,
       salt: 'file-transfer',
+    );
+  }
+
+  void _showSendFolderDialog(BuildContext context, WidgetRef ref, Map<String, dynamic> onlineUsers) async {
+    // Pick a folder
+    final folderPath = await FilePicker.platform.getDirectoryPath(
+      dialogTitle: 'Select folder to send',
+    );
+    if (folderPath == null) return;
+
+    // Count files for confirmation
+    final dir = Directory(folderPath);
+    final files = dir.listSync(recursive: true).whereType<File>().toList();
+    if (files.isEmpty) return;
+
+    // Show user picker dialog
+    if (!context.mounted) return;
+    final targetUserId = await showDialog<String>(
+      context: context,
+      builder: (ctx) => _UserPickerDialog(onlineUsers: onlineUsers),
+    );
+
+    if (targetUserId == null) return;
+
+    ref.read(fileTransferProvider.notifier).sendFolder(
+      folderPath: folderPath,
+      targetUserId: targetUserId,
+      masterKey: HavenConstants.defaultChannelKey,
+      salt: 'file-transfer',
+    );
+  }
+
+  void _acceptAll(BuildContext context, WidgetRef ref) async {
+    final saveDir = await FilePicker.platform.getDirectoryPath(
+      dialogTitle: 'Save all files to...',
+    );
+    if (saveDir == null) return;
+
+    ref.read(fileTransferProvider.notifier).acceptAll(
+      saveDir,
+      HavenConstants.defaultChannelKey,
+      'file-transfer',
     );
   }
 }

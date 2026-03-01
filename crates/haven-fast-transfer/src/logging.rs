@@ -53,6 +53,31 @@ pub enum TransferEvent {
         chunk_idx: u32,
         missing_count: u16,
     },
+    /// Blast started (raw sender)
+    BlastStarted {
+        target: String,
+        rate_bps: u64,
+        chunk_count: u32,
+        file_size: u64,
+    },
+    /// Blast progress (raw sender, periodic)
+    BlastProgress {
+        chunks_sent: u32,
+        chunks_total: u32,
+        rate_bps: u64,
+    },
+    /// Blast complete (raw sender)
+    BlastComplete {
+        chunks_sent: u32,
+        duration_ms: u64,
+        retransmits: u64,
+        effective_mbps: f64,
+    },
+    /// Retransmit sent
+    RetransmitSent {
+        chunk_idx: u32,
+        frame_count: u16,
+    },
     /// Transfer complete
     TransferComplete {
         total_bytes: u64,
@@ -103,6 +128,18 @@ impl fmt::Display for TransferEvent {
             Self::NackSent { chunk_idx, missing_count } => {
                 write!(f, "nack_sent idx={} missing={}", chunk_idx, missing_count)
             }
+            Self::BlastStarted { target, rate_bps, chunk_count, file_size } => {
+                write!(f, "blast_started target={} rate_mbps={} chunks={} size={}", target, *rate_bps as f64 * 8.0 / 1_000_000.0, chunk_count, file_size)
+            }
+            Self::BlastProgress { chunks_sent, chunks_total, rate_bps } => {
+                write!(f, "blast_progress chunks={}/{} rate_mbps={:.0}", chunks_sent, chunks_total, *rate_bps as f64 * 8.0 / 1_000_000.0)
+            }
+            Self::BlastComplete { chunks_sent, duration_ms, retransmits, effective_mbps } => {
+                write!(f, "blast_complete chunks={} duration_ms={} retransmits={} effective_mbps={:.1}", chunks_sent, duration_ms, retransmits, effective_mbps)
+            }
+            Self::RetransmitSent { chunk_idx, frame_count } => {
+                write!(f, "retransmit_sent idx={} frames={}", chunk_idx, frame_count)
+            }
             Self::TransferComplete { total_bytes, duration_ms, retransmits } => {
                 write!(f, "transfer_complete bytes={} duration_ms={} retransmits={}", total_bytes, duration_ms, retransmits)
             }
@@ -140,6 +177,12 @@ impl TransferLogger for TracingLogger {
             | TransferEvent::VacuumProgress { .. }
             | TransferEvent::TransferIdMismatch { .. }
             | TransferEvent::TransferComplete { .. }
+            | TransferEvent::BlastStarted { .. }
+            | TransferEvent::BlastProgress { .. }
+            | TransferEvent::BlastComplete { .. }
+            | TransferEvent::NackSent { .. }
+            | TransferEvent::RateAdjusted { .. }
+            | TransferEvent::RetransmitSent { .. }
             | TransferEvent::Error { .. } => {
                 tracing::info!(
                     component = entry.component,

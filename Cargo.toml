@@ -10,6 +10,7 @@ members = [
     "crates/haven-types",
     "crates/haven-file-server",
     "crates/haven-fast-transfer",
+    "crates/haven-file-gateway",
 ]
 
 [workspace.package]

@@ -113,7 +113,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     final fileTransferService = FileTransferService(
       gateway: gateway,
       getToken: () => authService.token ?? '',
-      getServerUrl: () => authService.serverUrl.replaceFirst(':3210', ':3211'),
+      getServerUrl: () => '${authService.serverUrl}/ft',
     );
     ref.read(fileTransferProvider.notifier).init(fileTransferService);
 

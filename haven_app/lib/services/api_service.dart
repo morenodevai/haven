@@ -20,6 +20,8 @@ class ApiService {
   String _baseUrl;
   String? _token;
 
+  bool _resolved = false;
+
   ApiService({String? baseUrl})
       : _baseUrl = baseUrl ?? HavenConstants.defaultServerUrl {
     _dio = Dio(BaseOptions(
@@ -30,13 +32,38 @@ class ApiService {
     ));
 
     _dio.interceptors.add(InterceptorsWrapper(
-      onRequest: (options, handler) {
+      onRequest: (options, handler) async {
+        if (!_resolved) {
+          await _resolveBaseUrl();
+        }
         if (_token != null) {
           options.headers['Authorization'] = 'Bearer $_token';
         }
         return handler.next(options);
       },
     ));
+  }
+
+  /// Try localhost first; if reachable use it, otherwise keep configured URL.
+  Future<void> _resolveBaseUrl() async {
+    _resolved = true;
+    final uri = Uri.parse(_baseUrl);
+    if (uri.host == '127.0.0.1' || uri.host == 'localhost') return;
+    final localUrl = uri.replace(host: '127.0.0.1').toString();
+    try {
+      await Dio().get(
+        uri.replace(host: '127.0.0.1', path: '/auth/login').toString(),
+        options: Options(
+          receiveTimeout: const Duration(milliseconds: 800),
+          sendTimeout: const Duration(milliseconds: 800),
+        ),
+      );
+      // Server is on localhost — use it
+      _baseUrl = localUrl;
+      _dio.options.baseUrl = localUrl;
+    } catch (_) {
+      // Not on localhost — keep configured URL
+    }
   }
 
   String get baseUrl => _baseUrl;

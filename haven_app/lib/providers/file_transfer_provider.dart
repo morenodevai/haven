@@ -85,6 +85,36 @@ class FileTransferNotifier extends StateNotifier<FileTransferState> {
     _syncState();
   }
 
+  /// Send all files in a folder to a peer.
+  List<String> sendFolder({
+    required String folderPath,
+    required String targetUserId,
+    required String masterKey,
+    required String salt,
+  }) {
+    if (_service == null) return [];
+    final ids = _service!.offerFolder(
+      folderPath: folderPath,
+      targetUserId: targetUserId,
+      masterKey: masterKey,
+      salt: salt,
+    );
+    _syncState();
+    return ids;
+  }
+
+  /// Accept all pending incoming offers at once, saving to a directory.
+  void acceptAll(String saveDir, String masterKey, String salt) {
+    if (_service == null) return;
+    for (final t in state.pendingOffers) {
+      // Use filename (which may contain relative path) to build save path
+      final safeName = t.filename.replaceAll('/', '\\');
+      final savePath = '$saveDir\\$safeName';
+      _service!.acceptOffer(t.transferId, savePath, masterKey, salt);
+    }
+    _syncState();
+  }
+
   /// Remove a completed/cancelled transfer from the list.
   void removeTransfer(String transferId) {
     _service?.removeTransfer(transferId);
