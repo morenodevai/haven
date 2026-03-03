@@ -5,6 +5,8 @@ class VoiceParticipant {
   final bool selfMute;
   final bool selfDeaf;
   final bool speaking;
+  final bool cameraOn;
+  final bool screenSharing;
 
   const VoiceParticipant({
     required this.userId,
@@ -13,6 +15,8 @@ class VoiceParticipant {
     this.selfMute = false,
     this.selfDeaf = false,
     this.speaking = false,
+    this.cameraOn = false,
+    this.screenSharing = false,
   });
 
   VoiceParticipant copyWith({
@@ -20,6 +24,8 @@ class VoiceParticipant {
     bool? selfMute,
     bool? selfDeaf,
     bool? speaking,
+    bool? cameraOn,
+    bool? screenSharing,
   }) {
     return VoiceParticipant(
       userId: userId,
@@ -28,6 +34,8 @@ class VoiceParticipant {
       selfMute: selfMute ?? this.selfMute,
       selfDeaf: selfDeaf ?? this.selfDeaf,
       speaking: speaking ?? this.speaking,
+      cameraOn: cameraOn ?? this.cameraOn,
+      screenSharing: screenSharing ?? this.screenSharing,
     );
   }
 

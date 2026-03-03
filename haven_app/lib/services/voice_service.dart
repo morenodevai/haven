@@ -24,6 +24,12 @@ class VoiceService {
   bool _muted = false;
   bool _deafened = false;
 
+  int _inputDeviceId = -1;
+  int _outputDeviceId = -1;
+
+  /// Per-user volume: userId → 0.0 (muted) to 2.0 (amplified). Default 1.0.
+  final Map<String, double> _userVolumes = {};
+
   // Local VAD state (with hysteresis to prevent flickering)
   bool _localSpeaking = false;
   static const double _speakThreshold = 0.015;
@@ -40,7 +46,7 @@ class VoiceService {
   /// Start microphone capture. Polls every 20ms and sends encrypted audio.
   Future<void> startCapture() async {
     _capture = WinAudioCapture();
-    _capture!.start();
+    _capture!.start(deviceId: _inputDeviceId);
 
     // Poll mic every 15ms (slightly faster than 20ms frame to avoid missing buffers)
     _captureTimer = Timer.periodic(const Duration(milliseconds: 15), (_) {
@@ -51,7 +57,7 @@ class VoiceService {
   /// Start audio playback (opens speaker device).
   Future<void> startPlayback() async {
     _playback = WinAudioPlayback();
-    _playback!.start();
+    _playback!.start(deviceId: _outputDeviceId);
   }
 
   /// Handle incoming voice audio from another participant.
@@ -61,9 +67,13 @@ class VoiceService {
     final pcm = CryptoService.decryptVoiceSync(_keyBase64, encryptedBase64);
     if (pcm == null || pcm.isEmpty) return;
 
-    _playback!.feed(pcm);
+    // Apply per-user volume scaling
+    final volume = _userVolumes[userId] ?? 1.0;
+    final scaled = volume == 1.0 ? pcm : _scaleVolume(pcm, volume);
 
-    // Remote VAD — update speaking indicator
+    _playback!.feed(scaled);
+
+    // Remote VAD — update speaking indicator (use original PCM for accuracy)
     final speaking = _computeRms(pcm) > 0.01;
     onRemoteSpeakingChanged?.call(userId, speaking);
   }
@@ -79,6 +89,33 @@ class VoiceService {
 
   /// Toggle deafen (stops receiving audio).
   void setDeafened(bool deafened) => _deafened = deafened;
+
+  /// Set volume for a specific user (0.0 = muted, 1.0 = normal, 2.0 = max).
+  void setUserVolume(String userId, double volume) {
+    _userVolumes[userId] = volume.clamp(0.0, 2.0);
+  }
+
+  /// Switch input (microphone) device. Stops and restarts capture.
+  void setInputDevice(int deviceId) {
+    _inputDeviceId = deviceId;
+    if (_capture != null && _capture!.isActive) {
+      _captureTimer?.cancel();
+      _capture!.stop();
+      _capture!.start(deviceId: _inputDeviceId);
+      _captureTimer = Timer.periodic(const Duration(milliseconds: 15), (_) {
+        _pollAndSend();
+      });
+    }
+  }
+
+  /// Switch output (speaker) device. Stops and restarts playback.
+  void setOutputDevice(int deviceId) {
+    _outputDeviceId = deviceId;
+    if (_playback != null && _playback!.isActive) {
+      _playback!.stop();
+      _playback!.start(deviceId: _outputDeviceId);
+    }
+  }
 
   /// Stop all audio and release resources.
   Future<void> dispose() async {
@@ -128,6 +165,21 @@ class VoiceService {
         }
       }
     }
+  }
+
+  /// Scale 16-bit PCM samples by [factor]. Clamps to Int16 range.
+  static Uint8List _scaleVolume(Uint8List pcm, double factor) {
+    if (pcm.length < 2) return pcm;
+    final result = Uint8List(pcm.length);
+    final src = ByteData.view(pcm.buffer, pcm.offsetInBytes, pcm.length);
+    final dst = ByteData.view(result.buffer);
+    final sampleCount = pcm.length ~/ 2;
+    for (int i = 0; i < sampleCount; i++) {
+      final sample = src.getInt16(i * 2, Endian.little);
+      final scaled = (sample * factor).round().clamp(-32768, 32767);
+      dst.setInt16(i * 2, scaled, Endian.little);
+    }
+    return result;
   }
 
   /// Compute RMS of 16-bit PCM audio samples.

@@ -11,6 +11,14 @@ const int _waveMapper = 0xFFFFFFFF;
 const int _whdrDone = 0x00000001;
 const int _mmsyserrNoerror = 0;
 
+// ── Audio Device ──
+
+class AudioDevice {
+  final int id; // -1 = system default (WAVE_MAPPER)
+  final String name;
+  const AudioDevice({required this.id, required this.name});
+}
+
 // ── Structs ──
 
 @Packed(1)
@@ -48,6 +56,48 @@ final class WAVEHDR extends Struct {
   external int reserved;
 }
 
+// ── Device caps structs ──
+
+// WAVEINCAPSW: 80 bytes (wMid:2, wPid:2, vDriverVersion:4, szPname:64, dwFormats:4, wChannels:2, wReserved1:2)
+@Packed(1)
+final class WAVEINCAPSW extends Struct {
+  @Uint16()
+  external int wMid;
+  @Uint16()
+  external int wPid;
+  @Uint32()
+  external int vDriverVersion;
+  @Array(32)
+  external Array<Uint16> szPname;
+  @Uint32()
+  external int dwFormats;
+  @Uint16()
+  external int wChannels;
+  @Uint16()
+  external int wReserved1;
+}
+
+// WAVEOUTCAPSW: 84 bytes (same as WAVEINCAPSW + dwSupport:4)
+@Packed(1)
+final class WAVEOUTCAPSW extends Struct {
+  @Uint16()
+  external int wMid;
+  @Uint16()
+  external int wPid;
+  @Uint32()
+  external int vDriverVersion;
+  @Array(32)
+  external Array<Uint16> szPname;
+  @Uint32()
+  external int dwFormats;
+  @Uint16()
+  external int wChannels;
+  @Uint16()
+  external int wReserved1;
+  @Uint32()
+  external int dwSupport;
+}
+
 // ── Native function typedefs ──
 
 // waveIn
@@ -83,6 +133,23 @@ typedef _WaveOutHdrD = int Function(
 typedef _WaveOutSimpleN = Uint32 Function(IntPtr hwo);
 typedef _WaveOutSimpleD = int Function(int hwo);
 
+// Device enumeration
+typedef _WaveInGetNumDevsN = Uint32 Function();
+typedef _WaveInGetNumDevsD = int Function();
+
+typedef _WaveOutGetNumDevsN = Uint32 Function();
+typedef _WaveOutGetNumDevsD = int Function();
+
+typedef _WaveInGetDevCapsWN = Uint32 Function(
+    IntPtr uDeviceID, Pointer<WAVEINCAPSW> pwic, Uint32 cbwic);
+typedef _WaveInGetDevCapsWD = int Function(
+    int uDeviceID, Pointer<WAVEINCAPSW> pwic, int cbwic);
+
+typedef _WaveOutGetDevCapsWN = Uint32 Function(
+    IntPtr uDeviceID, Pointer<WAVEOUTCAPSW> pwoc, Uint32 cbwoc);
+typedef _WaveOutGetDevCapsWD = int Function(
+    int uDeviceID, Pointer<WAVEOUTCAPSW> pwoc, int cbwoc);
+
 // ── Load winmm.dll ──
 
 final DynamicLibrary _winmm = DynamicLibrary.open('winmm.dll');
@@ -115,6 +182,72 @@ final _waveOutUnprepareHeader = _winmm
     .lookupFunction<_WaveOutHdrN, _WaveOutHdrD>('waveOutUnprepareHeader');
 final _waveOutWrite =
     _winmm.lookupFunction<_WaveOutHdrN, _WaveOutHdrD>('waveOutWrite');
+
+final _waveInGetNumDevs = _winmm
+    .lookupFunction<_WaveInGetNumDevsN, _WaveInGetNumDevsD>('waveInGetNumDevs');
+final _waveOutGetNumDevs =
+    _winmm.lookupFunction<_WaveOutGetNumDevsN, _WaveOutGetNumDevsD>(
+        'waveOutGetNumDevs');
+final _waveInGetDevCapsW =
+    _winmm.lookupFunction<_WaveInGetDevCapsWN, _WaveInGetDevCapsWD>(
+        'waveInGetDevCapsW');
+final _waveOutGetDevCapsW =
+    _winmm.lookupFunction<_WaveOutGetDevCapsWN, _WaveOutGetDevCapsWD>(
+        'waveOutGetDevCapsW');
+
+// ── Device enumeration helpers ──
+
+String _readArrayName(Array<Uint16> arr, int maxLen) {
+  final units = <int>[];
+  for (int i = 0; i < maxLen; i++) {
+    final c = arr[i];
+    if (c == 0) break;
+    units.add(c);
+  }
+  return String.fromCharCodes(units);
+}
+
+/// Returns available audio input (microphone) devices.
+/// First entry is always "Default" with id=-1.
+List<AudioDevice> getInputDevices() {
+  final devices = <AudioDevice>[
+    const AudioDevice(id: -1, name: 'Default'),
+  ];
+  final count = _waveInGetNumDevs();
+  final caps = calloc<WAVEINCAPSW>();
+  for (int i = 0; i < count; i++) {
+    final r = _waveInGetDevCapsW(i, caps, sizeOf<WAVEINCAPSW>());
+    if (r == _mmsyserrNoerror) {
+      devices.add(AudioDevice(
+        id: i,
+        name: _readArrayName(caps.ref.szPname, 32),
+      ));
+    }
+  }
+  calloc.free(caps);
+  return devices;
+}
+
+/// Returns available audio output (speaker) devices.
+/// First entry is always "Default" with id=-1.
+List<AudioDevice> getOutputDevices() {
+  final devices = <AudioDevice>[
+    const AudioDevice(id: -1, name: 'Default'),
+  ];
+  final count = _waveOutGetNumDevs();
+  final caps = calloc<WAVEOUTCAPSW>();
+  for (int i = 0; i < count; i++) {
+    final r = _waveOutGetDevCapsW(i, caps, sizeOf<WAVEOUTCAPSW>());
+    if (r == _mmsyserrNoerror) {
+      devices.add(AudioDevice(
+        id: i,
+        name: _readArrayName(caps.ref.szPname, 32),
+      ));
+    }
+  }
+  calloc.free(caps);
+  return devices;
+}
 
 // ── Helper: fill WAVEFORMATEX for 16kHz mono 16-bit PCM ──
 
@@ -149,11 +282,13 @@ class WinAudioCapture {
 
   bool get isActive => _active;
 
-  /// Open the default recording device and start capturing.
-  void start() {
+  /// Open a recording device and start capturing.
+  /// [deviceId] defaults to -1 (WAVE_MAPPER = system default).
+  void start({int deviceId = -1}) {
     if (_active) return;
 
-    final r = _waveInOpen(_hPtr, _waveMapper, _fmt, 0, 0, _callbackNull);
+    final devId = deviceId == -1 ? _waveMapper : deviceId;
+    final r = _waveInOpen(_hPtr, devId, _fmt, 0, 0, _callbackNull);
     if (r != _mmsyserrNoerror) {
       throw AudioException('waveInOpen failed (code $r). No microphone?');
     }
@@ -253,11 +388,13 @@ class WinAudioPlayback {
 
   bool get isActive => _active;
 
-  /// Open the default playback device.
-  void start() {
+  /// Open a playback device.
+  /// [deviceId] defaults to -1 (WAVE_MAPPER = system default).
+  void start({int deviceId = -1}) {
     if (_active) return;
 
-    final r = _waveOutOpen(_hPtr, _waveMapper, _fmt, 0, 0, _callbackNull);
+    final devId = deviceId == -1 ? _waveMapper : deviceId;
+    final r = _waveOutOpen(_hPtr, devId, _fmt, 0, 0, _callbackNull);
     if (r != _mmsyserrNoerror) {
       throw AudioException('waveOutOpen failed (code $r). No audio output?');
     }

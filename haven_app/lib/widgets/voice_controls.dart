@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:haven_app/config/theme.dart';
+import 'package:haven_app/providers/audio_settings_provider.dart';
+import 'package:haven_app/providers/video_provider.dart';
 import 'package:haven_app/providers/voice_provider.dart';
 
 class VoiceControls extends ConsumerWidget {
@@ -10,6 +12,7 @@ class VoiceControls extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final voiceState = ref.watch(voiceProvider);
+    final videoState = ref.watch(videoProvider);
 
     // Show error if any
     if (voiceState.error != null) {
@@ -65,6 +68,7 @@ class VoiceControls extends ConsumerWidget {
           child: ListView(
             padding: const EdgeInsets.all(16),
             children: voiceState.participants.values.map((p) {
+              final userVol = ref.watch(audioSettingsProvider).userVolumes[p.userId] ?? 1.0;
               return Card(
                 color: HavenTheme.surface,
                 margin: const EdgeInsets.only(bottom: 8),
@@ -97,6 +101,8 @@ class VoiceControls extends ConsumerWidget {
                       if (p.speaking)
                         const Icon(Icons.graphic_eq,
                             color: HavenTheme.online, size: 18),
+                      const SizedBox(width: 4),
+                      _VolumeButton(userId: p.userId, volume: userVol),
                     ],
                   ),
                 ),
@@ -131,6 +137,30 @@ class VoiceControls extends ConsumerWidget {
                 isActive: voiceState.selfDeaf,
                 onTap: () {
                   ref.read(voiceProvider.notifier).toggleDeaf();
+                },
+              ),
+              const SizedBox(width: 16),
+              _ControlButton(
+                icon: videoState.cameraEnabled
+                    ? Icons.videocam
+                    : Icons.videocam_off,
+                label: videoState.cameraEnabled ? 'Cam Off' : 'Camera',
+                isActive: videoState.cameraEnabled,
+                activeColor: HavenTheme.online,
+                onTap: () {
+                  ref.read(videoProvider.notifier).toggleCamera();
+                },
+              ),
+              const SizedBox(width: 16),
+              _ControlButton(
+                icon: videoState.screenShareEnabled
+                    ? Icons.stop_screen_share
+                    : Icons.screen_share,
+                label: videoState.screenShareEnabled ? 'Stop Share' : 'Share',
+                isActive: videoState.screenShareEnabled,
+                activeColor: HavenTheme.online,
+                onTap: () {
+                  ref.read(videoProvider.notifier).toggleScreenShare();
                 },
               ),
               const SizedBox(width: 16),
@@ -193,6 +223,127 @@ class _ControlButton extends StatelessWidget {
         Text(
           label,
           style: TextStyle(fontSize: 11, color: HavenTheme.textMuted),
+        ),
+      ],
+    );
+  }
+}
+
+class _VolumeButton extends ConsumerWidget {
+  final String userId;
+  final double volume;
+
+  const _VolumeButton({required this.userId, required this.volume});
+
+  IconData _volumeIcon(double vol) {
+    if (vol == 0) return Icons.volume_off;
+    if (vol < 1.0) return Icons.volume_down;
+    return Icons.volume_up;
+  }
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return PopupMenuButton<void>(
+      tooltip: '${(volume * 100).round()}%',
+      padding: EdgeInsets.zero,
+      constraints: const BoxConstraints(minWidth: 180),
+      color: HavenTheme.surface,
+      icon: Icon(
+        _volumeIcon(volume),
+        size: 18,
+        color: volume == 0
+            ? HavenTheme.error
+            : volume == 1.0
+                ? HavenTheme.textMuted
+                : HavenTheme.primaryLight,
+      ),
+      itemBuilder: (_) => [
+        PopupMenuItem<void>(
+          enabled: false,
+          child: _VolumeSliderContent(userId: userId, volume: volume),
+        ),
+      ],
+    );
+  }
+}
+
+class _VolumeSliderContent extends ConsumerStatefulWidget {
+  final String userId;
+  final double volume;
+
+  const _VolumeSliderContent({required this.userId, required this.volume});
+
+  @override
+  ConsumerState<_VolumeSliderContent> createState() =>
+      _VolumeSliderContentState();
+}
+
+class _VolumeSliderContentState extends ConsumerState<_VolumeSliderContent> {
+  late double _vol;
+
+  @override
+  void initState() {
+    super.initState();
+    _vol = widget.volume;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Row(
+          children: [
+            Text(
+              '${(_vol * 100).round()}%',
+              style: const TextStyle(
+                fontSize: 13,
+                color: HavenTheme.textPrimary,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+            const Spacer(),
+            InkWell(
+              onTap: () {
+                setState(() => _vol = 0);
+                ref.read(audioSettingsProvider.notifier).setUserVolume(widget.userId, 0);
+              },
+              child: const Padding(
+                padding: EdgeInsets.all(4),
+                child: Icon(Icons.volume_off, size: 16, color: HavenTheme.error),
+              ),
+            ),
+            const SizedBox(width: 8),
+            InkWell(
+              onTap: () {
+                setState(() => _vol = 1.0);
+                ref.read(audioSettingsProvider.notifier).setUserVolume(widget.userId, 1.0);
+              },
+              child: const Padding(
+                padding: EdgeInsets.all(4),
+                child: Icon(Icons.restart_alt, size: 16, color: HavenTheme.textMuted),
+              ),
+            ),
+          ],
+        ),
+        SliderTheme(
+          data: SliderThemeData(
+            activeTrackColor: HavenTheme.primaryLight,
+            inactiveTrackColor: HavenTheme.surfaceVariant,
+            thumbColor: HavenTheme.primaryLight,
+            overlayColor: HavenTheme.primaryLight.withValues(alpha: 0.2),
+            trackHeight: 3,
+            thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+          ),
+          child: Slider(
+            value: _vol,
+            min: 0,
+            max: 2.0,
+            onChanged: (v) {
+              setState(() => _vol = v);
+              ref.read(audioSettingsProvider.notifier).setUserVolume(widget.userId, v);
+            },
+          ),
         ),
       ],
     );

@@ -2,7 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:haven_app/config/theme.dart';
+import 'package:haven_app/providers/audio_settings_provider.dart';
 import 'package:haven_app/providers/auth_provider.dart';
+import 'package:haven_app/services/win_audio.dart';
 
 class SettingsDialog extends ConsumerWidget {
   const SettingsDialog({super.key});
@@ -18,12 +20,14 @@ class SettingsDialog extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final authState = ref.watch(authProvider);
     final serverUrl = ref.read(authProvider.notifier).serverUrl;
+    final audioState = ref.watch(audioSettingsProvider);
+    final audioNotifier = ref.read(audioSettingsProvider.notifier);
 
     return Dialog(
       backgroundColor: HavenTheme.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 420, maxHeight: 480),
+        constraints: const BoxConstraints(maxWidth: 420, maxHeight: 600),
         child: Padding(
           padding: const EdgeInsets.all(24),
           child: Column(
@@ -85,7 +89,26 @@ class SettingsDialog extends ConsumerWidget {
                     : HavenTheme.error,
               ),
 
-              const SizedBox(height: 24),
+              const SizedBox(height: 16),
+
+              // Audio section
+              _SectionHeader(title: 'AUDIO'),
+              const SizedBox(height: 8),
+              _DeviceRow(
+                label: 'Input Device',
+                devices: audioNotifier.inputDevices,
+                selectedId: audioState.inputDeviceId,
+                onChanged: (id) => audioNotifier.setInputDevice(id),
+              ),
+              const SizedBox(height: 4),
+              _DeviceRow(
+                label: 'Output Device',
+                devices: audioNotifier.outputDevices,
+                selectedId: audioState.outputDeviceId,
+                onChanged: (id) => audioNotifier.setOutputDevice(id),
+              ),
+
+              const SizedBox(height: 16),
 
               // About section
               _SectionHeader(title: 'ABOUT'),
@@ -178,6 +201,63 @@ class _InfoRow extends StatelessWidget {
               fontFamily: mono ? 'monospace' : null,
             ),
             overflow: TextOverflow.ellipsis,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _DeviceRow extends StatelessWidget {
+  final String label;
+  final List<AudioDevice> devices;
+  final int selectedId;
+  final ValueChanged<int> onChanged;
+
+  const _DeviceRow({
+    required this.label,
+    required this.devices,
+    required this.selectedId,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        SizedBox(
+          width: 100,
+          child: Text(
+            label,
+            style: TextStyle(
+              fontSize: 13,
+              color: HavenTheme.textSecondary,
+            ),
+          ),
+        ),
+        Expanded(
+          child: DropdownButtonHideUnderline(
+            child: DropdownButton<int>(
+              value: selectedId,
+              isExpanded: true,
+              dropdownColor: HavenTheme.surface,
+              style: const TextStyle(
+                fontSize: 13,
+                color: HavenTheme.textPrimary,
+              ),
+              items: devices.map((d) {
+                return DropdownMenuItem<int>(
+                  value: d.id,
+                  child: Text(
+                    d.name,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                );
+              }).toList(),
+              onChanged: (id) {
+                if (id != null) onChanged(id);
+              },
+            ),
           ),
         ),
       ],

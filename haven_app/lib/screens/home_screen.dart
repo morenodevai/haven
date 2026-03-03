@@ -11,11 +11,13 @@ import 'package:haven_app/providers/message_provider.dart';
 import 'package:haven_app/providers/file_transfer_provider.dart';
 import 'package:haven_app/providers/presence_provider.dart';
 import 'package:haven_app/providers/typing_provider.dart';
+import 'package:haven_app/providers/video_provider.dart';
 import 'package:haven_app/providers/voice_provider.dart';
 import 'package:haven_app/services/file_transfer_service.dart';
 import 'package:haven_app/screens/chat_screen.dart';
 import 'package:haven_app/screens/file_transfer_screen.dart';
 import 'package:haven_app/widgets/sidebar.dart';
+import 'package:haven_app/widgets/video_panel.dart';
 import 'package:haven_app/widgets/voice_controls.dart';
 
 class HomeScreen extends ConsumerStatefulWidget {
@@ -97,10 +99,30 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
     gateway.on('VoiceStateUpdate', (event) {
       ref.read(voiceProvider.notifier).handleVoiceStateUpdate(event);
+
+      // Notify video provider of peer join/leave
+      final vsData = event['data'] as Map<String, dynamic>;
+      final vsUserId = vsData['user_id'] as String;
+      final vsSessionId = vsData['session_id'] as String?;
+      final myUserId = ref.read(authProvider).userId;
+      if (vsUserId != myUserId) {
+        if (vsSessionId != null) {
+          ref.read(videoProvider.notifier).handlePeerJoined(vsUserId);
+        } else {
+          ref.read(videoProvider.notifier).handlePeerLeft(vsUserId);
+        }
+      }
     });
 
     gateway.on('VoiceAudioData', (event) {
       ref.read(voiceProvider.notifier).handleAudioData(event);
+    });
+
+    gateway.on('VoiceSignal', (event) {
+      final data = event['data'] as Map<String, dynamic>;
+      final fromUserId = data['from_user_id'] as String;
+      final signal = data['signal'] as Map<String, dynamic>;
+      ref.read(videoProvider.notifier).handleSignal(fromUserId, signal);
     });
 
     gateway.onDisconnect(() {
@@ -132,20 +154,28 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     final activeChannel = ref.watch(activeChannelProvider);
+    final videoState = ref.watch(videoProvider);
 
     return Scaffold(
-      body: Row(
+      body: Stack(
         children: [
-          // Sidebar
-          const Sidebar(),
+          Row(
+            children: [
+              // Sidebar
+              const Sidebar(),
 
-          // Divider
-          const VerticalDivider(width: 1, thickness: 1),
+              // Divider
+              const VerticalDivider(width: 1, thickness: 1),
 
-          // Main content area
-          Expanded(
-            child: _buildContent(activeChannel),
+              // Main content area
+              Expanded(
+                child: _buildContent(activeChannel),
+              ),
+            ],
           ),
+
+          // Floating video panel overlay
+          if (videoState.panelVisible) const VideoPanel(),
         ],
       ),
     );

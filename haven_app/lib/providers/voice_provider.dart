@@ -2,9 +2,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:haven_app/config/constants.dart';
 import 'package:haven_app/models/voice_participant.dart';
+import 'package:haven_app/providers/audio_settings_provider.dart';
 import 'package:haven_app/providers/auth_provider.dart';
 import 'package:haven_app/providers/gateway_provider.dart';
 import 'package:haven_app/services/voice_service.dart';
+import 'package:haven_app/providers/video_provider.dart';
 import 'package:haven_app/services/win_audio.dart';
 
 class VoiceState {
@@ -68,6 +70,18 @@ class VoiceNotifier extends StateNotifier<VoiceState> {
         },
       );
 
+      // Wire audio settings → voice service
+      final audioSettings = _ref.read(audioSettingsProvider.notifier);
+      audioSettings.onInputDeviceChanged = (id) => voiceService.setInputDevice(id);
+      audioSettings.onOutputDeviceChanged = (id) => voiceService.setOutputDevice(id);
+      audioSettings.onUserVolumeChanged = (userId, vol) => voiceService.setUserVolume(userId, vol);
+
+      // Apply current audio settings
+      final audioState = _ref.read(audioSettingsProvider);
+      for (final entry in audioState.userVolumes.entries) {
+        voiceService.setUserVolume(entry.key, entry.value);
+      }
+
       // Start playback first — if speakers fail, that's a real error
       await voiceService.startPlayback();
 
@@ -83,6 +97,9 @@ class VoiceNotifier extends StateNotifier<VoiceState> {
       state = state.copyWith(isInVoice: true, selfMute: noMic, selfDeaf: false);
 
       gateway.voiceJoin(HavenConstants.voiceChannelId);
+
+      // Initialize WebRTC for video/screen share
+      _ref.read(videoProvider.notifier).initWebRTC();
     } on AudioException catch (e) {
       state = state.copyWith(error: e.message);
     } catch (e) {
@@ -90,8 +107,14 @@ class VoiceNotifier extends StateNotifier<VoiceState> {
     }
   }
 
-  /// Leave the voice channel — closes audio, sends VoiceLeave.
+  /// Leave the voice channel — closes audio + video, sends VoiceLeave.
   Future<void> leaveVoice() async {
+    final audioSettings = _ref.read(audioSettingsProvider.notifier);
+    audioSettings.onInputDeviceChanged = null;
+    audioSettings.onOutputDeviceChanged = null;
+    audioSettings.onUserVolumeChanged = null;
+
+    await _ref.read(videoProvider.notifier).disposeWebRTC();
     _ref.read(gatewayServiceProvider).voiceLeave();
     await _voiceService?.dispose();
     _voiceService = null;

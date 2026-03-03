@@ -5,6 +5,7 @@ import 'package:haven_app/config/constants.dart';
 import 'package:haven_app/config/theme.dart';
 import 'package:haven_app/models/channel.dart';
 import 'package:haven_app/models/user.dart';
+import 'package:haven_app/providers/audio_settings_provider.dart';
 import 'package:haven_app/providers/auth_provider.dart';
 import 'package:haven_app/providers/channel_provider.dart';
 import 'package:haven_app/providers/presence_provider.dart';
@@ -23,6 +24,20 @@ class Sidebar extends ConsumerWidget {
       case ChannelType.file:
         return Icons.folder_shared;
     }
+  }
+
+  void _showVolumePopup(BuildContext context, WidgetRef ref, Offset position, String userId, double volume) {
+    final overlay = Overlay.of(context);
+    late OverlayEntry entry;
+    entry = OverlayEntry(
+      builder: (ctx) => _SidebarVolumeOverlay(
+        position: position,
+        userId: userId,
+        initialVolume: volume,
+        onDismiss: () => entry.remove(),
+      ),
+    );
+    overlay.insert(entry);
   }
 
   @override
@@ -120,36 +135,56 @@ class Sidebar extends ConsumerWidget {
                   ),
                   const SizedBox(height: 4),
                   ...voiceState.participants.values.map((p) {
+                    final userVol = ref.watch(audioSettingsProvider).userVolumes[p.userId] ?? 1.0;
                     return Padding(
                       padding: const EdgeInsets.symmetric(vertical: 2),
-                      child: Row(
-                        children: [
-                          Icon(
-                            p.speaking ? Icons.volume_up : Icons.volume_off,
-                            size: 14,
-                            color: p.speaking
-                                ? HavenTheme.online
-                                : HavenTheme.textMuted,
-                          ),
-                          const SizedBox(width: 6),
-                          Text(
-                            p.username,
-                            style: TextStyle(
-                              fontSize: 13,
-                              color: HavenTheme.textSecondary,
+                      child: GestureDetector(
+                        onSecondaryTapUp: (details) {
+                          _showVolumePopup(context, ref, details.globalPosition, p.userId, userVol);
+                        },
+                        child: Row(
+                          children: [
+                            Icon(
+                              p.speaking ? Icons.volume_up : Icons.volume_off,
+                              size: 14,
+                              color: p.speaking
+                                  ? HavenTheme.online
+                                  : HavenTheme.textMuted,
                             ),
-                          ),
-                          if (p.selfMute) ...[
-                            const SizedBox(width: 4),
-                            Icon(Icons.mic_off, size: 12,
-                                color: HavenTheme.error),
+                            const SizedBox(width: 6),
+                            Expanded(
+                              child: Text(
+                                p.username,
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  color: HavenTheme.textSecondary,
+                                ),
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                            if (p.selfMute) ...[
+                              const SizedBox(width: 4),
+                              Icon(Icons.mic_off, size: 12,
+                                  color: HavenTheme.error),
+                            ],
+                            if (p.selfDeaf) ...[
+                              const SizedBox(width: 4),
+                              Icon(Icons.headset_off, size: 12,
+                                  color: HavenTheme.error),
+                            ],
+                            if (userVol != 1.0) ...[
+                              const SizedBox(width: 4),
+                              Tooltip(
+                                message: '${(userVol * 100).round()}%',
+                                child: Icon(
+                                  userVol == 0 ? Icons.volume_off : Icons.volume_down,
+                                  size: 12,
+                                  color: userVol == 0 ? HavenTheme.error : HavenTheme.primaryLight,
+                                ),
+                              ),
+                            ],
                           ],
-                          if (p.selfDeaf) ...[
-                            const SizedBox(width: 4),
-                            Icon(Icons.headset_off, size: 12,
-                                color: HavenTheme.error),
-                          ],
-                        ],
+                        ),
                       ),
                     );
                   }),
@@ -352,6 +387,114 @@ class _OnlineUserTile extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _SidebarVolumeOverlay extends ConsumerStatefulWidget {
+  final Offset position;
+  final String userId;
+  final double initialVolume;
+  final VoidCallback onDismiss;
+
+  const _SidebarVolumeOverlay({
+    required this.position,
+    required this.userId,
+    required this.initialVolume,
+    required this.onDismiss,
+  });
+
+  @override
+  ConsumerState<_SidebarVolumeOverlay> createState() =>
+      _SidebarVolumeOverlayState();
+}
+
+class _SidebarVolumeOverlayState extends ConsumerState<_SidebarVolumeOverlay> {
+  late double _vol;
+
+  @override
+  void initState() {
+    super.initState();
+    _vol = widget.initialVolume;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      children: [
+        // Dismiss on tap outside
+        Positioned.fill(
+          child: GestureDetector(
+            onTap: widget.onDismiss,
+            behavior: HitTestBehavior.opaque,
+            child: const SizedBox.expand(),
+          ),
+        ),
+        Positioned(
+          left: widget.position.dx,
+          top: widget.position.dy,
+          child: Material(
+            color: HavenTheme.surface,
+            elevation: 8,
+            borderRadius: BorderRadius.circular(8),
+            child: Container(
+              width: 180,
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(
+                    children: [
+                      Text(
+                        'Volume: ${(_vol * 100).round()}%',
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: HavenTheme.textPrimary,
+                        ),
+                      ),
+                      const Spacer(),
+                      InkWell(
+                        onTap: () {
+                          setState(() => _vol = 0);
+                          ref.read(audioSettingsProvider.notifier).setUserVolume(widget.userId, 0);
+                        },
+                        child: const Icon(Icons.volume_off, size: 14, color: HavenTheme.error),
+                      ),
+                      const SizedBox(width: 8),
+                      InkWell(
+                        onTap: () {
+                          setState(() => _vol = 1.0);
+                          ref.read(audioSettingsProvider.notifier).setUserVolume(widget.userId, 1.0);
+                        },
+                        child: const Icon(Icons.restart_alt, size: 14, color: HavenTheme.textMuted),
+                      ),
+                    ],
+                  ),
+                  SliderTheme(
+                    data: SliderThemeData(
+                      activeTrackColor: HavenTheme.primaryLight,
+                      inactiveTrackColor: HavenTheme.surfaceVariant,
+                      thumbColor: HavenTheme.primaryLight,
+                      overlayColor: HavenTheme.primaryLight.withValues(alpha: 0.2),
+                      trackHeight: 3,
+                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5),
+                    ),
+                    child: Slider(
+                      value: _vol,
+                      min: 0,
+                      max: 2.0,
+                      onChanged: (v) {
+                        setState(() => _vol = v);
+                        ref.read(audioSettingsProvider.notifier).setUserVolume(widget.userId, v);
+                      },
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
