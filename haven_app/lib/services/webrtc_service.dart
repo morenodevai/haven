@@ -82,13 +82,13 @@ class WebRTCService {
 
   /// Handle an incoming signaling message from the gateway.
   Future<void> handleSignal(String fromUserId, Map<String, dynamic> signal) async {
-    final type = signal['type'] as String?;
+    final type = signal['signal_type'] as String?;
     if (type == null) return;
 
     switch (type) {
       case 'TrackInfo':
         final streamId = signal['stream_id'] as String;
-        final kindStr = signal['kind'] as String;
+        final kindStr = signal['track_type'] as String;
         final kind = kindStr == 'screen' ? VideoTrackKind.screen : VideoTrackKind.camera;
         _pendingTrackInfo.putIfAbsent(fromUserId, () => {})[streamId] = kind;
         break;
@@ -132,18 +132,46 @@ class WebRTCService {
     _cameraStream = null;
   }
 
+  /// Callback for showing the screen source picker UI.
+  /// Must be set before calling startScreenShare.
+  Future<DesktopCapturerSource?> Function(List<DesktopCapturerSource> sources)? onPickScreenSource;
+
   /// Start screen share and add tracks to all peers.
+  /// Uses desktopCapturer to enumerate sources, then presents a picker.
   Future<MediaStream?> startScreenShare() async {
     if (_screenStream != null) return _screenStream;
 
-    _screenStream = await navigator.mediaDevices.getDisplayMedia({
-      'video': true,
+    // Enumerate available screens and windows
+    final sources = await desktopCapturer.getSources(
+      types: [SourceType.Screen, SourceType.Window],
+    );
+
+    if (sources.isEmpty) return null;
+
+    // Let user pick a source
+    DesktopCapturerSource? selected;
+    if (onPickScreenSource != null) {
+      selected = await onPickScreenSource!(sources);
+    } else if (sources.isNotEmpty) {
+      // Fallback: pick entire screen (first Screen source)
+      selected = sources.firstWhere(
+        (s) => s.type == SourceType.Screen,
+        orElse: () => sources.first,
+      );
+    }
+    if (selected == null) return null;
+
+    // Create stream from selected source
+    _screenStream = await navigator.mediaDevices.getUserMedia({
+      'video': {
+        'deviceId': {'exact': selected.id},
+        'mandatory': {'frameRate': 30.0},
+      },
       'audio': false,
     });
 
-    // Handle user cancelling the screen picker
-    if (_screenStream!.getVideoTracks().isEmpty) {
-      await _screenStream!.dispose();
+    if (_screenStream == null || _screenStream!.getVideoTracks().isEmpty) {
+      _screenStream?.dispose();
       _screenStream = null;
       return null;
     }
@@ -187,10 +215,10 @@ class WebRTCService {
 
     pc.onIceCandidate = (candidate) {
       _gateway.voiceSignalSend(peerId, {
-        'type': 'IceCandidate',
+        'signal_type': 'IceCandidate',
         'candidate': candidate.candidate,
-        'sdpMid': candidate.sdpMid,
-        'sdpMLineIndex': candidate.sdpMLineIndex,
+        'sdp_mid': candidate.sdpMid,
+        'sdp_m_line_index': candidate.sdpMLineIndex,
       });
     };
 
@@ -238,7 +266,7 @@ class WebRTCService {
     await pc.setLocalDescription(offer);
 
     _gateway.voiceSignalSend(peerId, {
-      'type': 'Offer',
+      'signal_type': 'Offer',
       'sdp': offer.sdp,
     });
   }
@@ -269,7 +297,7 @@ class WebRTCService {
     await pc.setLocalDescription(answer);
 
     _gateway.voiceSignalSend(fromUserId, {
-      'type': 'Answer',
+      'signal_type': 'Answer',
       'sdp': answer.sdp,
     });
   }
@@ -290,16 +318,16 @@ class WebRTCService {
 
     await pc.addCandidate(RTCIceCandidate(
       signal['candidate'] as String,
-      signal['sdpMid'] as String?,
-      signal['sdpMLineIndex'] as int?,
+      signal['sdp_mid'] as String?,
+      signal['sdp_m_line_index'] as int?,
     ));
   }
 
   void _sendTrackInfo(String peerId, String streamId, VideoTrackKind kind) {
     _gateway.voiceSignalSend(peerId, {
-      'type': 'TrackInfo',
+      'signal_type': 'TrackInfo',
       'stream_id': streamId,
-      'kind': kind == VideoTrackKind.screen ? 'screen' : 'camera',
+      'track_type': kind == VideoTrackKind.screen ? 'screen' : 'camera',
     });
   }
 

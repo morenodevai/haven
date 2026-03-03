@@ -153,6 +153,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Provide BuildContext to video provider for screen picker dialog
+    ref.read(videoProvider.notifier).overlayContext = context;
+
     final activeChannel = ref.watch(activeChannelProvider);
     final videoState = ref.watch(videoProvider);
 
