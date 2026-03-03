@@ -183,17 +183,21 @@ class VideoNotifier extends StateNotifier<VideoState> {
       );
       state = state.copyWith(panelVisible: state.hasAnyVideo);
     } else {
-      final stream = await _webrtcService!.startScreenShare();
-      if (stream != null) {
-        final renderer = RTCVideoRenderer();
-        await renderer.initialize();
-        renderer.srcObject = stream;
-        state = state.copyWith(
-          screenShareEnabled: true,
-          localScreenStream: stream,
-          localScreenRenderer: renderer,
-          panelVisible: true,
-        );
+      try {
+        final stream = await _webrtcService!.startScreenShare();
+        if (stream != null) {
+          final renderer = RTCVideoRenderer();
+          await renderer.initialize();
+          renderer.srcObject = stream;
+          state = state.copyWith(
+            screenShareEnabled: true,
+            localScreenStream: stream,
+            localScreenRenderer: renderer,
+            panelVisible: true,
+          );
+        }
+      } catch (e) {
+        debugPrint('Screen share failed: $e');
       }
     }
   }

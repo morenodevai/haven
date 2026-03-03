@@ -161,13 +161,12 @@ class WebRTCService {
     }
     if (selected == null) return null;
 
-    // Create stream from selected source
-    _screenStream = await navigator.mediaDevices.getUserMedia({
+    // Create stream from selected source using getDisplayMedia (not getUserMedia)
+    _screenStream = await navigator.mediaDevices.getDisplayMedia(<String, dynamic>{
       'video': {
         'deviceId': {'exact': selected.id},
         'mandatory': {'frameRate': 30.0},
       },
-      'audio': false,
     });
 
     if (_screenStream == null || _screenStream!.getVideoTracks().isEmpty) {
