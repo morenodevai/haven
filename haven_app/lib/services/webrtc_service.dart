@@ -112,7 +112,11 @@ class WebRTCService {
     if (_cameraStream != null) return _cameraStream;
 
     _cameraStream = await navigator.mediaDevices.getUserMedia({
-      'video': true,
+      'video': {
+        'width': {'ideal': 1280},
+        'height': {'ideal': 720},
+        'frameRate': {'ideal': 60},
+      },
       'audio': false,
     });
 
@@ -165,7 +169,13 @@ class WebRTCService {
     _screenStream = await navigator.mediaDevices.getDisplayMedia(<String, dynamic>{
       'video': {
         'deviceId': {'exact': selected.id},
-        'mandatory': {'frameRate': 30.0},
+        'mandatory': {
+          'frameRate': 60.0,
+          'minWidth': 1280,
+          'minHeight': 720,
+          'maxWidth': 1920,
+          'maxHeight': 1080,
+        },
       },
     });
 
@@ -243,13 +253,15 @@ class WebRTCService {
     if (_cameraStream != null) {
       _sendTrackInfo(peerId, _cameraStream!.id, VideoTrackKind.camera);
       for (final track in _cameraStream!.getTracks()) {
-        await pc.addTrack(track, _cameraStream!);
+        final sender = await pc.addTrack(track, _cameraStream!);
+        await _applyBitrate(sender, VideoTrackKind.camera);
       }
     }
     if (_screenStream != null) {
       _sendTrackInfo(peerId, _screenStream!.id, VideoTrackKind.screen);
       for (final track in _screenStream!.getTracks()) {
-        await pc.addTrack(track, _screenStream!);
+        final sender = await pc.addTrack(track, _screenStream!);
+        await _applyBitrate(sender, VideoTrackKind.screen);
       }
     }
 
@@ -262,13 +274,18 @@ class WebRTCService {
     if (pc == null) return;
 
     final offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
+    final mungedSdp = _setSdpBandwidth(offer.sdp!, _sdpBandwidthKbps);
+    final mungedOffer = RTCSessionDescription(mungedSdp, offer.type);
+    await pc.setLocalDescription(mungedOffer);
 
     _gateway.voiceSignalSend(peerId, {
       'signal_type': 'Offer',
-      'sdp': offer.sdp,
+      'sdp': mungedSdp,
     });
   }
+
+  /// SDP bandwidth for video in kbps — 10 Mbps ceiling.
+  static const _sdpBandwidthKbps = 10000;
 
   Future<void> _handleOffer(String fromUserId, Map<String, dynamic> signal) async {
     var pc = _peers[fromUserId];
@@ -293,11 +310,13 @@ class WebRTCService {
     ));
 
     final answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
+    final mungedSdp = _setSdpBandwidth(answer.sdp!, _sdpBandwidthKbps);
+    final mungedAnswer = RTCSessionDescription(mungedSdp, answer.type);
+    await pc.setLocalDescription(mungedAnswer);
 
     _gateway.voiceSignalSend(fromUserId, {
       'signal_type': 'Answer',
-      'sdp': answer.sdp,
+      'sdp': mungedSdp,
     });
   }
 
@@ -334,11 +353,52 @@ class WebRTCService {
     for (final entry in _peers.entries) {
       _sendTrackInfo(entry.key, stream.id, kind);
       for (final track in stream.getTracks()) {
-        await entry.value.addTrack(track, stream);
+        final sender = await entry.value.addTrack(track, stream);
+        await _applyBitrate(sender, kind);
       }
       // Renegotiate
       await _createAndSendOffer(entry.key);
     }
+  }
+
+  /// Set encoding parameters on an RTP sender.
+  /// Camera: 4 Mbps max, Screen share: 8 Mbps max.
+  /// degradationPreference = maintain-resolution so encoder drops frames, not pixels.
+  Future<void> _applyBitrate(RTCRtpSender sender, VideoTrackKind kind) async {
+    final params = sender.parameters;
+    final maxBitrate = kind == VideoTrackKind.screen ? 8000000 : 4000000;
+    final minBitrate = kind == VideoTrackKind.screen ? 2000000 : 1000000;
+    params.degradationPreference = RTCDegradationPreference.DISABLED;
+    if (params.encodings == null || params.encodings!.isEmpty) {
+      params.encodings = [RTCRtpEncoding(
+        maxBitrate: maxBitrate,
+        minBitrate: minBitrate,
+      )];
+    } else {
+      for (final encoding in params.encodings!) {
+        encoding.maxBitrate = maxBitrate;
+        encoding.minBitrate = minBitrate;
+      }
+    }
+    await sender.setParameters(params);
+  }
+
+  /// Munge SDP to set video bitrate via b=AS line (kbps).
+  String _setSdpBandwidth(String sdp, int kbps) {
+    final lines = sdp.split('\r\n');
+    final result = <String>[];
+    for (var i = 0; i < lines.length; i++) {
+      result.add(lines[i]);
+      // After m=video line, insert bandwidth
+      if (lines[i].startsWith('m=video')) {
+        // Remove any existing b= lines
+        while (i + 1 < lines.length && lines[i + 1].startsWith('b=')) {
+          i++;
+        }
+        result.add('b=AS:$kbps');
+      }
+    }
+    return result.join('\r\n');
   }
 
   Future<void> _removeStreamFromPeers(MediaStream stream) async {

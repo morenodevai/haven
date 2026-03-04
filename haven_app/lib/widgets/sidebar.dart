@@ -1,14 +1,17 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import 'package:haven_app/config/constants.dart';
 import 'package:haven_app/config/theme.dart';
+import 'package:haven_app/services/webrtc_service.dart';
 import 'package:haven_app/models/channel.dart';
 import 'package:haven_app/models/user.dart';
 import 'package:haven_app/providers/audio_settings_provider.dart';
 import 'package:haven_app/providers/auth_provider.dart';
 import 'package:haven_app/providers/channel_provider.dart';
 import 'package:haven_app/providers/presence_provider.dart';
+import 'package:haven_app/providers/video_provider.dart';
 import 'package:haven_app/providers/voice_provider.dart';
 import 'package:haven_app/widgets/settings_dialog.dart';
 
@@ -24,6 +27,75 @@ class Sidebar extends ConsumerWidget {
       case ChannelType.file:
         return Icons.folder_shared;
     }
+  }
+
+  List<Widget> _buildCollapsedTiles(VideoState videoState, VoiceState voiceState, WidgetRef ref) {
+    final tiles = <Widget>[];
+
+    // Remote streams
+    for (final entry in videoState.remoteStreams.entries) {
+      final peerId = entry.key;
+      for (final rs in entry.value) {
+        final participant = voiceState.participants[peerId];
+        final name = participant?.username ?? peerId.substring(0, 8);
+        final label = rs.kind == VideoTrackKind.screen ? '$name (Screen)' : name;
+        tiles.add(_collapsedTile(rs.renderer, label, ref));
+      }
+    }
+
+    // Local screen (if showOwnScreen)
+    if (videoState.screenShareEnabled && videoState.showOwnScreen && videoState.localScreenRenderer != null) {
+      tiles.add(_collapsedTile(videoState.localScreenRenderer!, 'You (Screen)', ref));
+    }
+
+    // Local camera
+    if (videoState.cameraEnabled && videoState.localCameraRenderer != null) {
+      tiles.add(_collapsedTile(videoState.localCameraRenderer!, 'You', ref, mirror: true));
+    }
+
+    return tiles;
+  }
+
+  Widget _collapsedTile(RTCVideoRenderer renderer, String label, WidgetRef ref, {bool mirror = false}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+      child: GestureDetector(
+        onTap: () => ref.read(videoProvider.notifier).setVideoMode(VideoMode.expanded),
+        child: Container(
+          height: 100,
+          decoration: BoxDecoration(
+            color: Colors.black,
+            borderRadius: BorderRadius.circular(6),
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              RTCVideoView(
+                renderer,
+                mirror: mirror,
+                objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+              ),
+              Positioned(
+                left: 4,
+                bottom: 4,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                  decoration: BoxDecoration(
+                    color: Colors.black54,
+                    borderRadius: BorderRadius.circular(3),
+                  ),
+                  child: Text(
+                    label,
+                    style: const TextStyle(color: Colors.white, fontSize: 10),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   void _showVolumePopup(BuildContext context, WidgetRef ref, Offset position, String userId, double volume) {
@@ -47,6 +119,7 @@ class Sidebar extends ConsumerWidget {
     final onlineUsers = ref.watch(presenceProvider);
     final authState = ref.watch(authProvider);
     final voiceState = ref.watch(voiceProvider);
+    final videoState = ref.watch(videoProvider);
 
     return Container(
       width: 240,
@@ -191,6 +264,25 @@ class Sidebar extends ConsumerWidget {
                 ],
               ),
             ),
+          ],
+
+          // Collapsed video thumbnails
+          if (voiceState.isInVoice && videoState.videoMode == VideoMode.collapsed && videoState.hasAnyVideo) ...[
+            const SizedBox(height: 8),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Text(
+                'VIDEO',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: HavenTheme.textMuted,
+                  letterSpacing: 1.2,
+                ),
+              ),
+            ),
+            const SizedBox(height: 4),
+            ..._buildCollapsedTiles(videoState, voiceState, ref),
           ],
 
           const Spacer(),
