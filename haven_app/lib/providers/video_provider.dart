@@ -6,6 +6,7 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import 'package:haven_app/providers/auth_provider.dart';
 import 'package:haven_app/providers/gateway_provider.dart';
+import 'package:haven_app/providers/voice_provider.dart';
 import 'package:haven_app/services/webrtc_service.dart';
 import 'package:haven_app/widgets/screen_source_picker.dart';
 
@@ -193,6 +194,7 @@ class VideoNotifier extends StateNotifier<VideoState> {
 
     if (state.screenShareEnabled) {
       await _webrtcService!.stopScreenShare();
+      _ref.read(voiceProvider.notifier).stopScreenAudioCapture();
       final renderer = state.localScreenRenderer;
       if (renderer != null) {
         renderer.srcObject = null;
@@ -210,6 +212,8 @@ class VideoNotifier extends StateNotifier<VideoState> {
           final renderer = RTCVideoRenderer();
           await renderer.initialize();
           renderer.srcObject = stream;
+          // Start capturing system audio for screen share
+          _ref.read(voiceProvider.notifier).startScreenAudioCapture();
           state = state.copyWith(
             screenShareEnabled: true,
             localScreenStream: stream,
@@ -241,6 +245,11 @@ class VideoNotifier extends StateNotifier<VideoState> {
         rs.renderer.srcObject = null;
         await rs.renderer.dispose();
       }
+    }
+
+    // Stop screen audio capture if active
+    if (state.screenShareEnabled) {
+      _ref.read(voiceProvider.notifier).stopScreenAudioCapture();
     }
 
     await _webrtcService?.dispose();

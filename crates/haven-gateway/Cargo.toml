@@ -17,3 +17,6 @@ tracing = { workspace = true }
 jsonwebtoken = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }
+md-5 = "0.10"
+hmac = "0.12"
+sha1 = "0.10"

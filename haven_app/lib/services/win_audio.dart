@@ -375,7 +375,7 @@ class WinAudioCapture {
 // ══════════════════════════════════════════════════════════════════════
 
 class WinAudioPlayback {
-  static const int _numBufs = 16;
+  static const int _numBufs = 32;
   static const int _bufBytes = 640;
 
   int _hWaveOut = 0;
@@ -478,6 +478,184 @@ class WinAudioPlayback {
     calloc.free(_hPtr);
     calloc.free(_fmt);
   }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  WinLoopbackCapture — system audio capture via WASAPI loopback (in DLL)
+// ══════════════════════════════════════════════════════════════════════
+
+/// Captures system audio output (everything playing on speakers) via
+/// WASAPI loopback in the haven_file_client.dll.
+///
+/// Output format: 48 kHz stereo 16-bit PCM.
+/// Frame size: 20ms = 960 samples * 2 channels * 2 bytes = 3840 bytes.
+class WinLoopbackCapture {
+  static const int frameBytes = 3840; // 20ms at 48kHz stereo 16-bit
+
+  static final DynamicLibrary _dll = DynamicLibrary.open('haven_file_client.dll');
+
+  static final int Function() _start = _dll
+      .lookup<NativeFunction<Int32 Function()>>('haven_loopback_start')
+      .asFunction<int Function()>();
+
+  static final int Function(Pointer<Uint8>, int) _poll = _dll
+      .lookup<NativeFunction<Int32 Function(Pointer<Uint8>, Uint32)>>('haven_loopback_poll')
+      .asFunction<int Function(Pointer<Uint8>, int)>();
+
+  static final int Function() _stop = _dll
+      .lookup<NativeFunction<Int32 Function()>>('haven_loopback_stop')
+      .asFunction<int Function()>();
+
+  // Pre-allocated poll buffer (64 KB — holds ~17 frames)
+  static final Pointer<Uint8> _buf = calloc<Uint8>(65536);
+  static const int _bufSize = 65536;
+
+  bool _active = false;
+  bool get isActive => _active;
+
+  void start() {
+    if (_active) return;
+    final r = _start();
+    if (r != 0) {
+      throw AudioException('haven_loopback_start failed ($r)');
+    }
+    _active = true;
+  }
+
+  /// Poll captured audio. Returns up to ~64 KB of 48kHz stereo 16-bit PCM.
+  Uint8List poll() {
+    if (!_active) return Uint8List(0);
+    final n = _poll(_buf, _bufSize);
+    if (n <= 0) return Uint8List(0);
+    return Uint8List.fromList(_buf.asTypedList(n));
+  }
+
+  void stop() {
+    if (!_active) return;
+    _active = false;
+    _stop();
+  }
+
+  void dispose() {
+    stop();
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  WinAudioPlayback48kStereo — 48 kHz stereo 16-bit playback
+// ══════════════════════════════════════════════════════════════════════
+
+/// Playback configured for 48 kHz stereo 16-bit PCM (for screen audio).
+/// Same buffer management as WinAudioPlayback but different audio format.
+class WinAudioPlayback48kStereo {
+  static const int _numBufs = 32;
+  static const int _bufBytes = 3840; // 20ms at 48kHz stereo 16-bit
+
+  int _hWaveOut = 0;
+  bool _active = false;
+  final Pointer<IntPtr> _hPtr = calloc<IntPtr>();
+  final Pointer<WAVEFORMATEX> _fmt = _makeFormat48kStereo();
+  final List<Pointer<WAVEHDR>> _hdrs = [];
+  final List<Pointer<Uint8>> _bufs = [];
+  final List<bool> _busy = [];
+
+  bool get isActive => _active;
+
+  void start({int deviceId = -1}) {
+    if (_active) return;
+
+    final devId = deviceId == -1 ? _waveMapper : deviceId;
+    final r = _waveOutOpen(_hPtr, devId, _fmt, 0, 0, _callbackNull);
+    if (r != _mmsyserrNoerror) {
+      throw AudioException('waveOutOpen 48k failed (code $r)');
+    }
+    _hWaveOut = _hPtr.value;
+
+    for (int i = 0; i < _numBufs; i++) {
+      final buf = calloc<Uint8>(_bufBytes);
+      final hdr = calloc<WAVEHDR>();
+      hdr.ref.lpData = buf;
+      hdr.ref.dwBufferLength = _bufBytes;
+      hdr.ref.dwFlags = 0;
+      hdr.ref.dwLoops = 0;
+
+      _check(_waveOutPrepareHeader(_hWaveOut, hdr, sizeOf<WAVEHDR>()),
+          'waveOutPrepareHeader');
+
+      _hdrs.add(hdr);
+      _bufs.add(buf);
+      _busy.add(false);
+    }
+
+    _active = true;
+  }
+
+  bool feed(Uint8List data) {
+    if (!_active || data.isEmpty) return false;
+
+    for (int i = 0; i < _numBufs; i++) {
+      if (_busy[i] && (_hdrs[i].ref.dwFlags & _whdrDone) != 0) {
+        _busy[i] = false;
+      }
+    }
+
+    for (int i = 0; i < _numBufs; i++) {
+      if (!_busy[i]) {
+        final copyLen = data.length < _bufBytes ? data.length : _bufBytes;
+        final dst = _bufs[i];
+        for (int j = 0; j < copyLen; j++) {
+          dst[j] = data[j];
+        }
+        _hdrs[i].ref.dwBufferLength = copyLen;
+
+        final r = _waveOutWrite(_hWaveOut, _hdrs[i], sizeOf<WAVEHDR>());
+        if (r == _mmsyserrNoerror) {
+          _busy[i] = true;
+          return true;
+        }
+        return false;
+      }
+    }
+
+    return false;
+  }
+
+  void stop() {
+    if (!_active) return;
+    _active = false;
+
+    _waveOutReset(_hWaveOut);
+
+    for (int i = 0; i < _numBufs; i++) {
+      _waveOutUnprepareHeader(_hWaveOut, _hdrs[i], sizeOf<WAVEHDR>());
+      calloc.free(_hdrs[i]);
+      calloc.free(_bufs[i]);
+    }
+    _hdrs.clear();
+    _bufs.clear();
+    _busy.clear();
+
+    _waveOutClose(_hWaveOut);
+    _hWaveOut = 0;
+  }
+
+  void dispose() {
+    stop();
+    calloc.free(_hPtr);
+    calloc.free(_fmt);
+  }
+}
+
+Pointer<WAVEFORMATEX> _makeFormat48kStereo() {
+  final fmt = calloc<WAVEFORMATEX>();
+  fmt.ref.wFormatTag = _waveFormatPcm;
+  fmt.ref.nChannels = 2;
+  fmt.ref.nSamplesPerSec = 48000;
+  fmt.ref.wBitsPerSample = 16;
+  fmt.ref.nBlockAlign = 4; // 2 channels * 2 bytes
+  fmt.ref.nAvgBytesPerSec = 48000 * 4;
+  fmt.ref.cbSize = 0;
+  return fmt;
 }
 
 // ── Helpers ──

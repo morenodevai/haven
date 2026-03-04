@@ -8,12 +8,25 @@ pub struct FolderFileEntry {
     pub size: u64,
 }
 
+/// TURN server credentials sent to clients in the Ready event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnServer {
+    pub urls: Vec<String>,
+    pub username: String,
+    pub credential: String,
+}
+
 /// Events sent over the WebSocket gateway.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum GatewayEvent {
     /// Server confirms successful authentication
-    Ready { user_id: Uuid, username: String },
+    Ready {
+        user_id: Uuid,
+        username: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_servers: Option<Vec<TurnServer>>,
+    },
 
     /// A new encrypted message was posted
     MessageCreate {

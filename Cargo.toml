@@ -86,6 +86,11 @@ crossbeam-channel = "0.5"
 # Encryption
 aes-gcm = "0.10"
 
+# TURN relay crypto
+md-5 = "0.10"
+hmac = "0.12"
+sha1 = "0.10"
+
 # Workspace crates
 haven-api = { path = "crates/haven-api" }
 haven-crypto = { path = "crates/haven-crypto" }

@@ -43,13 +43,13 @@ class VoiceService {
   })  : _gateway = gateway,
         _keyBase64 = keyBase64;
 
-  /// Start microphone capture. Polls every 20ms and sends encrypted audio.
+  /// Start microphone capture. Polls every 20ms, splits into frames, and sends encrypted audio.
   Future<void> startCapture() async {
     _capture = WinAudioCapture();
     _capture!.start(deviceId: _inputDeviceId);
 
-    // Poll mic every 15ms (slightly faster than 20ms frame to avoid missing buffers)
-    _captureTimer = Timer.periodic(const Duration(milliseconds: 15), (_) {
+    // Poll mic every 20ms (matches 20ms frame size at 16 kHz)
+    _captureTimer = Timer.periodic(const Duration(milliseconds: 20), (_) {
       _pollAndSend();
     });
   }
@@ -131,6 +131,9 @@ class VoiceService {
 
   // ── Internal ──
 
+  /// 20ms frame at 16 kHz mono 16-bit = 320 samples * 2 bytes = 640 bytes.
+  static const int _frameBytes = 640;
+
   void _pollAndSend() {
     if (_capture == null || !_capture!.isActive) return;
 
@@ -142,10 +145,26 @@ class VoiceService {
 
     if (_muted) return;
 
-    // Encrypt and send
-    final encrypted = CryptoService.encryptVoiceSync(_keyBase64, pcm);
-    if (encrypted.isNotEmpty) {
-      _gateway.voiceData(encrypted);
+    // Split into individual 20ms frames before encrypting.
+    // poll() can return multiple frames concatenated (e.g. 1280 bytes = 2 frames).
+    // Each frame must be encrypted and sent individually so the receiver can
+    // feed them one at a time to the playback buffer.
+    int offset = 0;
+    while (offset + _frameBytes <= pcm.length) {
+      final frame = Uint8List.sublistView(pcm, offset, offset + _frameBytes);
+      final encrypted = CryptoService.encryptVoiceSync(_keyBase64, frame);
+      if (encrypted.isNotEmpty) {
+        _gateway.voiceData(encrypted);
+      }
+      offset += _frameBytes;
+    }
+    // If there's a partial frame at the end (< 640 bytes), send it too
+    if (offset < pcm.length) {
+      final frame = Uint8List.sublistView(pcm, offset);
+      final encrypted = CryptoService.encryptVoiceSync(_keyBase64, frame);
+      if (encrypted.isNotEmpty) {
+        _gateway.voiceData(encrypted);
+      }
     }
   }
 

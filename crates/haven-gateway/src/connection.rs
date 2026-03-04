@@ -9,7 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use tracing::{info, trace, warn};
 use uuid::Uuid;
 
-use haven_types::events::{GatewayCommand, GatewayEvent};
+use haven_types::events::{GatewayCommand, GatewayEvent, TurnServer};
 
 use crate::dispatcher::{Dispatcher, UserMessage};
 
@@ -26,6 +26,7 @@ pub async fn handle_connection_authenticated(
     user_id: Uuid,
     username: String,
     file_server_url: Option<String>,
+    turn_servers: Option<Vec<TurnServer>>,
 ) {
     let (mut sender, receiver) = socket.split();
 
@@ -35,6 +36,7 @@ pub async fn handle_connection_authenticated(
     let ready = GatewayEvent::Ready {
         user_id,
         username: username.clone(),
+        turn_servers,
     };
     if sender
         .send(Message::Text(serde_json::to_string(&ready).unwrap().into()))
@@ -68,6 +70,7 @@ pub async fn handle_connection(socket: WebSocket, dispatcher: Dispatcher, jwt_se
     let ready = GatewayEvent::Ready {
         user_id,
         username: username.clone(),
+        turn_servers: None,
     };
     if sender
         .send(Message::Text(serde_json::to_string(&ready).unwrap().into()))
@@ -736,12 +739,14 @@ async fn handle_command(
 ///   0x02 FileAckSend:    [type(1)] [target_uid(16)] [transfer_id(16)] [ack_chunk_idx(4)]
 ///   0x03 FileDoneSend:   [type(1)] [target_uid(16)] [transfer_id(16)]
 ///   0x04 VoiceAudio:     [type(1)] [encrypted_payload...]
+///   0x05 ScreenAudio:    [type(1)] [encrypted_payload...]
 ///
 /// For 0x01-0x03: The server swaps `target_user_id` for `sender_user_id`
 /// and forwards the frame to the target — zero-copy relay for the encrypted payload.
 ///
-/// For 0x04: The server prepends the sender's UUID and relays to all other
-/// voice channel participants as binary frames.
+/// For 0x04-0x05: The server prepends the sender's UUID and relays to all other
+/// voice channel participants as binary frames. 0x05 is screen share system audio
+/// (48kHz stereo) routed to a separate playback pipeline on receivers.
 async fn handle_binary_message(
     dispatcher: &Dispatcher,
     sender_user_id: Uuid,
@@ -845,6 +850,25 @@ async fn handle_binary_message(
             // Build outgoing frame: [0x04][sender_uid(16)][payload]
             let mut outgoing = Vec::with_capacity(1 + 16 + payload.len());
             outgoing.push(0x04);
+            outgoing.extend_from_slice(sender_user_id.as_bytes());
+            outgoing.extend_from_slice(payload);
+
+            dispatcher
+                .relay_voice_data_binary(sender_user_id, Bytes::from(outgoing))
+                .await;
+        }
+
+        // #11: 0x05: ScreenAudio binary -- [type(1)] [encrypted_payload...]
+        // Same relay logic as VoiceAudio but separate prefix so receivers can
+        // route screen share audio to a different playback pipeline (48kHz stereo).
+        0x05 => {
+            if data.len() < 2 {
+                return;
+            }
+            let payload = &data[1..];
+
+            let mut outgoing = Vec::with_capacity(1 + 16 + payload.len());
+            outgoing.push(0x05);
             outgoing.extend_from_slice(sender_user_id.as_bytes());
             outgoing.extend_from_slice(payload);
 

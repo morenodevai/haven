@@ -27,6 +27,7 @@ use haven_api::middleware::{require_auth, JwtSecret, Claims};
 use haven_api::reactions;
 use haven_gateway::connection;
 use haven_gateway::dispatcher::Dispatcher;
+use haven_gateway::turn::{TurnConfig, TurnServer as TurnRelay};
 
 /// Placeholder values that MUST NOT be used as the JWT secret.
 const PLACEHOLDER_SECRETS: &[&str] = &[
@@ -43,6 +44,7 @@ struct ServerState {
     file_server_url: Option<String>,
     file_server_internal_url: Option<String>,
     http_client: Client,
+    turn_servers: Option<Vec<haven_types::events::TurnServer>>,
 }
 
 /// Query parameters for the WebSocket upgrade endpoint.
@@ -122,6 +124,50 @@ async fn main() -> anyhow::Result<()> {
         info!("File server internal URL (proxy target): {}", url);
     }
 
+    // ── TURN relay ────────────────────────────────────────────────────
+    let (turn_servers_for_state, turn_relay_arc) = if let (Ok(turn_user), Ok(turn_pass), Ok(public_ip)) = (
+        std::env::var("HAVEN_TURN_USER"),
+        std::env::var("HAVEN_TURN_PASS"),
+        std::env::var("HAVEN_PUBLIC_IP"),
+    ) {
+        let public_ip: std::net::IpAddr = public_ip.parse()?;
+
+        let turn_config = TurnConfig {
+            udp_port: port,  // advertise gateway port for UDP too (same port, UDP vs TCP don't conflict)
+            public_ip,
+            realm: "haven".to_string(),
+            username: turn_user.clone(),
+            password: turn_pass.clone(),
+        };
+
+        let turn_relay = std::sync::Arc::new(TurnRelay::new(turn_config));
+
+        // Spawn UDP TURN listener on the SAME port as gateway (3210)
+        // UDP and TCP don't conflict on the same port number
+        let turn_udp = turn_relay.clone();
+        let udp_port = port;
+        tokio::spawn(async move {
+            if let Err(e) = turn_udp.run_udp(udp_port).await {
+                tracing::error!("TURN UDP listener failed: {}", e);
+            }
+        });
+
+        let ice_urls = turn_relay.ice_urls();
+        info!("TURN relay listening on UDP+TCP {}", port);
+        info!("TURN ICE URLs: {:?}", ice_urls);
+
+        let servers = vec![haven_types::events::TurnServer {
+            urls: ice_urls,
+            username: turn_user,
+            credential: turn_pass,
+        }];
+
+        (Some(servers), Some(turn_relay))
+    } else {
+        info!("TURN relay not configured (set HAVEN_TURN_USER, HAVEN_TURN_PASS, HAVEN_PUBLIC_IP to enable)");
+        (None, None)
+    };
+
     let state = ServerState {
         app: app_state.clone(),
         dispatcher: dispatcher.clone(),
@@ -129,6 +175,7 @@ async fn main() -> anyhow::Result<()> {
         file_server_url,
         file_server_internal_url,
         http_client: Client::builder().no_proxy().build()?,
+        turn_servers: turn_servers_for_state,
     };
 
     // CORS -- restrict to known origins; extend via HAVEN_CORS_ORIGINS env var
@@ -196,14 +243,72 @@ async fn main() -> anyhow::Result<()> {
     socket.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(socket.into())?;
 
-    // #12: into_make_service_with_connect_info to provide SocketAddr for rate limiting
-    // #15: graceful shutdown on Ctrl+C / SIGTERM
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    if let Some(turn_relay) = turn_relay_arc {
+        // TCP multiplexing: peek first byte to route STUN/TURN vs HTTP.
+        // STUN/TURN messages start with 0x00-0x3F (first 2 bits = 00).
+        // HTTP requests start with ASCII letters (G=0x47, P=0x50, etc).
+        // This lets TURN-over-TCP share port 3210 with no new port forwards.
+        use hyper_util::rt::TokioIo;
+        use tower::Service;
+
+        info!("TCP multiplexing enabled: TURN + HTTP on port {}", port);
+
+        let mut make_svc = app.into_make_service_with_connect_info::<SocketAddr>();
+
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
+
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    let (stream, peer_addr) = match result {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::error!("TCP accept error: {}", e);
+                            continue;
+                        }
+                    };
+
+                    // Peek first byte to determine protocol
+                    let mut peek_buf = [0u8; 1];
+                    match stream.peek(&mut peek_buf).await {
+                        Ok(1) => {}
+                        _ => continue,
+                    }
+
+                    if peek_buf[0] <= 0x3F {
+                        // STUN/TURN — hand to TURN TCP handler
+                        let turn = turn_relay.clone();
+                        tokio::spawn(async move {
+                            turn.handle_tcp_connection(stream, peer_addr).await;
+                        });
+                    } else {
+                        // HTTP/WS — hand to axum via hyper
+                        let svc = make_svc.call(peer_addr).await.unwrap();
+                        let hyper_svc = hyper_util::service::TowerToHyperService::new(svc);
+                        tokio::spawn(async move {
+                            let io = TokioIo::new(stream);
+                            let _ = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                                .serve_connection_with_upgrades(io, hyper_svc)
+                                .await;
+                        });
+                    }
+                }
+                _ = &mut shutdown => {
+                    info!("Shutting down...");
+                    break;
+                }
+            }
+        }
+    } else {
+        // No TURN — standard axum serve
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    }
 
     Ok(())
 }
@@ -296,11 +401,12 @@ async fn ws_upgrade(
     info!("{} ({}) pre-authenticated for WebSocket upgrade", username, user_id);
 
     let file_server_url = state.file_server_url.clone();
+    let turn_servers = state.turn_servers.clone();
     Ok(ws
         .max_frame_size(4 * 1024 * 1024)    // 4 MB max frame (supports larger chunk sizes)
         .max_message_size(8 * 1024 * 1024) // 8 MB max message
         .on_upgrade(move |socket| {
-            connection::handle_connection_authenticated(socket, state.dispatcher, user_id, username, file_server_url)
+            connection::handle_connection_authenticated(socket, state.dispatcher, user_id, username, file_server_url, turn_servers)
         }))
 }
 

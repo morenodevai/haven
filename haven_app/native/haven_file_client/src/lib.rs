@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod download;
 pub mod fast_download;
 pub mod fast_upload;
+pub mod loopback;
 pub mod upload;
 
 use std::ffi::CStr;
@@ -467,4 +468,29 @@ pub unsafe extern "C" fn haven_free_string(ptr: *mut std::os::raw::c_char) {
     if !ptr.is_null() {
         drop(unsafe { std::ffi::CString::from_raw(ptr) });
     }
+}
+
+// ── Loopback capture FFI ─────────────────────────────────────────────────
+
+/// Start capturing system audio (WASAPI loopback).
+/// Returns 0 on success, -1 on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn haven_loopback_start() -> i32 {
+    loopback::start()
+}
+
+/// Poll captured audio. Writes up to `max_len` bytes of 48kHz stereo 16-bit PCM
+/// into `buf`. Returns bytes written, or -1 on error.
+///
+/// # Safety
+/// `buf` must point to a buffer of at least `max_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn haven_loopback_poll(buf: *mut u8, max_len: u32) -> i32 {
+    loopback::poll(buf, max_len)
+}
+
+/// Stop loopback capture. Returns 0.
+#[unsafe(no_mangle)]
+pub extern "C" fn haven_loopback_stop() -> i32 {
+    loopback::stop()
 }

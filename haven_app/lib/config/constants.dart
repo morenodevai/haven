@@ -61,4 +61,5 @@ class HavenConstants {
   static const int binaryFileAck = 0x02;
   static const int binaryFileDone = 0x03;
   static const int binaryVoiceAudio = 0x04;
+  static const int binaryScreenAudio = 0x05;
 }

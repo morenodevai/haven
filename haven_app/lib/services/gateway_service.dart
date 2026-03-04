@@ -38,6 +38,9 @@ class GatewayService {
 
   bool _isConnected = false;
 
+  /// TURN server config received from the gateway Ready event.
+  List<Map<String, dynamic>>? turnServers;
+
   GatewayService({
     required String Function() getToken,
     required String Function() getBaseUrl,
@@ -239,6 +242,16 @@ class GatewayService {
       final parsed = jsonDecode(text) as Map<String, dynamic>;
       final type = parsed['type'] as String?;
       if (type != null) {
+        // Extract TURN config from Ready event
+        if (type == 'Ready') {
+          final data = parsed['data'] as Map<String, dynamic>?;
+          if (data != null && data['turn_servers'] != null) {
+            turnServers = (data['turn_servers'] as List)
+                .map((s) => Map<String, dynamic>.from(s as Map))
+                .toList();
+          }
+        }
+
         final handlers = _handlers[type];
         if (handlers != null) {
           for (final handler in handlers) {

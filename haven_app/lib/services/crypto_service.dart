@@ -272,4 +272,62 @@ class CryptoService {
       return null;
     }
   }
+
+  /// Encrypt raw PCM audio → raw bytes (IV + ciphertext + tag).
+  /// For binary transport (no base64 overhead).
+  static Uint8List encryptVoiceSyncBytes(String keyBase64, Uint8List pcmData) {
+    final key = base64.decode(keyBase64);
+    final nonce = _generateNonce();
+
+    final cipher = GCMBlockCipher(AESEngine())
+      ..init(
+        true,
+        AEADParameters(
+          KeyParameter(Uint8List.fromList(key)),
+          128,
+          Uint8List.fromList(nonce),
+          Uint8List(0),
+        ),
+      );
+
+    final outputBuf = Uint8List(cipher.getOutputSize(pcmData.length));
+    final len = cipher.processBytes(pcmData, 0, pcmData.length, outputBuf, 0);
+    final finalLen = cipher.doFinal(outputBuf, len);
+    final ciphertext = outputBuf.sublist(0, len + finalLen);
+
+    final combined = Uint8List(12 + ciphertext.length);
+    combined.setRange(0, 12, nonce);
+    combined.setRange(12, combined.length, ciphertext);
+    return combined;
+  }
+
+  /// Decrypt raw bytes (IV + ciphertext + tag) → raw PCM.
+  /// For binary transport (no base64).
+  static Uint8List? decryptVoiceSyncBytes(String keyBase64, Uint8List combined) {
+    try {
+      if (combined.length < 29) return null;
+
+      final nonce = combined.sublist(0, 12);
+      final ciphertext = combined.sublist(12);
+
+      final cipher = GCMBlockCipher(AESEngine())
+        ..init(
+          false,
+          AEADParameters(
+            KeyParameter(Uint8List.fromList(base64.decode(keyBase64))),
+            128,
+            Uint8List.fromList(nonce),
+            Uint8List(0),
+          ),
+        );
+
+      final outputBuf = Uint8List(cipher.getOutputSize(ciphertext.length));
+      final len = cipher.processBytes(
+          ciphertext, 0, ciphertext.length, outputBuf, 0);
+      final finalLen = cipher.doFinal(outputBuf, len);
+      return outputBuf.sublist(0, len + finalLen);
+    } catch (_) {
+      return null;
+    }
+  }
 }

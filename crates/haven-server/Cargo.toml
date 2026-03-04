@@ -24,6 +24,8 @@ jsonwebtoken = { workspace = true }
 
 reqwest = { workspace = true }
 futures-util = { workspace = true }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 
 haven-api = { workspace = true }
 haven-db = { workspace = true }

@@ -37,11 +37,31 @@ class WebRTCService {
   void Function(RemoteVideoTrack track)? onRemoteTrackAdded;
   void Function(String peerId, String streamId)? onRemoteTrackRemoved;
 
-  static const _rtcConfig = {
-    'iceServers': [
+  /// Build ICE config dynamically, including TURN servers from gateway if available.
+  Map<String, dynamic> get _rtcConfig {
+    final iceServers = <Map<String, dynamic>>[
       {'urls': 'stun:stun.l.google.com:19302'},
-    ],
-  };
+    ];
+
+    // Add TURN servers from gateway Ready event
+    final turns = _gateway.turnServers;
+    if (turns != null) {
+      for (final server in turns) {
+        final urls = server['urls'];
+        final username = server['username'] as String?;
+        final credential = server['credential'] as String?;
+        if (urls != null && username != null && credential != null) {
+          iceServers.add({
+            'urls': urls,
+            'username': username,
+            'credential': credential,
+          });
+        }
+      }
+    }
+
+    return {'iceServers': iceServers};
+  }
 
   WebRTCService({
     required GatewayService gateway,
@@ -166,6 +186,8 @@ class WebRTCService {
     if (selected == null) return null;
 
     // Create stream from selected source using getDisplayMedia (not getUserMedia)
+    // Note: audio is captured separately via WASAPI loopback (ScreenAudioService)
+    // since getDisplayMedia audio doesn't work on desktop flutter_webrtc.
     _screenStream = await navigator.mediaDevices.getDisplayMedia(<String, dynamic>{
       'video': {
         'deviceId': {'exact': selected.id},
@@ -365,6 +387,8 @@ class WebRTCService {
   /// Camera: 4 Mbps max, Screen share: 8 Mbps max.
   /// degradationPreference = maintain-resolution so encoder drops frames, not pixels.
   Future<void> _applyBitrate(RTCRtpSender sender, VideoTrackKind kind) async {
+    // Only apply video bitrate settings to video tracks
+    if (sender.track?.kind != 'video') return;
     final params = sender.parameters;
     final maxBitrate = kind == VideoTrackKind.screen ? 8000000 : 4000000;
     final minBitrate = kind == VideoTrackKind.screen ? 2000000 : 1000000;

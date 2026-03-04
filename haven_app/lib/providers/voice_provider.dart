@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:haven_app/config/constants.dart';
@@ -5,6 +7,7 @@ import 'package:haven_app/models/voice_participant.dart';
 import 'package:haven_app/providers/audio_settings_provider.dart';
 import 'package:haven_app/providers/auth_provider.dart';
 import 'package:haven_app/providers/gateway_provider.dart';
+import 'package:haven_app/services/screen_audio_service.dart';
 import 'package:haven_app/services/voice_service.dart';
 import 'package:haven_app/providers/video_provider.dart';
 import 'package:haven_app/services/win_audio.dart';
@@ -45,6 +48,8 @@ class VoiceState {
 class VoiceNotifier extends StateNotifier<VoiceState> {
   final Ref _ref;
   VoiceService? _voiceService;
+  ScreenAudioService? _screenAudioService;
+  void Function(Uint8List)? _binaryHandler;
 
   VoiceNotifier(this._ref) : super(const VoiceState());
 
@@ -94,6 +99,17 @@ class VoiceNotifier extends StateNotifier<VoiceState> {
       }
 
       _voiceService = voiceService;
+
+      // Screen audio service — receives screen share audio from peers
+      _screenAudioService = ScreenAudioService(
+        gateway: gateway,
+        keyBase64: HavenConstants.defaultChannelKey,
+      );
+
+      // Register binary handler for incoming screen audio (0x05)
+      _binaryHandler = _handleBinaryMessage;
+      gateway.onBinary(_binaryHandler!);
+
       state = state.copyWith(isInVoice: true, selfMute: noMic, selfDeaf: false);
 
       gateway.voiceJoin(HavenConstants.voiceChannelId);
@@ -118,6 +134,15 @@ class VoiceNotifier extends StateNotifier<VoiceState> {
     _ref.read(gatewayServiceProvider).voiceLeave();
     await _voiceService?.dispose();
     _voiceService = null;
+
+    // Clean up screen audio
+    _screenAudioService?.dispose();
+    _screenAudioService = null;
+    if (_binaryHandler != null) {
+      _ref.read(gatewayServiceProvider).offBinary(_binaryHandler!);
+      _binaryHandler = null;
+    }
+
     state = const VoiceState();
   }
 
@@ -193,7 +218,41 @@ class VoiceNotifier extends StateNotifier<VoiceState> {
     state = state.copyWith(participants: updated);
   }
 
+  /// Start capturing system audio for screen share.
+  void startScreenAudioCapture() {
+    _screenAudioService?.startCapture();
+  }
+
+  /// Stop capturing system audio.
+  void stopScreenAudioCapture() {
+    _screenAudioService?.stopCapture();
+  }
+
+  /// Handle incoming binary WebSocket frames.
+  /// Routes 0x05 screen audio to the screen audio service.
+  void _handleBinaryMessage(Uint8List data) {
+    if (data.length < 18) return; // 1 type + 16 uuid + 1 payload min
+    final type = data[0];
+
+    if (type == 0x05) {
+      // Screen audio: [0x05][sender_uid(16)][encrypted_payload]
+      final senderBytes = data.sublist(1, 17);
+      // Convert UUID bytes to string (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+      final hex = senderBytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+      final userId = '${hex.substring(0, 8)}-${hex.substring(8, 12)}-'
+          '${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20, 32)}';
+      final payload = data.sublist(17);
+      _screenAudioService?.handleScreenAudio(userId, payload);
+    }
+  }
+
   void clear() {
+    _screenAudioService?.dispose();
+    _screenAudioService = null;
+    if (_binaryHandler != null) {
+      _ref.read(gatewayServiceProvider).offBinary(_binaryHandler!);
+      _binaryHandler = null;
+    }
     _voiceService?.dispose();
     _voiceService = null;
     state = const VoiceState();
