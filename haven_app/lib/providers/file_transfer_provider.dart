@@ -72,6 +72,8 @@ class FileTransferNotifier extends StateNotifier<FileTransferState> {
   void init(FileTransferService service) {
     _service = service;
     _service!.onProgressUpdate = _syncState;
+    // Initialize local DB and resume incomplete transfers
+    _service!.initAndResume().then((_) => _syncState());
   }
 
   void _syncState() {

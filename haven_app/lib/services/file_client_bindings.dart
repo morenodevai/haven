@@ -92,6 +92,29 @@ typedef _FreeStringDart = void Function(Pointer<Utf8> ptr);
 typedef _GetLastErrorNative = Pointer<Utf8> Function(Pointer<Void> handle);
 typedef _GetLastErrorDart = Pointer<Utf8> Function(Pointer<Void> handle);
 
+typedef _ResumeUploadNative = Pointer<Void> Function(
+  Pointer<Utf8> filePath,
+  Pointer<Utf8> serverUrl,
+  Pointer<Utf8> transferId,
+  Pointer<Utf8> jwtToken,
+  Pointer<Utf8> masterKey,
+  Pointer<Utf8> salt,
+  Pointer<Utf8> fileSha256,
+  Pointer<Utf8> chunkHashesJson,
+  Uint32 startChunk,
+);
+typedef _ResumeUploadDart = Pointer<Void> Function(
+  Pointer<Utf8> filePath,
+  Pointer<Utf8> serverUrl,
+  Pointer<Utf8> transferId,
+  Pointer<Utf8> jwtToken,
+  Pointer<Utf8> masterKey,
+  Pointer<Utf8> salt,
+  Pointer<Utf8> fileSha256,
+  Pointer<Utf8> chunkHashesJson,
+  int startChunk,
+);
+
 // Fast transfer typedefs (same signatures as regular upload/download)
 typedef _FastUploadNative = _UploadFileNative;
 typedef _FastUploadDart = _UploadFileDart;
@@ -109,6 +132,9 @@ class FileClientBindings {
   late final _GetHashesJsonDart _getHashesJson;
   late final _FreeStringDart _freeString;
   late final _GetLastErrorDart _getLastError;
+
+  // Resume upload
+  late final _ResumeUploadDart _resumeUpload;
 
   // Fast transfer functions
   late final _FastUploadDart _fastUpload;
@@ -155,6 +181,10 @@ class FileClientBindings {
     _getLastError = lib
         .lookup<NativeFunction<_GetLastErrorNative>>('haven_get_last_error')
         .asFunction<_GetLastErrorDart>();
+
+    _resumeUpload = lib
+        .lookup<NativeFunction<_ResumeUploadNative>>('haven_resume_upload')
+        .asFunction<_ResumeUploadDart>();
 
     // Fast transfer bindings
     _fastUpload = lib
@@ -235,6 +265,44 @@ class FileClientBindings {
       );
     } finally {
       calloc.free(pSavePath);
+      calloc.free(pServerUrl);
+      calloc.free(pTransferId);
+      calloc.free(pJwtToken);
+      calloc.free(pMasterKey);
+      calloc.free(pSalt);
+      calloc.free(pFileSha256);
+      calloc.free(pChunkHashes);
+    }
+  }
+
+  /// Resume an upload from a specific chunk. Skips hashing pass.
+  Pointer<Void> resumeUpload({
+    required String filePath,
+    required String serverUrl,
+    required String transferId,
+    required String jwtToken,
+    required String masterKey,
+    required String salt,
+    required String fileSha256,
+    required String chunkHashesJson,
+    required int startChunk,
+  }) {
+    final pFilePath = filePath.toNativeUtf8();
+    final pServerUrl = serverUrl.toNativeUtf8();
+    final pTransferId = transferId.toNativeUtf8();
+    final pJwtToken = jwtToken.toNativeUtf8();
+    final pMasterKey = masterKey.toNativeUtf8();
+    final pSalt = salt.toNativeUtf8();
+    final pFileSha256 = fileSha256.toNativeUtf8();
+    final pChunkHashes = chunkHashesJson.toNativeUtf8();
+
+    try {
+      return _resumeUpload(
+        pFilePath, pServerUrl, pTransferId, pJwtToken, pMasterKey, pSalt,
+        pFileSha256, pChunkHashes, startChunk,
+      );
+    } finally {
+      calloc.free(pFilePath);
       calloc.free(pServerUrl);
       calloc.free(pTransferId);
       calloc.free(pJwtToken);

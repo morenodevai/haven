@@ -4,7 +4,7 @@ use tracing::info;
 
 /// Current schema version. Increment this and add a new migration function
 /// to the `MIGRATIONS` array when the schema changes.
-const CURRENT_VERSION: u32 = 3;
+const CURRENT_VERSION: u32 = 4;
 
 /// Each migration is a function that takes a connection and applies changes.
 /// Migrations are applied sequentially starting from the current version + 1.
@@ -15,6 +15,7 @@ const MIGRATIONS: &[MigrationFn] = &[
     migrate_v1,
     migrate_v2,
     migrate_v3,
+    migrate_v4,
 ];
 
 pub fn run(conn: &Connection) -> Result<()> {
@@ -148,6 +149,53 @@ fn migrate_v3(conn: &Connection) -> Result<()> {
         "
         INSERT OR IGNORE INTO channels (id, name)
             VALUES ('00000000-0000-0000-0000-000000000003', 'file-sharing');
+        ",
+    )?;
+    Ok(())
+}
+
+/// Version 4: Pending offers for transfer resume — persists file/folder offers
+/// so reconnecting clients can recover missed offers.
+fn migrate_v4(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pending_offers (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            transfer_id     TEXT NOT NULL,
+            from_user_id    TEXT NOT NULL,
+            to_user_id      TEXT NOT NULL,
+            filename        TEXT NOT NULL,
+            file_size       INTEGER NOT NULL,
+            file_sha256     TEXT,
+            chunk_hashes    TEXT,
+            file_server_url TEXT,
+            folder_id       TEXT,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            status          TEXT NOT NULL DEFAULT 'pending'
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pending_offers_to_user
+            ON pending_offers(to_user_id, status);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_offers_transfer
+            ON pending_offers(transfer_id);
+
+        CREATE TABLE IF NOT EXISTS pending_folder_offers (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            folder_id       TEXT NOT NULL UNIQUE,
+            from_user_id    TEXT NOT NULL,
+            to_user_id      TEXT NOT NULL,
+            folder_name     TEXT NOT NULL,
+            total_size      INTEGER NOT NULL,
+            file_count      INTEGER NOT NULL,
+            manifest        TEXT NOT NULL,
+            file_server_url TEXT,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            status          TEXT NOT NULL DEFAULT 'pending'
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pending_folder_offers_to_user
+            ON pending_folder_offers(to_user_id, status);
         ",
     )?;
     Ok(())

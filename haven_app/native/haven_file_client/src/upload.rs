@@ -278,3 +278,163 @@ pub async fn upload_file(
     progress.state.store(STATE_COMPLETE, Ordering::Relaxed);
     Ok(())
 }
+
+/// Resume an upload from a specific chunk. The transfer must already exist on the server.
+///
+/// Skips pass 1 (hashing) entirely — the caller provides pre-computed hashes.
+/// Skips chunks before `start_chunk` in pass 2 (upload).
+/// The server's chunk upload endpoint is idempotent so re-uploading is safe.
+pub async fn resume_upload(
+    file_path: &str,
+    server_url: &str,
+    transfer_id: &str,
+    jwt_token: &str,
+    master_key: &[u8],
+    salt: &[u8],
+    file_sha256: &str,
+    chunk_hashes_json: &str,
+    start_chunk: u32,
+    progress: Arc<UploadProgress>,
+) -> Result<(), String> {
+    let key = derive_key(master_key, salt);
+    let async_client = Client::new();
+
+    let path = Path::new(file_path);
+    let file_size = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| format!("Cannot read file: {}", e))?
+        .len();
+
+    let chunk_count = if file_size == 0 {
+        1
+    } else {
+        (file_size as usize + CHUNK_SIZE - 1) / CHUNK_SIZE
+    };
+
+    let chunk_hashes: Vec<String> = serde_json::from_str(chunk_hashes_json)
+        .map_err(|e| format!("Failed to parse chunk_hashes: {}", e))?;
+
+    // Store hashes so Dart can read them via FFI (same as fresh upload)
+    {
+        let json = serde_json::json!({
+            "file_sha256": file_sha256,
+            "chunk_hashes": chunk_hashes,
+        })
+        .to_string();
+        *progress.hashes_json.lock().unwrap() = Some(json);
+    }
+
+    // Calculate encrypted size for progress tracking
+    let encrypted_chunk_size = CHUNK_SIZE + 28;
+    let encrypted_size: u64 = if chunk_count == 0 {
+        0
+    } else {
+        let last_plain_size = if file_size == 0 { 0 } else { ((file_size - 1) % CHUNK_SIZE as u64) + 1 };
+        (chunk_count as u64 - 1) * encrypted_chunk_size as u64 + last_plain_size + 28
+    };
+
+    let already_done = start_chunk as u64 * encrypted_chunk_size as u64;
+    progress.bytes_total.store(encrypted_size, Ordering::Relaxed);
+    progress.bytes_done.store(already_done.min(encrypted_size), Ordering::Relaxed);
+    progress.state.store(STATE_UPLOADING, Ordering::Relaxed);
+
+    // Pass 2: sequential read → parallel encrypt + upload, starting from start_chunk
+    let semaphore = Arc::new(Semaphore::new(UPLOAD_CONCURRENCY));
+    let mut handles = Vec::with_capacity(chunk_count - start_chunk as usize);
+
+    let mut file = tokio::fs::File::open(file_path)
+        .await
+        .map_err(|e| format!("Cannot open file for upload: {}", e))?;
+
+    // Seek past already-uploaded chunks
+    if start_chunk > 0 {
+        use tokio::io::AsyncSeekExt;
+        let skip_bytes = start_chunk as u64 * CHUNK_SIZE as u64;
+        file.seek(std::io::SeekFrom::Start(skip_bytes))
+            .await
+            .map_err(|e| format!("Failed to seek to chunk {}: {}", start_chunk, e))?;
+    }
+
+    for idx in (start_chunk as usize)..chunk_count {
+        if progress.is_cancelled() {
+            progress.state.store(STATE_CANCELLED, Ordering::Relaxed);
+            return Err("Cancelled".into());
+        }
+
+        let remaining = file_size - idx as u64 * CHUNK_SIZE as u64;
+        let to_read = (remaining as usize).min(CHUNK_SIZE);
+        let mut buf = vec![0u8; to_read];
+
+        file.read_exact(&mut buf)
+            .await
+            .map_err(|e| format!("Read error at chunk {}: {}", idx, e))?;
+
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+
+        let key_copy = key;
+        let server_url_clone = server_url.to_string();
+        let transfer_id_clone = transfer_id.to_string();
+        let jwt_clone = jwt_token.to_string();
+        let progress_clone = progress.clone();
+        let client_clone = async_client.clone();
+
+        let handle = tokio::spawn(async move {
+            let _permit = permit;
+
+            let nonce = derive_chunk_nonce(&key_copy, idx as u64);
+            let encrypted = tokio::task::spawn_blocking(move || {
+                encrypt_chunk_with_nonce(&key_copy, &buf, nonce)
+            })
+            .await
+            .map_err(|e| format!("Encryption task panicked at chunk {}: {}", idx, e))??;
+
+            let enc_len = encrypted.len() as u64;
+
+            let url = format!(
+                "{}/transfers/{}/chunks/{}",
+                server_url_clone, transfer_id_clone, idx
+            );
+
+            let resp = client_clone
+                .put(&url)
+                .header("Authorization", format!("Bearer {}", jwt_clone))
+                .header("Content-Type", "application/octet-stream")
+                .body(encrypted)
+                .send()
+                .await
+                .map_err(|e| format!("Chunk {} upload failed: {}", idx, e))?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(format!(
+                    "Chunk {} upload failed ({}): {}",
+                    idx, status, body
+                ));
+            }
+
+            progress_clone.bytes_done.fetch_add(enc_len, Ordering::Relaxed);
+            Ok::<(), String>(())
+        });
+
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        if progress.is_cancelled() {
+            progress.state.store(STATE_CANCELLED, Ordering::Relaxed);
+            return Err("Cancelled".into());
+        }
+        handle
+            .await
+            .map_err(|e| format!("Upload task panicked: {}", e))??;
+    }
+
+    if progress.is_cancelled() {
+        progress.state.store(STATE_CANCELLED, Ordering::Relaxed);
+        return Err("Cancelled".into());
+    }
+
+    progress.state.store(STATE_COMPLETE, Ordering::Relaxed);
+    Ok(())
+}

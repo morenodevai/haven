@@ -1,4 +1,4 @@
-use crate::models::{FileRow, MessageRow, ReactionRow, UserRow};
+use crate::models::{FileRow, MessageRow, PendingFolderOfferRow, PendingOfferRow, ReactionRow, UserRow};
 use crate::Database;
 use anyhow::Result;
 use rusqlite::Connection;
@@ -133,6 +133,141 @@ impl Database {
                 })
                 .optional()?;
             Ok(row)
+        })
+    }
+
+    // -- Pending Offers --
+
+    pub fn insert_pending_offer(
+        &self,
+        transfer_id: &str,
+        from_user_id: &str,
+        to_user_id: &str,
+        filename: &str,
+        file_size: i64,
+        file_sha256: Option<&str>,
+        chunk_hashes: Option<&str>,
+        file_server_url: Option<&str>,
+        folder_id: Option<&str>,
+    ) -> Result<()> {
+        self.with_conn_mut(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO pending_offers
+                 (transfer_id, from_user_id, to_user_id, filename, file_size, file_sha256, chunk_hashes, file_server_url, folder_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![transfer_id, from_user_id, to_user_id, filename, file_size, file_sha256, chunk_hashes, file_server_url, folder_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn update_pending_offer_status(&self, transfer_id: &str, status: &str) -> Result<()> {
+        self.with_conn_mut(|conn| {
+            conn.execute(
+                "UPDATE pending_offers SET status = ?1 WHERE transfer_id = ?2",
+                rusqlite::params![status, transfer_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn update_pending_offer_hashes(
+        &self,
+        transfer_id: &str,
+        file_sha256: &str,
+        chunk_hashes: &str,
+    ) -> Result<()> {
+        self.with_conn_mut(|conn| {
+            conn.execute(
+                "UPDATE pending_offers SET file_sha256 = ?1, chunk_hashes = ?2 WHERE transfer_id = ?3",
+                rusqlite::params![file_sha256, chunk_hashes, transfer_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_pending_offers_for_user(&self, user_id: &str) -> Result<Vec<PendingOfferRow>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT transfer_id, from_user_id, to_user_id, filename, file_size,
+                        file_sha256, chunk_hashes, file_server_url, folder_id, status
+                 FROM pending_offers
+                 WHERE to_user_id = ?1 AND status IN ('pending', 'accepted')
+                 ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map([user_id], |row| {
+                Ok(PendingOfferRow {
+                    transfer_id: row.get(0)?,
+                    from_user_id: row.get(1)?,
+                    to_user_id: row.get(2)?,
+                    filename: row.get(3)?,
+                    file_size: row.get(4)?,
+                    file_sha256: row.get(5)?,
+                    chunk_hashes: row.get(6)?,
+                    file_server_url: row.get(7)?,
+                    folder_id: row.get(8)?,
+                    status: row.get(9)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+        })
+    }
+
+    pub fn insert_pending_folder_offer(
+        &self,
+        folder_id: &str,
+        from_user_id: &str,
+        to_user_id: &str,
+        folder_name: &str,
+        total_size: i64,
+        file_count: i64,
+        manifest: &str,
+        file_server_url: Option<&str>,
+    ) -> Result<()> {
+        self.with_conn_mut(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO pending_folder_offers
+                 (folder_id, from_user_id, to_user_id, folder_name, total_size, file_count, manifest, file_server_url)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![folder_id, from_user_id, to_user_id, folder_name, total_size, file_count, manifest, file_server_url],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn update_pending_folder_offer_status(&self, folder_id: &str, status: &str) -> Result<()> {
+        self.with_conn_mut(|conn| {
+            conn.execute(
+                "UPDATE pending_folder_offers SET status = ?1 WHERE folder_id = ?2",
+                rusqlite::params![status, folder_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_pending_folder_offers_for_user(&self, user_id: &str) -> Result<Vec<PendingFolderOfferRow>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT folder_id, from_user_id, to_user_id, folder_name, total_size,
+                        file_count, manifest, file_server_url, status
+                 FROM pending_folder_offers
+                 WHERE to_user_id = ?1 AND status IN ('pending', 'accepted')
+                 ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map([user_id], |row| {
+                Ok(PendingFolderOfferRow {
+                    folder_id: row.get(0)?,
+                    from_user_id: row.get(1)?,
+                    to_user_id: row.get(2)?,
+                    folder_name: row.get(3)?,
+                    total_size: row.get(4)?,
+                    file_count: row.get(5)?,
+                    manifest: row.get(6)?,
+                    file_server_url: row.get(7)?,
+                    status: row.get(8)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
         })
     }
 

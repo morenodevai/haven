@@ -9,9 +9,13 @@ use futures_util::{SinkExt, StreamExt};
 use tracing::{info, trace, warn};
 use uuid::Uuid;
 
-use haven_types::events::{GatewayCommand, GatewayEvent, TurnServer};
+use haven_types::events::{FolderFileEntry, GatewayCommand, GatewayEvent, TurnServer};
 
 use crate::dispatcher::{Dispatcher, UserMessage};
+
+/// Optional database handle for persisting/replaying pending offers.
+/// When Some, file/folder offers are stored and replayed on reconnect.
+pub type DbHandle = Option<Arc<haven_db::Database>>;
 
 /// Heartbeat interval: server sends a Ping every 15 seconds.
 /// If 2 consecutive Pongs are missed (~30s), the connection is dropped.
@@ -27,6 +31,7 @@ pub async fn handle_connection_authenticated(
     username: String,
     file_server_url: Option<String>,
     turn_servers: Option<Vec<TurnServer>>,
+    db: DbHandle,
 ) {
     let (mut sender, receiver) = socket.split();
 
@@ -46,8 +51,13 @@ pub async fn handle_connection_authenticated(
         return;
     }
 
+    // Replay pending offers on reconnect
+    if let Some(db) = &db {
+        replay_pending_offers(&mut sender, db, user_id, file_server_url.as_deref()).await;
+    }
+
     // Shared connection loop
-    run_connection_loop(sender, receiver, dispatcher, user_id, username, file_server_url).await;
+    run_connection_loop(sender, receiver, dispatcher, user_id, username, file_server_url, db).await;
 }
 
 /// Handle a single WebSocket connection (legacy path — uses Identify handshake).
@@ -80,8 +90,8 @@ pub async fn handle_connection(socket: WebSocket, dispatcher: Dispatcher, jwt_se
         return;
     }
 
-    // Shared connection loop (legacy path has no file server URL)
-    run_connection_loop(sender, receiver, dispatcher, user_id, username, None).await;
+    // Shared connection loop (legacy path has no file server URL or DB)
+    run_connection_loop(sender, receiver, dispatcher, user_id, username, None, None).await;
 }
 
 /// Shared connection loop — factored out of both handle_connection and
@@ -93,6 +103,7 @@ async fn run_connection_loop(
     user_id: Uuid,
     username: String,
     file_server_url: Option<String>,
+    db: DbHandle,
 ) {
     // Register per-user channel and send existing online users, then go online
     let (conn_id, mut user_rx) = dispatcher.register_user_channel(user_id).await;
@@ -203,6 +214,7 @@ async fn run_connection_loop(
     let username_recv = username.clone();
     let recv_subscriptions = subscribed_channels.clone();
     let file_server_url_recv = file_server_url.clone();
+    let db_recv = db;
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
@@ -216,6 +228,7 @@ async fn run_connection_loop(
                                 cmd,
                                 &recv_subscriptions,
                                 file_server_url_recv.as_deref(),
+                                &db_recv,
                             )
                             .await;
                         }
@@ -293,6 +306,7 @@ async fn handle_command(
     cmd: GatewayCommand,
     subscriptions: &Arc<std::sync::RwLock<HashSet<Uuid>>>,
     file_server_url: Option<&str>,
+    db: &DbHandle,
 ) {
     match cmd {
         GatewayCommand::Identify { .. } => {} // Already handled
@@ -442,6 +456,23 @@ async fn handle_command(
                 username, user_id, target_user_id, filename,
                 if folder_id.is_some() { " [folder]" } else { "" }
             );
+            // Persist offer for replay on reconnect
+            if let Some(db) = &db {
+                let ch_json = chunk_hashes.as_ref().map(|h| serde_json::to_string(h).unwrap_or_default());
+                if let Err(e) = db.insert_pending_offer(
+                    &transfer_id,
+                    &user_id.to_string(),
+                    &target_user_id.to_string(),
+                    &filename,
+                    size as i64,
+                    file_sha256.as_deref(),
+                    ch_json.as_deref(),
+                    file_server_url,
+                    folder_id.as_deref(),
+                ) {
+                    warn!("Failed to persist pending offer: {}", e);
+                }
+            }
             dispatcher
                 .send_to_user(
                     target_user_id,
@@ -468,6 +499,9 @@ async fn handle_command(
                 "{} ({}) -> file accept to {}",
                 username, user_id, target_user_id
             );
+            if let Some(db) = &db {
+                let _ = db.update_pending_offer_status(&transfer_id, "accepted");
+            }
             dispatcher
                 .send_to_user(
                     target_user_id,
@@ -487,6 +521,9 @@ async fn handle_command(
                 "{} ({}) -> file reject to {}",
                 username, user_id, target_user_id
             );
+            if let Some(db) = &db {
+                let _ = db.update_pending_offer_status(&transfer_id, "rejected");
+            }
             dispatcher
                 .send_to_user(
                     target_user_id,
@@ -598,6 +635,14 @@ async fn handle_command(
                 "{} ({}) -> file upload complete to {} [transfer={}]",
                 username, user_id, target_user_id, &transfer_id[..transfer_id.len().min(8)]
             );
+            // Update pending offer with hashes so replayed offers include them
+            if let Some(db) = &db {
+                if let (Some(sha), Some(hashes)) = (&file_sha256, &chunk_hashes) {
+                    let ch_json = serde_json::to_string(hashes).unwrap_or_default();
+                    let _ = db.update_pending_offer_hashes(&transfer_id, sha, &ch_json);
+                }
+                let _ = db.update_pending_offer_status(&transfer_id, "uploaded");
+            }
             // Only include file_server_url if the gateway has one configured.
             let fsu = file_server_url.as_deref().filter(|s| !s.is_empty()).map(|s| s.to_string());
             dispatcher
@@ -653,6 +698,21 @@ async fn handle_command(
                 "{} ({}) -> folder offer to {} ({}, {} files, {} bytes)",
                 username, user_id, target_user_id, folder_name, file_count, total_size
             );
+            if let Some(db) = &db {
+                let manifest_json = serde_json::to_string(&manifest).unwrap_or_default();
+                if let Err(e) = db.insert_pending_folder_offer(
+                    &folder_id,
+                    &user_id.to_string(),
+                    &target_user_id.to_string(),
+                    &folder_name,
+                    total_size as i64,
+                    file_count as i64,
+                    &manifest_json,
+                    file_server_url,
+                ) {
+                    warn!("Failed to persist pending folder offer: {}", e);
+                }
+            }
             dispatcher
                 .send_to_user(
                     target_user_id,
@@ -677,6 +737,9 @@ async fn handle_command(
                 "{} ({}) -> folder accept to {} [folder={}]",
                 username, user_id, target_user_id, folder_id
             );
+            if let Some(db) = &db {
+                let _ = db.update_pending_folder_offer_status(&folder_id, "accepted");
+            }
             dispatcher
                 .send_to_user(
                     target_user_id,
@@ -696,6 +759,9 @@ async fn handle_command(
                 "{} ({}) -> folder reject to {} [folder={}]",
                 username, user_id, target_user_id, folder_id
             );
+            if let Some(db) = &db {
+                let _ = db.update_pending_folder_offer_status(&folder_id, "rejected");
+            }
             dispatcher
                 .send_to_user(
                     target_user_id,
@@ -879,6 +945,75 @@ async fn handle_binary_message(
 
         _ => {
             warn!("Unknown binary message type: 0x{:02x}", msg_type);
+        }
+    }
+}
+
+/// Replay pending file/folder offers to a reconnecting client.
+async fn replay_pending_offers(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    db: &haven_db::Database,
+    user_id: Uuid,
+    file_server_url: Option<&str>,
+) {
+    let uid = user_id.to_string();
+
+    // Replay folder offers
+    if let Ok(folders) = db.get_pending_folder_offers_for_user(&uid) {
+        for f in folders {
+            let manifest: Vec<FolderFileEntry> = serde_json::from_str(&f.manifest).unwrap_or_default();
+            let event = GatewayEvent::FolderOffer {
+                from_user_id: f.from_user_id.parse().unwrap_or(Uuid::nil()),
+                folder_id: f.folder_id,
+                folder_name: f.folder_name,
+                total_size: f.total_size as u64,
+                file_count: f.file_count as u32,
+                manifest,
+                file_server_url: f.file_server_url.or_else(|| file_server_url.map(|s| s.to_string())),
+            };
+            let text = serde_json::to_string(&event).unwrap();
+            if sender.send(Message::Text(text.into())).await.is_err() {
+                return;
+            }
+            info!("Replayed pending folder offer {} to {}", "folder", uid);
+        }
+    }
+
+    // Replay file offers
+    if let Ok(offers) = db.get_pending_offers_for_user(&uid) {
+        for o in offers {
+            let chunk_hashes: Option<Vec<String>> = o.chunk_hashes.as_ref()
+                .and_then(|j| serde_json::from_str(j).ok());
+            let event = GatewayEvent::FileOffer {
+                from_user_id: o.from_user_id.parse().unwrap_or(Uuid::nil()),
+                transfer_id: o.transfer_id.clone(),
+                filename: o.filename,
+                size: o.file_size as u64,
+                file_sha256: o.file_sha256.clone(),
+                chunk_hashes: chunk_hashes.clone(),
+                file_server_url: o.file_server_url.or_else(|| file_server_url.map(|s| s.to_string())),
+                folder_id: o.folder_id,
+            };
+            let text = serde_json::to_string(&event).unwrap();
+            if sender.send(Message::Text(text.into())).await.is_err() {
+                return;
+            }
+
+            // If upload is complete, also replay FileReady
+            if o.status == "uploaded" && o.file_sha256.is_some() && chunk_hashes.is_some() {
+                let ready = GatewayEvent::FileReady {
+                    from_user_id: o.from_user_id.parse().unwrap_or(Uuid::nil()),
+                    transfer_id: o.transfer_id.clone(),
+                    file_server_url: file_server_url.map(|s| s.to_string()),
+                    file_sha256: o.file_sha256,
+                    chunk_hashes,
+                };
+                let text = serde_json::to_string(&ready).unwrap();
+                if sender.send(Message::Text(text.into())).await.is_err() {
+                    return;
+                }
+            }
+            info!("Replayed pending offer {} to {}", o.transfer_id, uid);
         }
     }
 }

@@ -29,7 +29,7 @@ const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 pub type AppState = Arc<AppStateInner>;
 
 pub struct AppStateInner {
-    pub db: Database,
+    pub db: Arc<Database>,
     pub jwt_secret: String,
     pub dispatcher: Dispatcher,
     pub auth_rate_limiter: AuthRateLimiter,

@@ -33,3 +33,28 @@ pub struct FileRow {
     pub size: i64,
     pub created_at: String,
 }
+
+pub struct PendingOfferRow {
+    pub transfer_id: String,
+    pub from_user_id: String,
+    pub to_user_id: String,
+    pub filename: String,
+    pub file_size: i64,
+    pub file_sha256: Option<String>,
+    pub chunk_hashes: Option<String>,
+    pub file_server_url: Option<String>,
+    pub folder_id: Option<String>,
+    pub status: String,
+}
+
+pub struct PendingFolderOfferRow {
+    pub folder_id: String,
+    pub from_user_id: String,
+    pub to_user_id: String,
+    pub folder_name: String,
+    pub total_size: i64,
+    pub file_count: i64,
+    pub manifest: String,
+    pub file_server_url: Option<String>,
+    pub status: String,
+}

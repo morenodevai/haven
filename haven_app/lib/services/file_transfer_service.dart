@@ -8,6 +8,7 @@ import 'package:uuid/uuid.dart';
 
 import 'package:haven_app/services/file_client_bindings.dart';
 import 'package:haven_app/services/gateway_service.dart';
+import 'package:haven_app/services/transfer_db_service.dart';
 
 /// Represents a file transfer (upload or download) in progress.
 class FileTransfer {
@@ -19,7 +20,7 @@ class FileTransfer {
   final String? fromUserId;
 
   /// If this file belongs to a folder transfer, the parent folder ID.
-  final String? folderId;
+  String? folderId;
 
   // Native handle (null if not started yet)
   Pointer<Void>? nativeHandle;
@@ -177,6 +178,8 @@ class FileTransferService {
   final _dio = Dio();
   final Map<String, Timer> _pollTimers = {};
   final Map<String, int> _pollCounts = {};
+  final TransferDbService _transferDb = TransferDbService();
+  Timer? _persistTimer;
 
   FileClientBindings? _getBindings() {
     if (_bindings != null) return _bindings;
@@ -222,6 +225,165 @@ class FileTransferService {
 
   Map<String, FileTransfer> get transfers => Map.unmodifiable(_transfers);
   Map<String, FolderTransfer> get folders => Map.unmodifiable(_folders);
+
+  /// Initialize local DB and resume incomplete transfers.
+  Future<void> initAndResume() async {
+    await _transferDb.init();
+
+    // Start periodic persistence (every 10 seconds)
+    _persistTimer = Timer.periodic(
+      const Duration(seconds: 10),
+      (_) => _persistProgress(),
+    );
+
+    // Load incomplete transfers and attempt resume
+    final incomplete = await _transferDb.getIncompleteTransfers();
+    for (final record in incomplete) {
+      _log('INFO', 'initAndResume: found incomplete transfer=${record.transferId} file=${record.filename} isUpload=${record.isUpload} state=${record.state}');
+
+      final transfer = FileTransfer(
+        transferId: record.transferId,
+        filename: record.filename,
+        fileSize: record.fileSize,
+        isUpload: record.isUpload,
+        targetUserId: record.targetUserId,
+        fromUserId: record.fromUserId,
+        fileServerUrl: record.fileServerUrl,
+        fileSha256: record.fileSha256,
+        chunkHashes: record.chunkHashes != null
+            ? (jsonDecode(record.chunkHashes!) as List<dynamic>).map((e) => e as String).toList()
+            : null,
+        folderId: record.folderId,
+      );
+      transfer.bytesDone = record.bytesDone;
+      transfer.bytesTotal = record.fileSize;
+      _transfers[record.transferId] = transfer;
+
+      if (record.isUpload && record.filePath != null && record.masterKey != null && record.salt != null) {
+        // Resume upload — query server for chunk status
+        _resumeUpload(transfer, record);
+      } else if (!record.isUpload && record.savePath != null && record.masterKey != null && record.salt != null) {
+        // Resume download
+        _resumeDownload(transfer, record);
+      }
+    }
+
+    if (incomplete.isNotEmpty) {
+      onProgressUpdate?.call();
+    }
+  }
+
+  Future<void> _resumeUpload(FileTransfer transfer, TransferRecord record) async {
+    final bindings = _getBindings();
+    if (bindings == null) return;
+
+    try {
+      final serverUrl = _getServerUrl();
+      _log('INFO', '_resumeUpload: querying chunk status for ${record.transferId}');
+
+      final resp = await _dio.get(
+        '$serverUrl/ft/transfers/${record.transferId}/chunks',
+        options: Options(
+          headers: {'Authorization': 'Bearer ${_getToken()}'},
+          receiveTimeout: const Duration(seconds: 10),
+        ),
+      );
+
+      if (resp.statusCode == 200) {
+        final data = resp.data as Map<String, dynamic>;
+        final receivedChunks = (data['received_chunks'] as List<dynamic>?)?.cast<int>() ?? [];
+        final chunkCount = data['chunk_count'] as int? ?? 0;
+        final startChunk = receivedChunks.isEmpty ? 0 : receivedChunks.length;
+
+        _log('INFO', '_resumeUpload: ${record.transferId} received=${receivedChunks.length}/$chunkCount, resuming from chunk $startChunk');
+
+        if (record.fileSha256 == null || record.chunkHashes == null) {
+          _log('WARN', '_resumeUpload: missing hashes, cannot resume ${record.transferId}');
+          return;
+        }
+
+        final handle = bindings.resumeUpload(
+          filePath: record.filePath!,
+          serverUrl: serverUrl,
+          transferId: record.transferId,
+          jwtToken: _getToken(),
+          masterKey: record.masterKey!,
+          salt: record.salt!,
+          fileSha256: record.fileSha256!,
+          chunkHashesJson: record.chunkHashes!,
+          startChunk: startChunk,
+        );
+        transfer.nativeHandle = handle;
+        transfer.offerSent = true; // Already sent in previous session
+        _activeUploadTransferId = record.transferId;
+        _startProgressPolling();
+      } else if (resp.statusCode == 404) {
+        // Transfer doesn't exist on server anymore — start fresh
+        _log('INFO', '_resumeUpload: transfer ${record.transferId} not found on server, cleaning up');
+        await _transferDb.deleteTransfer(record.transferId);
+        _transfers.remove(record.transferId);
+      }
+    } catch (e) {
+      _log('WARN', '_resumeUpload: failed to query server for ${record.transferId}: $e');
+    }
+  }
+
+  Future<void> _resumeDownload(FileTransfer transfer, TransferRecord record) async {
+    try {
+      final serverUrl = _getServerUrl();
+      _log('INFO', '_resumeDownload: querying transfer status for ${record.transferId}');
+
+      final resp = await _dio.get(
+        '$serverUrl/ft/transfers/${record.transferId}',
+        options: Options(
+          headers: {'Authorization': 'Bearer ${_getToken()}'},
+          receiveTimeout: const Duration(seconds: 10),
+        ),
+      );
+
+      if (resp.statusCode == 200) {
+        final data = resp.data as Map<String, dynamic>;
+        final status = data['status'] as String?;
+
+        if (status == 'complete') {
+          // Upload complete — start download immediately
+          if (transfer.fileSha256 != null && transfer.chunkHashes != null) {
+            _log('INFO', '_resumeDownload: ${record.transferId} upload complete, starting download');
+            _startDownload(transfer, record.savePath!, record.masterKey!, record.salt!);
+          }
+        } else if (status == 'uploading') {
+          // Still uploading — poll for completion
+          _log('INFO', '_resumeDownload: ${record.transferId} still uploading, polling');
+          transfer.state = TransferState.hashing;
+          _pendingDownloads[record.transferId] = _PendingDownload(record.savePath!, record.masterKey!, record.salt!);
+          _startStatusPolling(record.transferId);
+        }
+      } else if (resp.statusCode == 404) {
+        _log('INFO', '_resumeDownload: ${record.transferId} not found on server');
+        await _transferDb.deleteTransfer(record.transferId);
+        _transfers.remove(record.transferId);
+      }
+    } catch (e) {
+      _log('WARN', '_resumeDownload: failed for ${record.transferId}: $e');
+    }
+  }
+
+  Future<void> _persistProgress() async {
+    for (final transfer in _transfers.values) {
+      if (transfer.state == TransferState.complete ||
+          transfer.state == TransferState.error ||
+          transfer.state == TransferState.cancelled) {
+        continue;
+      }
+      if (transfer.nativeHandle != null) {
+        await _transferDb.updateProgress(
+          transfer.transferId,
+          transfer.bytesDone,
+          transfer.state,
+        );
+      }
+    }
+  }
 
   void _log(String level, String message) {
     _gateway.send({
@@ -609,6 +771,7 @@ class FileTransferService {
 
   void dispose() {
     _progressTimer?.cancel();
+    _persistTimer?.cancel();
     for (final t in _pollTimers.values) {
       t.cancel();
     }
@@ -621,6 +784,7 @@ class FileTransferService {
     }
     _transfers.clear();
     _folders.clear();
+    _transferDb.close();
   }
 
   void _startStatusPolling(String transferId) {
@@ -742,6 +906,20 @@ class FileTransferService {
 
     _log('INFO', '_startUpload: transfer=${transfer.transferId} file=$filePath server=$serverUrl');
 
+    // Persist to local DB for resume capability
+    _transferDb.upsertTransfer(TransferRecord(
+      transferId: transfer.transferId,
+      filename: transfer.filename,
+      fileSize: transfer.fileSize,
+      isUpload: true,
+      targetUserId: transfer.targetUserId,
+      filePath: filePath,
+      masterKey: masterKey,
+      salt: salt,
+      folderId: transfer.folderId,
+      createdAt: DateTime.now().toIso8601String(),
+    ));
+
     // Use HTTP upload (works through file gateway proxy for NAT traversal)
     final handle = bindings.uploadFile(
       filePath: filePath,
@@ -765,6 +943,23 @@ class FileTransferService {
     final serverUrl = _getServerUrl();
 
     _log('INFO', '_startDownload: transfer=${transfer.transferId} savePath=$savePath server=$serverUrl sha256=${transfer.fileSha256} chunks=${transfer.chunkHashes?.length}');
+
+    // Persist to local DB for resume capability
+    _transferDb.upsertTransfer(TransferRecord(
+      transferId: transfer.transferId,
+      filename: transfer.filename,
+      fileSize: transfer.fileSize,
+      isUpload: false,
+      fromUserId: transfer.fromUserId,
+      savePath: savePath,
+      fileServerUrl: transfer.fileServerUrl,
+      fileSha256: transfer.fileSha256,
+      chunkHashes: transfer.chunkHashes != null ? jsonEncode(transfer.chunkHashes!) : null,
+      masterKey: masterKey,
+      salt: salt,
+      folderId: transfer.folderId,
+      createdAt: DateTime.now().toIso8601String(),
+    ));
 
     // Use HTTP download (works through file gateway proxy for NAT traversal)
     final handle = bindings.downloadFile(
@@ -843,6 +1038,19 @@ class FileTransferService {
             'type': 'FileOfferSend',
             'data': offerData,
           });
+          // Persist hashes to local DB so resume can use them
+          _transferDb.upsertTransfer(TransferRecord(
+            transferId: transfer.transferId,
+            filename: transfer.filename,
+            fileSize: transfer.fileSize,
+            isUpload: true,
+            targetUserId: transfer.targetUserId,
+            fileSha256: transfer.fileSha256,
+            chunkHashes: jsonEncode(transfer.chunkHashes!),
+            folderId: transfer.folderId,
+            state: transfer.state,
+            createdAt: DateTime.now().toIso8601String(),
+          ));
         } else {
           _log('WARN', 'state=transferring but getUploadHashesJson returned null: transfer=${transfer.transferId}');
         }
@@ -855,6 +1063,7 @@ class FileTransferService {
           transfer.chunkHashes != null) {
         transfer.uploadCompleteSent = true;
         _log('INFO', 'upload complete: transfer=${transfer.transferId} — sending FileUploadCompleteSend');
+        _transferDb.markComplete(transfer.transferId);
         _gateway.send({
           'type': 'FileUploadCompleteSend',
           'data': {
@@ -876,6 +1085,11 @@ class FileTransferService {
           transfer.isUpload &&
           _activeUploadTransferId == transfer.transferId) {
         _processQueue();
+      }
+
+      // Mark download complete in local DB
+      if (transfer.state == TransferState.complete && !transfer.isUpload) {
+        _transferDb.markComplete(transfer.transferId);
       }
 
       // Check if parent folder is complete
@@ -1033,6 +1247,10 @@ class FileTransferService {
           acceptOffer(transferId, savePath, folder.masterKey!, folder.salt!);
           return; // Don't trigger UI update for individual pending offer
         }
+      } else {
+        // Folder not known (e.g. replayed offer after restart) — show as standalone
+        _log('INFO', '_handleFileOffer: unknown folder=$folderId, showing as standalone offer');
+        transfer.folderId = null;
       }
     }
 

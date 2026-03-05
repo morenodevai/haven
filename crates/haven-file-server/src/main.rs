@@ -105,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/transfers/{id}/chunks/{index}", put(routes::upload_chunk))
         .route("/transfers/{id}/data", get(routes::download_data))
         .route("/transfers/{id}", get(routes::get_transfer_status))
+        .route("/transfers/{id}/chunks", get(routes::get_chunk_status))
         .route("/transfers/{id}/confirm", post(routes::confirm_transfer))
         .route("/transfers/{id}", delete(routes::delete_transfer))
         .route("/fast-transfer", get(routes::fast_transfer_ws))

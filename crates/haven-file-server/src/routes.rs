@@ -63,6 +63,15 @@ pub struct TransferStatus {
     pub created_at: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ChunkStatusResponse {
+    pub transfer_id: String,
+    pub status: String,
+    pub chunk_count: u64,
+    pub received_chunks: Vec<u64>,
+    pub bytes_received: u64,
+}
+
 // ── Auth helper ─────────────────────────────────────────────────────────
 
 pub fn extract_claims(headers: &HeaderMap, jwt_secret: &str) -> Result<Claims, StatusCode> {
@@ -563,6 +572,59 @@ pub async fn get_transfer_status(
     }).map_err(|_| StatusCode::NOT_FOUND)?;
 
     Ok(Json(status))
+}
+
+/// GET /transfers/{id}/chunks — returns which chunks have been received.
+///
+/// Used by reconnecting clients to determine where to resume an upload.
+pub async fn get_chunk_status(
+    State(state): State<AppState>,
+    Path(transfer_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<ChunkStatusResponse>, StatusCode> {
+    let _claims = extract_claims(&headers, &state.jwt_secret)?;
+
+    // Get transfer info using writer connection for WAL visibility
+    let (status, chunk_count, bytes_received): (String, u64, u64) = state
+        .db
+        .with_conn_mut(|conn| {
+            conn.query_row(
+                "SELECT status, chunk_count, bytes_received FROM transfers WHERE id = ?1",
+                [&transfer_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, i64>(2)? as u64,
+                    ))
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("Transfer not found"))
+        })
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    // Query received chunk indices
+    let received_chunks: Vec<u64> = state
+        .db
+        .with_conn_mut(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT chunk_index FROM chunks WHERE transfer_id = ?1 AND received = 1 ORDER BY chunk_index",
+            )?;
+            let rows = stmt
+                .query_map([&transfer_id], |row| row.get::<_, i64>(0))?;
+            rows.map(|r| r.map(|v| v as u64))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(ChunkStatusResponse {
+        transfer_id,
+        status,
+        chunk_count,
+        received_chunks,
+        bytes_received,
+    }))
 }
 
 /// POST /transfers/{id}/confirm — receiver confirms successful download.

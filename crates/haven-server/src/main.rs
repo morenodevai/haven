@@ -98,13 +98,13 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(2 * 1024 * 1024 * 1024);
 
-    // Init database
-    let db = haven_db::Database::open(&PathBuf::from(&db_path))?;
+    // Init database (Arc-wrapped for sharing between API + gateway connection handlers)
+    let db = Arc::new(haven_db::Database::open(&PathBuf::from(&db_path))?);
 
     // Shared state
     let dispatcher = Dispatcher::new();
     let app_state: AppState = Arc::new(AppStateInner {
-        db,
+        db: db.clone(),
         jwt_secret: jwt_secret.clone(),
         dispatcher: dispatcher.clone(),
         auth_rate_limiter: AuthRateLimiter::new(),
@@ -202,6 +202,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/channels/{channel_id}/messages/{message_id}/reactions", post(reactions::toggle_reaction))
         .route("/files", post(files::upload_file))
         .route("/files/{file_id}", get(files::download_file))
+        .route("/pending-offers", get(get_pending_offers))
         .layer(middleware::from_fn(require_auth))
         .with_state(app_state);
 
@@ -217,6 +218,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/ft/transfers/{id}/data", put(ft_upload_data))
         .route("/ft/transfers/{id}/data", get(ft_download_data))
         .route("/ft/transfers/{id}/chunks/{index}", put(ft_upload_chunk))
+        .route("/ft/transfers/{id}/chunks", get(ft_get_chunks))
         .route("/ft/transfers/{id}/confirm", post(ft_confirm_transfer))
         .layer(middleware::from_fn(require_auth))
         .with_state(state);
@@ -402,12 +404,86 @@ async fn ws_upgrade(
 
     let file_server_url = state.file_server_url.clone();
     let turn_servers = state.turn_servers.clone();
+    let db = state.app.db.clone();
     Ok(ws
         .max_frame_size(4 * 1024 * 1024)    // 4 MB max frame (supports larger chunk sizes)
         .max_message_size(8 * 1024 * 1024) // 8 MB max message
         .on_upgrade(move |socket| {
-            connection::handle_connection_authenticated(socket, state.dispatcher, user_id, username, file_server_url, turn_servers)
+            connection::handle_connection_authenticated(socket, state.dispatcher, user_id, username, file_server_url, turn_servers, Some(db))
         }))
+}
+
+// ── Pending offers endpoint ──────────────────────────────────────────
+
+/// GET /pending-offers — returns pending file/folder offers for the authenticated user.
+async fn get_pending_offers(
+    State(state): State<AppState>,
+    axum::Extension(jwt): axum::Extension<JwtSecret>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, StatusCode> {
+    // Extract user ID from auth middleware (already validated)
+    let auth_header = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let token_data = decode::<Claims>(
+        auth_header,
+        &DecodingKey::from_secret(jwt.0.as_bytes()),
+        &Validation::default(),
+    )
+    .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    let user_id = token_data.claims.sub.to_string();
+
+    let file_offers = state
+        .db
+        .get_pending_offers_for_user(&user_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let folder_offers = state
+        .db
+        .get_pending_folder_offers_for_user(&user_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let file_offers_json: Vec<serde_json::Value> = file_offers
+        .into_iter()
+        .map(|o| {
+            serde_json::json!({
+                "transfer_id": o.transfer_id,
+                "from_user_id": o.from_user_id,
+                "filename": o.filename,
+                "file_size": o.file_size,
+                "file_sha256": o.file_sha256,
+                "chunk_hashes": o.chunk_hashes.and_then(|j| serde_json::from_str::<Vec<String>>(&j).ok()),
+                "file_server_url": o.file_server_url,
+                "folder_id": o.folder_id,
+                "status": o.status,
+            })
+        })
+        .collect();
+
+    let folder_offers_json: Vec<serde_json::Value> = folder_offers
+        .into_iter()
+        .map(|f| {
+            serde_json::json!({
+                "folder_id": f.folder_id,
+                "from_user_id": f.from_user_id,
+                "folder_name": f.folder_name,
+                "total_size": f.total_size,
+                "file_count": f.file_count,
+                "manifest": serde_json::from_str::<serde_json::Value>(&f.manifest).unwrap_or_default(),
+                "file_server_url": f.file_server_url,
+                "status": f.status,
+            })
+        })
+        .collect();
+
+    Ok(axum::Json(serde_json::json!({
+        "file_offers": file_offers_json,
+        "folder_offers": folder_offers_json,
+    })))
 }
 
 // ── File transfer proxy ──────────────────────────────────────────────
@@ -482,6 +558,10 @@ async fn ft_download_data(State(state): State<ServerState>, Path(id): Path<Strin
 
 async fn ft_upload_chunk(State(state): State<ServerState>, Path((id, index)): Path<(String, String)>, headers: HeaderMap, body: Body) -> Result<Response, StatusCode> {
     ft_proxy(&state, Method::PUT, &format!("/transfers/{id}/chunks/{index}"), &headers, body).await
+}
+
+async fn ft_get_chunks(State(state): State<ServerState>, Path(id): Path<String>, headers: HeaderMap, body: Body) -> Result<Response, StatusCode> {
+    ft_proxy(&state, Method::GET, &format!("/transfers/{id}/chunks"), &headers, body).await
 }
 
 async fn ft_confirm_transfer(State(state): State<ServerState>, Path(id): Path<String>, headers: HeaderMap, body: Body) -> Result<Response, StatusCode> {

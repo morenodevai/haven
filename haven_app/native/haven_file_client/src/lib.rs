@@ -107,6 +107,69 @@ pub unsafe extern "C" fn haven_upload_file(
     handle_ptr
 }
 
+/// Resume an upload from a specific chunk. Returns a handle for progress polling.
+///
+/// Skips hashing pass — uses pre-computed hashes from the caller.
+/// Starts uploading from `start_chunk`, skipping already-received chunks.
+///
+/// # Safety
+/// All string pointers must be valid null-terminated UTF-8 C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn haven_resume_upload(
+    file_path: *const c_char,
+    server_url: *const c_char,
+    transfer_id: *const c_char,
+    jwt_token: *const c_char,
+    master_key: *const c_char,
+    salt: *const c_char,
+    file_sha256: *const c_char,
+    chunk_hashes_json: *const c_char,
+    start_chunk: u32,
+) -> Handle {
+    let file_path = unsafe { cstr_to_str(file_path) }.to_string();
+    let server_url = unsafe { cstr_to_str(server_url) }.to_string();
+    let transfer_id = unsafe { cstr_to_str(transfer_id) }.to_string();
+    let jwt_token = unsafe { cstr_to_str(jwt_token) }.to_string();
+    let master_key = unsafe { cstr_to_bytes(master_key) }.to_vec();
+    let salt = unsafe { cstr_to_bytes(salt) }.to_vec();
+    let file_sha256 = unsafe { cstr_to_str(file_sha256) }.to_string();
+    let chunk_hashes_json = unsafe { cstr_to_str(chunk_hashes_json) }.to_string();
+
+    let progress = Arc::new(UploadProgress::new());
+    let progress_clone = progress.clone();
+
+    let handle = Box::new(TransferHandle::Upload(progress));
+    let handle_ptr = Box::into_raw(handle);
+
+    let rt = get_or_create_runtime();
+    rt.spawn(async move {
+        let result = upload::resume_upload(
+            &file_path,
+            &server_url,
+            &transfer_id,
+            &jwt_token,
+            &master_key,
+            &salt,
+            &file_sha256,
+            &chunk_hashes_json,
+            start_chunk,
+            progress_clone.clone(),
+        )
+        .await;
+
+        if let Err(e) = result {
+            eprintln!("Resume upload error: {}", e);
+            *progress_clone.last_error.lock().unwrap() = Some(e);
+            let cur = progress_clone.state.load(std::sync::atomic::Ordering::Relaxed);
+            if cur != upload::STATE_COMPLETE && cur != upload::STATE_CANCELLED {
+                progress_clone.state.store(upload::STATE_ERROR, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    });
+
+    handle_ptr
+}
+
 /// Start a download. Returns a handle for progress polling and cancellation.
 ///
 /// # Safety
