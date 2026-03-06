@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tracing::{info, warn};
 
+use haven_types::api::{Claims, TransferStatus as TStatus};
+
 use crate::db::FileDb;
 use crate::storage::Storage;
 
@@ -25,15 +27,6 @@ pub struct AppState {
     /// Pre-bound UDP socket for fast transfers (fixed port, bound at startup).
     pub udp_socket: Arc<std::net::UdpSocket>,
     pub udp_port: u16,
-}
-
-/// JWT claims — must match the messaging server's format.
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct Claims {
-    pub sub: String,     // user ID
-    pub username: String,
-    pub exp: usize,
 }
 
 // ── Request/response types ──────────────────────────────────────────────
@@ -127,7 +120,7 @@ pub async fn create_transfer(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now', '+' || ?7 || ' hours'))",
             rusqlite::params![
                 &req.id,
-                &claims.sub,
+                &claims.sub.to_string(),
                 req.file_size as i64,
                 chunk_size as i64,
                 chunk_count as i64,
@@ -209,10 +202,10 @@ pub async fn upload_data(
         })
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
-    if uploader_id != claims.sub {
+    if uploader_id != claims.sub.to_string() {
         return Err(StatusCode::FORBIDDEN);
     }
-    if current_status != "uploading" {
+    if current_status.as_str() != TStatus::Uploading.to_string() {
         return Err(StatusCode::CONFLICT);
     }
 
@@ -362,10 +355,10 @@ pub async fn upload_chunk(
         })
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
-    if uploader_id != claims.sub {
+    if uploader_id != claims.sub.to_string() {
         return Err(StatusCode::FORBIDDEN);
     }
-    if current_status != "uploading" {
+    if current_status.as_str() != TStatus::Uploading.to_string() {
         return Err(StatusCode::CONFLICT);
     }
 
@@ -470,7 +463,7 @@ pub async fn download_data(
         .map_err(|_| anyhow::anyhow!("Transfer not found"))
     }).map_err(|_| StatusCode::NOT_FOUND)?;
 
-    if status == "expired" {
+    if status.as_str() == TStatus::Expired.to_string() {
         return Err(StatusCode::GONE);
     }
 
@@ -478,7 +471,7 @@ pub async fn download_data(
     let start_offset = parse_range_start(&headers).unwrap_or(0);
 
     // Determine how many bytes are available to serve
-    let available = if status == "complete" { file_size } else { bytes_received };
+    let available = if status.as_str() == TStatus::Complete.to_string() { file_size } else { bytes_received };
     if start_offset >= available {
         return Err(StatusCode::RANGE_NOT_SATISFIABLE);
     }
@@ -628,13 +621,27 @@ pub async fn get_chunk_status(
 }
 
 /// POST /transfers/{id}/confirm — receiver confirms successful download.
-/// Server deletes the file from disk.
+/// Server deletes the file from disk. Only the uploader can confirm.
 pub async fn confirm_transfer(
     State(state): State<AppState>,
     Path(transfer_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, StatusCode> {
-    let _claims = extract_claims(&headers, &state.jwt_secret)?;
+    let claims = extract_claims(&headers, &state.jwt_secret)?;
+
+    // Verify the caller is the uploader
+    let uploader_id: String = state.db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT uploader_id FROM transfers WHERE id = ?1",
+            [&transfer_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| anyhow::anyhow!("Transfer not found"))
+    }).map_err(|_| StatusCode::NOT_FOUND)?;
+
+    if uploader_id != claims.sub.to_string() {
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     // Delete file from disk
     state.storage.delete_file(&transfer_id).await.map_err(|e| {
@@ -673,7 +680,7 @@ pub async fn delete_transfer(
         .map_err(|_| anyhow::anyhow!("Transfer not found"))
     }).map_err(|_| StatusCode::NOT_FOUND)?;
 
-    if uploader_id != claims.sub {
+    if uploader_id != claims.sub.to_string() {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -693,6 +700,74 @@ pub async fn delete_transfer(
 /// GET /health — liveness check (no auth).
 pub async fn health() -> &'static str {
     "ok"
+}
+
+/// GET /transfers/all — list all transfers (admin, internal only).
+/// Rejects non-loopback callers for defense in depth.
+pub async fn list_all_transfers(
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !peer.ip().is_loopback() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let db = state.db.clone();
+    let transfers = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, uploader_id, file_size, chunk_size, chunk_count,
+                        file_sha256, bytes_received, status, created_at
+                 FROM transfers ORDER BY created_at DESC LIMIT 200",
+            )?;
+            let rows: Vec<serde_json::Value> = stmt
+                .query_map([], |row| {
+                    Ok(serde_json::json!({
+                        "id": row.get::<_, String>(0)?,
+                        "uploader_id": row.get::<_, String>(1)?,
+                        "file_size": row.get::<_, i64>(2)?,
+                        "chunk_size": row.get::<_, i64>(3)?,
+                        "chunk_count": row.get::<_, i64>(4)?,
+                        "file_sha256": row.get::<_, String>(5)?,
+                        "bytes_received": row.get::<_, i64>(6)?,
+                        "status": row.get::<_, String>(7)?,
+                        "created_at": row.get::<_, String>(8)?,
+                    }))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok::<_, anyhow::Error>(serde_json::json!({ "transfers": rows }))
+        })
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(transfers))
+}
+
+/// DELETE /admin/transfers/{id} — admin delete transfer (internal only).
+/// Rejects non-loopback callers for defense in depth.
+pub async fn admin_delete_transfer(
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    State(state): State<AppState>,
+    Path(transfer_id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    if !peer.ip().is_loopback() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    // Delete file from disk (ignore if already gone)
+    state.storage.delete_file(&transfer_id).await.ok();
+
+    // Delete from DB
+    state
+        .db
+        .with_conn_mut(|conn| {
+            conn.execute("DELETE FROM transfers WHERE id = ?1", [&transfer_id])?;
+            Ok(())
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    info!("Admin deleted transfer {}", transfer_id);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────

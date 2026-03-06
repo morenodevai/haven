@@ -11,7 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
-use futures_util::TryStreamExt;
+use futures_util::{TryStreamExt, SinkExt, StreamExt};
 use reqwest::Client;
 use jsonwebtoken::{DecodingKey, Validation, decode};
 use serde::Deserialize;
@@ -20,6 +20,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+use haven_api::admin;
 use haven_api::auth::{self, AppState, AppStateInner, AuthRateLimiter};
 use haven_api::files;
 use haven_api::messages;
@@ -29,15 +30,14 @@ use haven_gateway::connection;
 use haven_gateway::dispatcher::Dispatcher;
 use haven_gateway::turn::{TurnConfig, TurnServer as TurnRelay};
 
-/// Placeholder values that MUST NOT be used as the JWT secret.
-const PLACEHOLDER_SECRETS: &[&str] = &[
-    "change-me-to-a-random-string",
-    "dev-secret-change-me",
-];
+use haven_types::PLACEHOLDER_SECRETS;
+
+/// RFC 5764: STUN/TURN messages have first byte in 0x00..=0x3F (first 2 bits = 00).
+/// HTTP requests start with ASCII letters (0x41+). Used for TCP multiplexing.
+const STUN_FIRST_BYTE_MAX: u8 = 0x3F;
 
 #[derive(Clone)]
 struct ServerState {
-    #[allow(dead_code)]
     app: AppState,
     dispatcher: Dispatcher,
     jwt_secret: String,
@@ -92,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
         std::fs::canonicalize(&uploads_dir).unwrap_or_else(|_| uploads_dir.clone())
     });
 
-    // #5: Configurable body limit (default 10 MB)
+    // #5: Configurable body limit (default 2 GB)
     let max_body_size: usize = std::env::var("HAVEN_MAX_BODY_SIZE")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -168,13 +168,15 @@ async fn main() -> anyhow::Result<()> {
         (None, None)
     };
 
+    let http_client = Client::builder().no_proxy().build()?;
+
     let state = ServerState {
         app: app_state.clone(),
         dispatcher: dispatcher.clone(),
         jwt_secret: jwt_secret.clone(),
         file_server_url,
         file_server_internal_url,
-        http_client: Client::builder().no_proxy().build()?,
+        http_client: http_client.clone(),
         turn_servers: turn_servers_for_state,
     };
 
@@ -221,13 +223,80 @@ async fn main() -> anyhow::Result<()> {
         .route("/ft/transfers/{id}/chunks", get(ft_get_chunks))
         .route("/ft/transfers/{id}/confirm", post(ft_confirm_transfer))
         .layer(middleware::from_fn(require_auth))
-        .with_state(state);
+        .with_state(state.clone());
 
-    let app = Router::new()
+    // Fast-transfer WS proxy — auth is handled by the upstream file server via ?token= param
+    let ft_ws_route = Router::new()
+        .route("/ft/fast-transfer", get(ft_fast_transfer_ws))
+        .with_state(state.clone());
+
+    // ── Admin dashboard ─────────────────────────────────────────────────
+    let admin_secret = std::env::var("HAVEN_ADMIN_SECRET").unwrap_or_default();
+    let start_time = std::time::Instant::now();
+
+    let admin_routes = if !admin_secret.is_empty() {
+        let admin_state = admin::AdminState {
+            admin_secret,
+            jwt_secret: jwt_secret.clone(),
+            db: db.clone(),
+            dispatcher: dispatcher.clone(),
+            http_client: http_client.clone(),
+            file_server_internal_url: state.file_server_internal_url.clone(),
+            start_time,
+        };
+
+        // Login is public (no middleware)
+        let admin_login = Router::new()
+            .route("/admin/login", post(admin::admin_login))
+            .with_state(admin_state.clone());
+
+        // Protected admin API
+        let admin_api = Router::new()
+            .route("/admin/stats", get(admin::get_stats))
+            .route("/admin/users", get(admin::list_users))
+            .route("/admin/users/{id}", delete(admin::delete_user))
+            .route("/admin/kick/{user_id}", post(admin::kick_user))
+            .route("/admin/voice", get(admin::get_voice_state))
+            .route("/admin/messages", get(admin::list_messages))
+            .route("/admin/offers", get(admin::list_offers))
+            .route("/admin/offers/{id}", delete(admin::delete_offer))
+            .route("/admin/transfers", get(admin::list_transfers))
+            .route("/admin/transfers/{id}", delete(admin::delete_transfer))
+            .route("/admin/config", get(admin::get_config))
+            .route("/admin/channels", get(admin::list_channels))
+            .route("/admin/channels", post(admin::create_channel))
+            .route("/admin/channels/{id}", delete(admin::delete_channel))
+            .layer(middleware::from_fn(admin::require_admin))
+            .with_state(admin_state.clone());
+
+        // Admin WebSocket (auth via query param, not middleware)
+        let admin_ws = Router::new()
+            .route("/admin/ws", get(admin::admin_ws))
+            .with_state(admin_state);
+
+        // Static file serving — dashboard UI
+        let admin_ui = Router::new()
+            .nest_service("/dashboard", tower_http::services::ServeDir::new("./admin-ui"));
+
+        info!("Admin dashboard enabled at /dashboard/");
+        Some(admin_login.merge(admin_api).merge(admin_ws).merge(admin_ui))
+    } else {
+        info!("HAVEN_ADMIN_SECRET not set -- admin dashboard disabled");
+        None
+    };
+
+    let mut app = Router::new()
         .merge(public_routes)
         .merge(protected_routes)
         .merge(file_proxy_routes)
-        .merge(ws_route)
+        .merge(ft_ws_route)
+        .merge(ws_route);
+
+    if let Some(admin) = admin_routes {
+        app = app.merge(admin);
+    }
+
+    let app = app
         .layer(axum::Extension(jwt_extension))
         .layer(DefaultBodyLimit::max(max_body_size))
         .layer(cors)
@@ -278,7 +347,7 @@ async fn main() -> anyhow::Result<()> {
                         _ => continue,
                     }
 
-                    if peek_buf[0] <= 0x3F {
+                    if peek_buf[0] <= STUN_FIRST_BYTE_MAX {
                         // STUN/TURN — hand to TURN TCP handler
                         let turn = turn_relay.clone();
                         tokio::spawn(async move {
@@ -315,25 +384,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// #15: Listen for Ctrl+C / SIGTERM to trigger graceful shutdown.
-async fn shutdown_signal() {
-    let ctrl_c = tokio::signal::ctrl_c();
-    #[cfg(unix)]
-    {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("failed to install SIGTERM handler");
-        tokio::select! {
-            _ = ctrl_c => info!("Received Ctrl+C, shutting down..."),
-            _ = sigterm.recv() => info!("Received SIGTERM, shutting down..."),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        ctrl_c.await.ok();
-        info!("Received Ctrl+C, shutting down...");
-    }
-}
+use haven_types::shutdown_signal;
 
 /// Build a CORS layer that allows the Tauri client and localhost dev server.
 /// Additional origins can be supplied via the HAVEN_CORS_ORIGINS env var
@@ -418,24 +469,9 @@ async fn ws_upgrade(
 /// GET /pending-offers — returns pending file/folder offers for the authenticated user.
 async fn get_pending_offers(
     State(state): State<AppState>,
-    axum::Extension(jwt): axum::Extension<JwtSecret>,
-    headers: HeaderMap,
+    axum::Extension(claims): axum::Extension<Claims>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    // Extract user ID from auth middleware (already validated)
-    let auth_header = headers
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-
-    let token_data = decode::<Claims>(
-        auth_header,
-        &DecodingKey::from_secret(jwt.0.as_bytes()),
-        &Validation::default(),
-    )
-    .map_err(|_| StatusCode::UNAUTHORIZED)?;
-
-    let user_id = token_data.claims.sub.to_string();
+    let user_id = claims.sub.to_string();
 
     let file_offers = state
         .db
@@ -566,4 +602,74 @@ async fn ft_get_chunks(State(state): State<ServerState>, Path(id): Path<String>,
 
 async fn ft_confirm_transfer(State(state): State<ServerState>, Path(id): Path<String>, headers: HeaderMap, body: Body) -> Result<Response, StatusCode> {
     ft_proxy(&state, Method::POST, &format!("/transfers/{id}/confirm"), &headers, body).await
+}
+
+/// WebSocket proxy for /ft/fast-transfer → file server /fast-transfer.
+/// Bidirectionally pipes messages between the client and the upstream file server.
+async fn ft_fast_transfer_ws(
+    State(state): State<ServerState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    ws: WebSocketUpgrade,
+) -> Result<impl IntoResponse, StatusCode> {
+    let base = state.file_server_internal_url.as_deref().unwrap_or("http://127.0.0.1:3211");
+    // Convert http:// to ws://
+    let ws_base = base.replacen("http://", "ws://", 1).replacen("https://", "wss://", 1);
+
+    // Forward the token query param to the upstream
+    let token = params.get("token").cloned().unwrap_or_default();
+    let upstream_url = format!("{}/fast-transfer?token={}", ws_base, token);
+
+    Ok(ws.on_upgrade(move |client_socket| async move {
+        // Connect to upstream file server WS
+        let upstream = match tokio_tungstenite::connect_async(&upstream_url).await {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                tracing::error!(error = %e, "fast-transfer WS proxy: failed to connect upstream");
+                return;
+            }
+        };
+
+        let (mut client_tx, mut client_rx) = client_socket.split();
+        let (mut upstream_tx, mut upstream_rx) = upstream.split();
+
+        // Client → upstream
+        let c2u = tokio::spawn(async move {
+            while let Some(Ok(msg)) = client_rx.next().await {
+                use tokio_tungstenite::tungstenite::Message as TMsg;
+                let tung_msg = match msg {
+                    axum::extract::ws::Message::Text(t) => TMsg::Text(t.to_string().into()),
+                    axum::extract::ws::Message::Binary(b) => TMsg::Binary(b.to_vec().into()),
+                    axum::extract::ws::Message::Ping(p) => TMsg::Ping(p.to_vec().into()),
+                    axum::extract::ws::Message::Pong(p) => TMsg::Pong(p.to_vec().into()),
+                    axum::extract::ws::Message::Close(_) => break,
+                };
+                if upstream_tx.send(tung_msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Upstream → client
+        let u2c = tokio::spawn(async move {
+            while let Some(Ok(msg)) = upstream_rx.next().await {
+                use tokio_tungstenite::tungstenite::Message as TMsg;
+                let axum_msg = match msg {
+                    TMsg::Text(t) => axum::extract::ws::Message::Text(t.to_string().into()),
+                    TMsg::Binary(b) => axum::extract::ws::Message::Binary(b.to_vec().into()),
+                    TMsg::Ping(p) => axum::extract::ws::Message::Ping(p.to_vec().into()),
+                    TMsg::Pong(p) => axum::extract::ws::Message::Pong(p.to_vec().into()),
+                    TMsg::Close(_) => break,
+                    _ => continue,
+                };
+                if client_tx.send(axum_msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        tokio::select! {
+            _ = c2u => {},
+            _ = u2c => {},
+        }
+    }))
 }

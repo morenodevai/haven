@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use sha2::{Sha256, Digest};
 use std::path::PathBuf;
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tracing::{info, warn};
 
 /// Manages on-disk file storage for transfers.
@@ -21,7 +21,17 @@ impl Storage {
     }
 
     /// Path to the file for a given transfer.
+    ///
+    /// Validates that `transfer_id` contains no path separators or ".." sequences
+    /// to prevent path traversal attacks.
     pub fn file_path(&self, transfer_id: &str) -> PathBuf {
+        assert!(
+            !transfer_id.contains("..")
+                && !transfer_id.contains('/')
+                && !transfer_id.contains('\\'),
+            "transfer_id contains path traversal characters: {}",
+            transfer_id
+        );
         self.dir.join(transfer_id)
     }
 
@@ -66,30 +76,6 @@ impl Storage {
         Ok(data.len())
     }
 
-    /// Read bytes from a transfer file at a given offset.
-    #[allow(dead_code)]
-    pub async fn read_range(
-        &self,
-        transfer_id: &str,
-        offset: u64,
-        length: usize,
-    ) -> Result<Vec<u8>> {
-        let path = self.file_path(transfer_id);
-        let mut file = fs::File::open(&path).await?;
-        file.seek(std::io::SeekFrom::Start(offset)).await?;
-        let mut buf = vec![0u8; length];
-        let n = file.read_exact(&mut buf).await.map(|_| length).or_else(|e| {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                // partial read at end of available data
-                Ok(0)
-            } else {
-                Err(e)
-            }
-        })?;
-        buf.truncate(n);
-        Ok(buf)
-    }
-
     /// Delete a transfer's file from disk.
     pub async fn delete_file(&self, transfer_id: &str) -> Result<()> {
         let path = self.file_path(transfer_id);
@@ -106,41 +92,4 @@ impl Storage {
         }
     }
 
-    /// Get the actual size of the file on disk.
-    #[allow(dead_code)]
-    pub async fn file_size(&self, transfer_id: &str) -> Result<u64> {
-        let path = self.file_path(transfer_id);
-        let metadata = fs::metadata(&path).await?;
-        Ok(metadata.len())
-    }
-
-    /// List all transfer IDs that have files on disk.
-    #[allow(dead_code)]
-    pub async fn list_files(&self) -> Result<Vec<String>> {
-        let mut entries = fs::read_dir(&self.dir).await?;
-        let mut ids = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
-            if let Some(name) = entry.file_name().to_str() {
-                ids.push(name.to_string());
-            }
-        }
-        Ok(ids)
-    }
-
-    /// Compute the full SHA-256 of a stored file.
-    #[allow(dead_code)]
-    pub async fn verify_full_hash(&self, transfer_id: &str) -> Result<String> {
-        let path = self.file_path(transfer_id);
-        let mut file = fs::File::open(&path).await?;
-        let mut hasher = Sha256::new();
-        let mut buf = vec![0u8; 4 * 1024 * 1024]; // 4 MB read buffer
-        loop {
-            let n = file.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
-        Ok(hex::encode(hasher.finalize()))
-    }
 }

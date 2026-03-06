@@ -17,6 +17,9 @@ class VoiceService {
   final void Function(bool speaking)? onLocalSpeakingChanged;
   final void Function(String userId, bool speaking)? onRemoteSpeakingChanged;
 
+  /// Capture poll interval — matches the 20ms frame size at 16 kHz.
+  static const _capturePollInterval = Duration(milliseconds: 20);
+
   WinAudioCapture? _capture;
   WinAudioPlayback? _playback;
   Timer? _captureTimer;
@@ -48,8 +51,7 @@ class VoiceService {
     _capture = WinAudioCapture();
     _capture!.start(deviceId: _inputDeviceId);
 
-    // Poll mic every 20ms (matches 20ms frame size at 16 kHz)
-    _captureTimer = Timer.periodic(const Duration(milliseconds: 20), (_) {
+    _captureTimer = Timer.periodic(_capturePollInterval, (_) {
       _pollAndSend();
     });
   }
@@ -102,7 +104,7 @@ class VoiceService {
       _captureTimer?.cancel();
       _capture!.stop();
       _capture!.start(deviceId: _inputDeviceId);
-      _captureTimer = Timer.periodic(const Duration(milliseconds: 15), (_) {
+      _captureTimer = Timer.periodic(_capturePollInterval, (_) {
         _pollAndSend();
       });
     }

@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "haven-fast-transfer"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -350,6 +350,7 @@ dependencies = [
  "tokio-tungstenite",
  "url",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

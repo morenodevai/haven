@@ -21,6 +21,7 @@ class ScreenAudioService {
   final Map<String, WinAudioPlayback48kStereo> _playbacks = {};
 
   bool _receiving = true;
+  double _volume = 1.0;
 
   ScreenAudioService({
     required GatewayService gateway,
@@ -52,13 +53,21 @@ class ScreenAudioService {
 
   // ── Receiver side ──
 
+  /// Set playback volume for received screen audio (0.0 = silent, 2.0 = max).
+  void setVolume(double v) {
+    _volume = v.clamp(0.0, 2.0);
+  }
+
   /// Handle incoming screen audio from a peer.
   /// Called from the binary message handler when prefix byte is 0x05.
   void handleScreenAudio(String userId, Uint8List encryptedBytes) {
     if (!_receiving) return;
+    if (_volume == 0.0) return; // muted — skip decryption entirely
 
     final pcm = CryptoService.decryptVoiceSyncBytes(_keyBase64, encryptedBytes);
     if (pcm == null || pcm.isEmpty) return;
+
+    final scaled = _volume == 1.0 ? pcm : _scaleVolume(pcm, _volume);
 
     // Lazy-create per-user playback
     var playback = _playbacks[userId];
@@ -70,14 +79,14 @@ class ScreenAudioService {
 
     // Feed in 3840-byte frames
     int offset = 0;
-    while (offset + WinLoopbackCapture.frameBytes <= pcm.length) {
+    while (offset + WinLoopbackCapture.frameBytes <= scaled.length) {
       playback.feed(Uint8List.sublistView(
-          pcm, offset, offset + WinLoopbackCapture.frameBytes));
+          scaled, offset, offset + WinLoopbackCapture.frameBytes));
       offset += WinLoopbackCapture.frameBytes;
     }
     // Partial frame at end
-    if (offset < pcm.length) {
-      playback.feed(Uint8List.sublistView(pcm, offset));
+    if (offset < scaled.length) {
+      playback.feed(Uint8List.sublistView(scaled, offset));
     }
   }
 
@@ -122,6 +131,21 @@ class ScreenAudioService {
       final frame = Uint8List.sublistView(pcm, offset);
       _sendFrame(frame);
     }
+  }
+
+  /// Scale 16-bit PCM samples by [factor]. Clamps to Int16 range.
+  static Uint8List _scaleVolume(Uint8List pcm, double factor) {
+    if (pcm.length < 2) return pcm;
+    final result = Uint8List(pcm.length);
+    final src = ByteData.view(pcm.buffer, pcm.offsetInBytes, pcm.length);
+    final dst = ByteData.view(result.buffer);
+    final sampleCount = pcm.length ~/ 2;
+    for (int i = 0; i < sampleCount; i++) {
+      final sample = src.getInt16(i * 2, Endian.little);
+      final scaled = (sample * factor).round().clamp(-32768, 32767);
+      dst.setInt16(i * 2, scaled, Endian.little);
+    }
+    return result;
   }
 
   void _sendFrame(Uint8List pcm) {

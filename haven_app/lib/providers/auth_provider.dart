@@ -1,3 +1,4 @@
+import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:haven_app/services/api_service.dart';
@@ -76,17 +77,22 @@ class AuthNotifier extends StateNotifier<AuthState> {
         userId: _authService.userId,
         username: _authService.username,
       );
-    } catch (e) {
+    } on DioException catch (e) {
       String message = 'Login failed';
-      if (e.toString().contains('401')) {
-        message = 'Invalid username or password';
-      } else if (e.toString().contains('429')) {
-        message = 'Too many attempts. Please wait.';
-      } else if (e.toString().contains('SocketException') ||
-          e.toString().contains('Connection refused')) {
-        message = 'Cannot connect to server';
+      switch (e.response?.statusCode) {
+        case 401:
+          message = 'Invalid username or password';
+        case 429:
+          message = 'Too many attempts. Please wait.';
+        default:
+          if (e.type == DioExceptionType.connectionError ||
+              e.type == DioExceptionType.connectionTimeout) {
+            message = 'Cannot connect to server';
+          }
       }
       state = state.copyWith(isLoading: false, error: message);
+    } catch (_) {
+      state = state.copyWith(isLoading: false, error: 'Login failed');
     }
   }
 
@@ -99,19 +105,24 @@ class AuthNotifier extends StateNotifier<AuthState> {
         userId: _authService.userId,
         username: _authService.username,
       );
-    } catch (e) {
+    } on DioException catch (e) {
       String message = 'Registration failed';
-      if (e.toString().contains('409')) {
-        message = 'Username already taken';
-      } else if (e.toString().contains('400')) {
-        message = 'Invalid username or password format';
-      } else if (e.toString().contains('429')) {
-        message = 'Too many attempts. Please wait.';
-      } else if (e.toString().contains('SocketException') ||
-          e.toString().contains('Connection refused')) {
-        message = 'Cannot connect to server';
+      switch (e.response?.statusCode) {
+        case 400:
+          message = 'Invalid username or password format';
+        case 409:
+          message = 'Username already taken';
+        case 429:
+          message = 'Too many attempts. Please wait.';
+        default:
+          if (e.type == DioExceptionType.connectionError ||
+              e.type == DioExceptionType.connectionTimeout) {
+            message = 'Cannot connect to server';
+          }
       }
       state = state.copyWith(isLoading: false, error: message);
+    } catch (_) {
+      state = state.copyWith(isLoading: false, error: 'Registration failed');
     }
   }
 

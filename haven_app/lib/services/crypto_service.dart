@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:isolate';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:pointycastle/export.dart';
@@ -18,10 +19,10 @@ class CryptoService {
 
   static SecureRandom _initSecureRandom() {
     final random = FortunaRandom();
+    final secureRng = Random.secure();
     final seed = Uint8List(32);
-    final dartRandom = DateTime.now().microsecondsSinceEpoch;
     for (int i = 0; i < 32; i++) {
-      seed[i] = ((dartRandom >> (i % 8)) ^ (i * 37)) & 0xFF;
+      seed[i] = secureRng.nextInt(256);
     }
     random.seed(KeyParameter(seed));
     return random;

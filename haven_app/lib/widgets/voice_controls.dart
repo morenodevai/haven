@@ -1,12 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import 'package:haven_app/config/theme.dart';
 import 'package:haven_app/providers/audio_settings_provider.dart';
 import 'package:haven_app/providers/video_provider.dart';
 import 'package:haven_app/providers/voice_provider.dart';
-import 'package:haven_app/services/webrtc_service.dart';
+import 'package:haven_app/widgets/video_grid.dart';
 
 class VoiceControls extends ConsumerWidget {
   const VoiceControls({super.key});
@@ -16,16 +15,16 @@ class VoiceControls extends ConsumerWidget {
     final voiceState = ref.watch(voiceProvider);
     final videoState = ref.watch(videoProvider);
 
-    if (voiceState.error != null) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
+    ref.listen<VoiceState>(voiceProvider, (prev, next) {
+      if (next.error != null && prev?.error != next.error) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text(voiceState.error!),
+            content: Text(next.error!),
             backgroundColor: HavenTheme.error,
           ),
         );
-      });
-    }
+      }
+    });
 
     if (!voiceState.isInVoice) {
       return Center(
@@ -86,177 +85,19 @@ class VoiceControls extends ConsumerWidget {
 
 // ─── Video Grid ──────────────────────────────────────────────────────────────
 
-class _VideoGrid extends ConsumerWidget {
+class _VideoGrid extends StatelessWidget {
   final VideoState videoState;
   final VoiceState voiceState;
 
   const _VideoGrid({required this.videoState, required this.voiceState});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final tiles = _collectTiles();
-    if (tiles.isEmpty) {
-      return const Center(
-        child: Text('No video', style: TextStyle(color: HavenTheme.textMuted)),
-      );
-    }
-
-    final focusedId = videoState.focusedStreamId;
-    if (focusedId != null) {
-      final focusedIdx = tiles.indexWhere((t) => t.id == focusedId);
-      if (focusedIdx >= 0) {
-        return _buildFocusedLayout(tiles, focusedIdx, ref);
-      }
-    }
-
-    return _buildEqualGrid(tiles, ref);
-  }
-
-  List<_VideoTileData> _collectTiles() {
-    final tiles = <_VideoTileData>[];
-
-    // Local camera
-    if (videoState.cameraEnabled && videoState.localCameraRenderer != null) {
-      tiles.add(_VideoTileData(
-        id: 'local-camera',
-        renderer: videoState.localCameraRenderer!,
-        label: 'You',
-        mirror: true,
-        isScreen: false,
-      ));
-    }
-
-    // Local screen (only if showOwnScreen)
-    if (videoState.screenShareEnabled && videoState.showOwnScreen && videoState.localScreenRenderer != null) {
-      tiles.add(_VideoTileData(
-        id: 'local-screen',
-        renderer: videoState.localScreenRenderer!,
-        label: 'You (Screen)',
-        isScreen: true,
-      ));
-    }
-
-    // Remote streams
-    for (final entry in videoState.remoteStreams.entries) {
-      final peerId = entry.key;
-      for (final rs in entry.value) {
-        final participant = voiceState.participants[peerId];
-        final name = participant?.username ?? peerId.substring(0, 8);
-        tiles.add(_VideoTileData(
-          id: '$peerId-${rs.stream.id}',
-          renderer: rs.renderer,
-          label: rs.kind == VideoTrackKind.screen ? '$name (Screen)' : name,
-          isScreen: rs.kind == VideoTrackKind.screen,
-        ));
-      }
-    }
-
-    return tiles;
-  }
-
-  Widget _buildEqualGrid(List<_VideoTileData> tiles, WidgetRef ref) {
-    final count = tiles.length;
-    if (count == 1) return _tile(tiles[0], ref);
-    if (count == 2) {
-      return Row(
-        children: tiles.map((t) => Expanded(child: _tile(t, ref))).toList(),
-      );
-    }
-    if (count <= 4) {
-      return Column(
-        children: [
-          Expanded(
-            child: Row(
-              children: tiles.take(2).map((t) => Expanded(child: _tile(t, ref))).toList(),
-            ),
-          ),
-          Expanded(
-            child: Row(
-              children: tiles.skip(2).map((t) => Expanded(child: _tile(t, ref))).toList(),
-            ),
-          ),
-        ],
-      );
-    }
-    // 5-6: 3x2
-    return Column(
-      children: [
-        Expanded(
-          child: Row(
-            children: tiles.take(3).map((t) => Expanded(child: _tile(t, ref))).toList(),
-          ),
-        ),
-        Expanded(
-          child: Row(
-            children: tiles.skip(3).map((t) => Expanded(child: _tile(t, ref))).toList(),
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildFocusedLayout(List<_VideoTileData> tiles, int focusedIdx, WidgetRef ref) {
-    final focused = tiles[focusedIdx];
-    final others = [...tiles]..removeAt(focusedIdx);
-
-    return Row(
-      children: [
-        Expanded(
-          flex: 3,
-          child: _tile(focused, ref),
-        ),
-        if (others.isNotEmpty)
-          SizedBox(
-            width: 180,
-            child: ListView(
-              children: others.map((t) => SizedBox(
-                height: 120,
-                child: _tile(t, ref),
-              )).toList(),
-            ),
-          ),
-      ],
-    );
-  }
-
-  Widget _tile(_VideoTileData data, WidgetRef ref) {
-    return GestureDetector(
-      onTap: () => ref.read(videoProvider.notifier).setFocusedStream(data.id),
-      child: Container(
-        margin: const EdgeInsets.all(1),
-        color: Colors.black,
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            RTCVideoView(
-              data.renderer,
-              mirror: data.mirror,
-              objectFit: data.isScreen
-                  ? RTCVideoViewObjectFit.RTCVideoViewObjectFitContain
-                  : RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
-            ),
-            Positioned(
-              left: 6,
-              bottom: 6,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                decoration: BoxDecoration(
-                  color: Colors.black54,
-                  borderRadius: BorderRadius.circular(4),
-                ),
-                child: Text(
-                  data.label,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 11,
-                    fontWeight: FontWeight.w500,
-                  ),
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
+  Widget build(BuildContext context) {
+    final tiles = collectVideoTiles(videoState, voiceState);
+    return VideoGrid(
+      tiles: tiles,
+      focusedStreamId: videoState.focusedStreamId,
+      emptyText: 'No video',
     );
   }
 }
@@ -422,6 +263,12 @@ class _ControlBar extends ConsumerWidget {
             onTap: () => ref.read(videoProvider.notifier).toggleScreenShare(),
           ),
 
+          // Screen audio volume (visible when any screen share is active)
+          if (videoState.screenShareEnabled || videoState.remoteStreams.isNotEmpty) ...[
+            const SizedBox(width: 16),
+            _ScreenAudioVolumeButton(),
+          ],
+
           // Eye toggle (own screen preview)
           if (videoState.screenShareEnabled) ...[
             const SizedBox(width: 16),
@@ -480,22 +327,6 @@ class _ControlBar extends ConsumerWidget {
 }
 
 // ─── Shared widgets ──────────────────────────────────────────────────────────
-
-class _VideoTileData {
-  final String id;
-  final RTCVideoRenderer renderer;
-  final String label;
-  final bool mirror;
-  final bool isScreen;
-
-  _VideoTileData({
-    required this.id,
-    required this.renderer,
-    required this.label,
-    this.mirror = false,
-    this.isScreen = false,
-  });
-}
 
 class _ControlButton extends StatelessWidget {
   final IconData icon;
@@ -577,6 +408,152 @@ class _VolumeButton extends ConsumerWidget {
         PopupMenuItem<void>(
           enabled: false,
           child: _VolumeSliderContent(userId: userId, volume: volume),
+        ),
+      ],
+    );
+  }
+}
+
+class _ScreenAudioVolumeButton extends ConsumerWidget {
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final audioState = ref.watch(audioSettingsProvider);
+    final effectiveVol = audioState.screenAudioMuted ? 0.0 : audioState.screenAudioVolume;
+
+    IconData icon;
+    if (effectiveVol == 0) {
+      icon = Icons.volume_off;
+    } else if (effectiveVol < 1.0) {
+      icon = Icons.volume_down;
+    } else {
+      icon = Icons.volume_up;
+    }
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        PopupMenuButton<void>(
+          tooltip: 'Screen audio ${(effectiveVol * 100).round()}%',
+          padding: EdgeInsets.zero,
+          constraints: const BoxConstraints(minWidth: 180),
+          color: HavenTheme.surface,
+          child: Material(
+            color: audioState.screenAudioMuted
+                ? HavenTheme.error.withValues(alpha: 0.2)
+                : HavenTheme.surface,
+            shape: const CircleBorder(),
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Icon(
+                icon,
+                color: audioState.screenAudioMuted
+                    ? HavenTheme.error
+                    : HavenTheme.textSecondary,
+                size: 24,
+              ),
+            ),
+          ),
+          itemBuilder: (_) => [
+            PopupMenuItem<void>(
+              enabled: false,
+              child: _ScreenAudioSliderContent(
+                volume: audioState.screenAudioVolume,
+                muted: audioState.screenAudioMuted,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 4),
+        Text(
+          'Screen Vol',
+          style: TextStyle(fontSize: 11, color: HavenTheme.textMuted),
+        ),
+      ],
+    );
+  }
+}
+
+class _ScreenAudioSliderContent extends ConsumerStatefulWidget {
+  final double volume;
+  final bool muted;
+
+  const _ScreenAudioSliderContent({required this.volume, required this.muted});
+
+  @override
+  ConsumerState<_ScreenAudioSliderContent> createState() =>
+      _ScreenAudioSliderContentState();
+}
+
+class _ScreenAudioSliderContentState
+    extends ConsumerState<_ScreenAudioSliderContent> {
+  late double _vol;
+
+  @override
+  void initState() {
+    super.initState();
+    _vol = widget.volume;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Row(
+          children: [
+            Text(
+              widget.muted ? 'Muted' : '${(_vol * 100).round()}%',
+              style: const TextStyle(
+                fontSize: 13,
+                color: HavenTheme.textPrimary,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+            const Spacer(),
+            InkWell(
+              onTap: () {
+                ref.read(audioSettingsProvider.notifier).toggleScreenAudioMute();
+              },
+              child: Padding(
+                padding: const EdgeInsets.all(4),
+                child: Icon(
+                  widget.muted ? Icons.volume_up : Icons.volume_off,
+                  size: 16,
+                  color: widget.muted ? HavenTheme.online : HavenTheme.error,
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            InkWell(
+              onTap: () {
+                setState(() => _vol = 1.0);
+                ref.read(audioSettingsProvider.notifier).setScreenAudioVolume(1.0);
+              },
+              child: const Padding(
+                padding: EdgeInsets.all(4),
+                child: Icon(Icons.restart_alt, size: 16, color: HavenTheme.textMuted),
+              ),
+            ),
+          ],
+        ),
+        SliderTheme(
+          data: SliderThemeData(
+            activeTrackColor: HavenTheme.primaryLight,
+            inactiveTrackColor: HavenTheme.surfaceVariant,
+            thumbColor: HavenTheme.primaryLight,
+            overlayColor: HavenTheme.primaryLight.withValues(alpha: 0.2),
+            trackHeight: 3,
+            thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+          ),
+          child: Slider(
+            value: _vol,
+            min: 0,
+            max: 2.0,
+            onChanged: (v) {
+              setState(() => _vol = v);
+              ref.read(audioSettingsProvider.notifier).setScreenAudioVolume(v);
+            },
+          ),
         ),
       ],
     );

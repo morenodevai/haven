@@ -192,7 +192,7 @@ impl Database {
                 "SELECT transfer_id, from_user_id, to_user_id, filename, file_size,
                         file_sha256, chunk_hashes, file_server_url, folder_id, status
                  FROM pending_offers
-                 WHERE to_user_id = ?1 AND status IN ('pending', 'accepted')
+                 WHERE to_user_id = ?1 AND status IN ('pending', 'accepted', 'uploaded')
                  ORDER BY created_at ASC",
             )?;
             let rows = stmt.query_map([user_id], |row| {
@@ -268,6 +268,194 @@ impl Database {
                 })
             })?;
             rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+        })
+    }
+
+    // -- Admin queries --
+
+    /// List all registered users without password hashes (admin).
+    pub fn list_all_users(&self) -> Result<Vec<(String, String, String)>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, username, created_at FROM users ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+    }
+
+    /// Delete a user and their associated pending offers (admin).
+    pub fn delete_user(&self, user_id: &str) -> Result<()> {
+        self.with_conn_mut(|conn| {
+            conn.execute(
+                "DELETE FROM pending_offers WHERE from_user_id = ?1 OR to_user_id = ?1",
+                [user_id],
+            )?;
+            conn.execute(
+                "DELETE FROM pending_folder_offers WHERE from_user_id = ?1 OR to_user_id = ?1",
+                [user_id],
+            )?;
+            conn.execute("DELETE FROM users WHERE id = ?1", [user_id])?;
+            Ok(())
+        })
+    }
+
+    /// List all channels with message counts (admin).
+    pub fn list_channels_with_counts(&self) -> Result<Vec<(String, String, i64)>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT c.id, c.name, COUNT(m.id) as msg_count
+                 FROM channels c
+                 LEFT JOIN messages m ON c.id = m.channel_id
+                 GROUP BY c.id
+                 ORDER BY c.name",
+            )?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+    }
+
+    /// Create a new channel (admin).
+    pub fn create_channel(&self, id: &str, name: &str) -> Result<()> {
+        self.with_conn_mut(|conn| {
+            conn.execute(
+                "INSERT INTO channels (id, name) VALUES (?1, ?2)",
+                [id, name],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Delete a channel and all its messages and reactions (admin).
+    pub fn delete_channel(&self, id: &str) -> Result<()> {
+        self.with_conn_mut(|conn| {
+            conn.execute(
+                "DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE channel_id = ?1)",
+                [id],
+            )?;
+            conn.execute("DELETE FROM messages WHERE channel_id = ?1", [id])?;
+            conn.execute("DELETE FROM channels WHERE id = ?1", [id])?;
+            Ok(())
+        })
+    }
+
+    /// Get recent messages across all channels, metadata only (admin).
+    pub fn list_recent_messages(
+        &self,
+        limit: u32,
+        channel_id: Option<&str>,
+    ) -> Result<Vec<MessageRow>> {
+        self.with_conn(|conn| {
+            let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match channel_id {
+                Some(cid) => (
+                    "SELECT m.id, m.channel_id, m.author_id,
+                            COALESCE(u.username, 'unknown'), m.ciphertext, m.nonce, m.created_at
+                     FROM messages m LEFT JOIN users u ON m.author_id = u.id
+                     WHERE m.channel_id = ?1
+                     ORDER BY m.created_at DESC LIMIT ?2"
+                        .into(),
+                    vec![
+                        Box::new(cid.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                        Box::new(limit),
+                    ],
+                ),
+                None => (
+                    "SELECT m.id, m.channel_id, m.author_id,
+                            COALESCE(u.username, 'unknown'), m.ciphertext, m.nonce, m.created_at
+                     FROM messages m LEFT JOIN users u ON m.author_id = u.id
+                     ORDER BY m.created_at DESC LIMIT ?1"
+                        .into(),
+                    vec![Box::new(limit) as Box<dyn rusqlite::types::ToSql>],
+                ),
+            };
+            let mut stmt = conn.prepare(&sql)?;
+            let refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.query_map(refs.as_slice(), |row| {
+                Ok(MessageRow {
+                    id: row.get(0)?,
+                    channel_id: row.get(1)?,
+                    author_id: row.get(2)?,
+                    author_username: row
+                        .get::<_, Option<String>>(3)?
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    ciphertext: row.get(4)?,
+                    nonce: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+    }
+
+    /// List all pending file offers, unfiltered (admin).
+    pub fn list_all_pending_offers(&self) -> Result<Vec<PendingOfferRow>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT transfer_id, from_user_id, to_user_id, filename, file_size,
+                        file_sha256, chunk_hashes, file_server_url, folder_id, status
+                 FROM pending_offers
+                 ORDER BY created_at DESC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(PendingOfferRow {
+                    transfer_id: row.get(0)?,
+                    from_user_id: row.get(1)?,
+                    to_user_id: row.get(2)?,
+                    filename: row.get(3)?,
+                    file_size: row.get(4)?,
+                    file_sha256: row.get(5)?,
+                    chunk_hashes: row.get(6)?,
+                    file_server_url: row.get(7)?,
+                    folder_id: row.get(8)?,
+                    status: row.get(9)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+    }
+
+    /// List all pending folder offers, unfiltered (admin).
+    pub fn list_all_pending_folder_offers(&self) -> Result<Vec<PendingFolderOfferRow>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT folder_id, from_user_id, to_user_id, folder_name, total_size,
+                        file_count, manifest, file_server_url, status
+                 FROM pending_folder_offers
+                 ORDER BY created_at DESC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(PendingFolderOfferRow {
+                    folder_id: row.get(0)?,
+                    from_user_id: row.get(1)?,
+                    to_user_id: row.get(2)?,
+                    folder_name: row.get(3)?,
+                    total_size: row.get(4)?,
+                    file_count: row.get(5)?,
+                    manifest: row.get(6)?,
+                    file_server_url: row.get(7)?,
+                    status: row.get(8)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+    }
+
+    /// Delete a pending offer by transfer_id (admin).
+    pub fn delete_pending_offer(&self, transfer_id: &str) -> Result<()> {
+        self.with_conn_mut(|conn| {
+            conn.execute(
+                "DELETE FROM pending_offers WHERE transfer_id = ?1",
+                [transfer_id],
+            )?;
+            Ok(())
         })
     }
 

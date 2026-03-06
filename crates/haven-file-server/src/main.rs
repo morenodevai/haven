@@ -19,11 +19,7 @@ use crate::db::FileDb;
 use crate::routes::AppState;
 use crate::storage::Storage;
 
-/// Placeholder JWT secrets that MUST NOT be used.
-const PLACEHOLDER_SECRETS: &[&str] = &[
-    "change-me-to-a-random-string",
-    "dev-secret-change-me",
-];
+use haven_types::PLACEHOLDER_SECRETS;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -110,6 +106,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/transfers/{id}", delete(routes::delete_transfer))
         .route("/fast-transfer", get(routes::fast_transfer_ws))
         .route("/health", get(routes::health))
+        .route("/transfers/all", get(routes::list_all_transfers))
+        .route("/admin/transfers/{id}", delete(routes::admin_delete_transfer))
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024 * 1024)) // 4 GB max
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -131,21 +129,4 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = tokio::signal::ctrl_c();
-    #[cfg(unix)]
-    {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("failed to install SIGTERM handler");
-        tokio::select! {
-            _ = ctrl_c => info!("Received Ctrl+C, shutting down..."),
-            _ = sigterm.recv() => info!("Received SIGTERM, shutting down..."),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        ctrl_c.await.ok();
-        info!("Received Ctrl+C, shutting down...");
-    }
-}
+use haven_types::shutdown_signal;

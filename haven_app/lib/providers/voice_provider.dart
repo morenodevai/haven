@@ -80,6 +80,7 @@ class VoiceNotifier extends StateNotifier<VoiceState> {
       audioSettings.onInputDeviceChanged = (id) => voiceService.setInputDevice(id);
       audioSettings.onOutputDeviceChanged = (id) => voiceService.setOutputDevice(id);
       audioSettings.onUserVolumeChanged = (userId, vol) => voiceService.setUserVolume(userId, vol);
+      audioSettings.onScreenAudioVolumeChanged = (vol) => _screenAudioService?.setVolume(vol);
 
       // Apply current audio settings
       final audioState = _ref.read(audioSettingsProvider);
@@ -129,6 +130,7 @@ class VoiceNotifier extends StateNotifier<VoiceState> {
     audioSettings.onInputDeviceChanged = null;
     audioSettings.onOutputDeviceChanged = null;
     audioSettings.onUserVolumeChanged = null;
+    audioSettings.onScreenAudioVolumeChanged = null;
 
     await _ref.read(videoProvider.notifier).disposeWebRTC();
     _ref.read(gatewayServiceProvider).voiceLeave();

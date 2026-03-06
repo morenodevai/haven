@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import 'package:haven_app/config/constants.dart';
 import 'package:haven_app/models/channel.dart';
@@ -15,10 +14,10 @@ import 'package:haven_app/providers/typing_provider.dart';
 import 'package:haven_app/providers/video_provider.dart';
 import 'package:haven_app/providers/voice_provider.dart';
 import 'package:haven_app/services/file_transfer_service.dart';
-import 'package:haven_app/services/webrtc_service.dart';
 import 'package:haven_app/screens/chat_screen.dart';
 import 'package:haven_app/screens/file_transfer_screen.dart';
 import 'package:haven_app/widgets/sidebar.dart';
+import 'package:haven_app/widgets/video_grid.dart';
 import 'package:haven_app/widgets/voice_controls.dart';
 
 class HomeScreen extends ConsumerStatefulWidget {
@@ -189,7 +188,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 }
 
-class _FullscreenVideoOverlay extends ConsumerWidget {
+class _FullscreenVideoOverlay extends ConsumerStatefulWidget {
   final VideoState videoState;
   final VoiceState voiceState;
   final String? myUserId;
@@ -201,9 +200,28 @@ class _FullscreenVideoOverlay extends ConsumerWidget {
   });
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_FullscreenVideoOverlay> createState() => _FullscreenVideoOverlayState();
+}
+
+class _FullscreenVideoOverlayState extends ConsumerState<_FullscreenVideoOverlay> {
+  final _focusNode = FocusNode();
+
+  @override
+  void initState() {
+    super.initState();
+    _focusNode.requestFocus();
+  }
+
+  @override
+  void dispose() {
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
     return KeyboardListener(
-      focusNode: FocusNode()..requestFocus(),
+      focusNode: _focusNode,
       autofocus: true,
       onKeyEvent: (event) {
         if (event is KeyDownEvent && event.logicalKey == LogicalKeyboardKey.escape) {
@@ -216,7 +234,7 @@ class _FullscreenVideoOverlay extends ConsumerWidget {
           children: [
             // Video grid fills entire screen
             Positioned.fill(
-              child: _buildVideoGrid(ref),
+              child: _buildVideoGrid(),
             ),
 
             // Semi-transparent control bar at bottom
@@ -240,9 +258,9 @@ class _FullscreenVideoOverlay extends ConsumerWidget {
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     _fullscreenButton(
-                      icon: videoState.showOwnScreen ? Icons.visibility : Icons.visibility_off,
+                      icon: widget.videoState.showOwnScreen ? Icons.visibility : Icons.visibility_off,
                       label: 'Preview',
-                      visible: videoState.screenShareEnabled,
+                      visible: widget.videoState.screenShareEnabled,
                       onTap: () => ref.read(videoProvider.notifier).toggleShowOwnScreen(),
                     ),
                     const SizedBox(width: 24),
@@ -289,187 +307,12 @@ class _FullscreenVideoOverlay extends ConsumerWidget {
     );
   }
 
-  Widget _buildVideoGrid(WidgetRef ref) {
-    final tiles = _collectTiles(ref);
-    if (tiles.isEmpty) {
-      return const Center(
-        child: Text('No video', style: TextStyle(color: Colors.white54)),
-      );
-    }
-
-    final focusedId = videoState.focusedStreamId;
-    if (focusedId != null) {
-      final focusedIdx = tiles.indexWhere((t) => t.id == focusedId);
-      if (focusedIdx >= 0) {
-        return _buildFocusedLayout(tiles, focusedIdx, ref);
-      }
-    }
-
-    return _buildEqualGrid(tiles, ref);
-  }
-
-  List<_VideoTileData> _collectTiles(WidgetRef ref) {
-    final tiles = <_VideoTileData>[];
-
-    // Local camera
-    if (videoState.cameraEnabled && videoState.localCameraRenderer != null) {
-      tiles.add(_VideoTileData(
-        id: 'local-camera',
-        renderer: videoState.localCameraRenderer!,
-        label: 'You',
-        mirror: true,
-        isScreen: false,
-      ));
-    }
-
-    // Local screen (only if showOwnScreen)
-    if (videoState.screenShareEnabled && videoState.showOwnScreen && videoState.localScreenRenderer != null) {
-      tiles.add(_VideoTileData(
-        id: 'local-screen',
-        renderer: videoState.localScreenRenderer!,
-        label: 'You (Screen)',
-        isScreen: true,
-      ));
-    }
-
-    // Remote streams
-    for (final entry in videoState.remoteStreams.entries) {
-      final peerId = entry.key;
-      for (final rs in entry.value) {
-        final participant = voiceState.participants[peerId];
-        final name = participant?.username ?? peerId.substring(0, 8);
-        tiles.add(_VideoTileData(
-          id: '$peerId-${rs.stream.id}',
-          renderer: rs.renderer,
-          label: rs.kind == VideoTrackKind.screen ? '$name (Screen)' : name,
-          isScreen: rs.kind == VideoTrackKind.screen,
-        ));
-      }
-    }
-
-    return tiles;
-  }
-
-  Widget _buildEqualGrid(List<_VideoTileData> tiles, WidgetRef ref) {
-    final count = tiles.length;
-    if (count == 1) return _tile(tiles[0], ref);
-    if (count == 2) {
-      return Row(
-        children: tiles.map((t) => Expanded(child: _tile(t, ref))).toList(),
-      );
-    }
-    if (count <= 4) {
-      return Column(
-        children: [
-          Expanded(
-            child: Row(
-              children: tiles.take(2).map((t) => Expanded(child: _tile(t, ref))).toList(),
-            ),
-          ),
-          Expanded(
-            child: Row(
-              children: tiles.skip(2).map((t) => Expanded(child: _tile(t, ref))).toList(),
-            ),
-          ),
-        ],
-      );
-    }
-    // 5-6: 3x2
-    return Column(
-      children: [
-        Expanded(
-          child: Row(
-            children: tiles.take(3).map((t) => Expanded(child: _tile(t, ref))).toList(),
-          ),
-        ),
-        Expanded(
-          child: Row(
-            children: tiles.skip(3).map((t) => Expanded(child: _tile(t, ref))).toList(),
-          ),
-        ),
-      ],
+  Widget _buildVideoGrid() {
+    final tiles = collectVideoTiles(widget.videoState, widget.voiceState);
+    return VideoGrid(
+      tiles: tiles,
+      focusedStreamId: widget.videoState.focusedStreamId,
+      emptyText: 'No video',
     );
   }
-
-  Widget _buildFocusedLayout(List<_VideoTileData> tiles, int focusedIdx, WidgetRef ref) {
-    final focused = tiles[focusedIdx];
-    final others = [...tiles]..removeAt(focusedIdx);
-
-    return Row(
-      children: [
-        // Focused tile ~75%
-        Expanded(
-          flex: 3,
-          child: _tile(focused, ref),
-        ),
-        // Others strip
-        if (others.isNotEmpty)
-          SizedBox(
-            width: 180,
-            child: ListView(
-              children: others.map((t) => SizedBox(
-                height: 120,
-                child: _tile(t, ref),
-              )).toList(),
-            ),
-          ),
-      ],
-    );
-  }
-
-  Widget _tile(_VideoTileData data, WidgetRef ref) {
-    return GestureDetector(
-      onTap: () => ref.read(videoProvider.notifier).setFocusedStream(data.id),
-      child: Container(
-        color: Colors.black,
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            RTCVideoView(
-              data.renderer,
-              mirror: data.mirror,
-              objectFit: data.isScreen
-                  ? RTCVideoViewObjectFit.RTCVideoViewObjectFitContain
-                  : RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
-            ),
-            Positioned(
-              left: 4,
-              bottom: 4,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                decoration: BoxDecoration(
-                  color: Colors.black54,
-                  borderRadius: BorderRadius.circular(4),
-                ),
-                child: Text(
-                  data.label,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 11,
-                    fontWeight: FontWeight.w500,
-                  ),
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _VideoTileData {
-  final String id;
-  final RTCVideoRenderer renderer;
-  final String label;
-  final bool mirror;
-  final bool isScreen;
-
-  _VideoTileData({
-    required this.id,
-    required this.renderer,
-    required this.label,
-    this.mirror = false,
-    this.isScreen = false,
-  });
 }

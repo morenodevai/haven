@@ -79,7 +79,7 @@ class FileTransfer {
 }
 
 /// Folder transfer state machine.
-class FolderTransferState {
+class FolderTransferStatus {
   static const int pending = 0;
   static const int active = 1;
   static const int complete = 2;
@@ -105,7 +105,7 @@ class FolderTransfer {
   final String? targetUserId;
   final List<FolderFileEntry> manifest;
 
-  int state = FolderTransferState.pending;
+  int state = FolderTransferStatus.pending;
 
   /// Maps child transfer IDs to their relative paths in the folder.
   final Map<String, String> transferIdToPath = {};
@@ -170,9 +170,6 @@ class FileTransferService {
   final GatewayService _gateway;
   final String Function() _getToken;
   final String Function() _getServerUrl;
-
-  /// Cached result of localhost reachability check. Null = not yet checked.
-
 
   FileClientBindings? _bindings;
   final _dio = Dio();
@@ -487,7 +484,7 @@ class FileTransferService {
       manifest: manifest,
       targetUserId: targetUserId,
     );
-    folder.state = FolderTransferState.active;
+    folder.state = FolderTransferStatus.active;
     _folders[folderId] = folder;
 
     // Send FolderOfferSend via gateway
@@ -622,7 +619,7 @@ class FileTransferService {
 
     _log('INFO', 'acceptFolder: folder=$folderId name=${folder.folderName} saveDir=$saveDir');
 
-    folder.state = FolderTransferState.active;
+    folder.state = FolderTransferStatus.active;
     folder.saveDir = saveDir;
     folder.masterKey = masterKey;
     folder.salt = salt;
@@ -655,7 +652,7 @@ class FileTransferService {
 
     _log('INFO', 'rejectFolder: folder=$folderId');
 
-    folder.state = FolderTransferState.rejected;
+    folder.state = FolderTransferStatus.rejected;
 
     // Send FolderRejectSend
     _gateway.send({
@@ -865,36 +862,6 @@ class FileTransferService {
   }
 
   // ── Private methods ──────────────────────────────────────────────────
-
-  Future<String> _resolveServerUrl(String configuredUrl) async {
-    final uri = Uri.parse(configuredUrl);
-    final healthOpts = Options(
-      receiveTimeout: const Duration(milliseconds: 800),
-      sendTimeout: const Duration(milliseconds: 800),
-    );
-
-    // Try localhost first (same machine as server)
-    try {
-      await _dio.get(uri.replace(host: '127.0.0.1', path: '/health').toString(), options: healthOpts);
-      final resolved = uri.replace(host: '127.0.0.1').toString();
-      _log('INFO', 'server resolve: using 127.0.0.1 ($resolved)');
-      return resolved;
-    } catch (_) {}
-
-    // Try the chat server's host (LAN IP the app already connected to)
-    final chatHost = Uri.parse(_getServerUrl()).host;
-    if (chatHost.isNotEmpty && chatHost != uri.host && chatHost != '127.0.0.1') {
-      try {
-        await _dio.get(uri.replace(host: chatHost, path: '/health').toString(), options: healthOpts);
-        final resolved = uri.replace(host: chatHost).toString();
-        _log('INFO', 'server resolve: using chat host $chatHost ($resolved)');
-        return resolved;
-      } catch (_) {}
-    }
-
-    _log('INFO', 'server resolve: using configured $configuredUrl');
-    return configuredUrl;
-  }
 
   void _startUpload(FileTransfer transfer, String filePath, String masterKey, String salt) async {
     final bindings = _getBindings();
@@ -1133,15 +1100,15 @@ class FileTransferService {
 
   void _checkFolderCompletion(String folderId) {
     final folder = _folders[folderId];
-    if (folder == null || folder.state == FolderTransferState.complete) return;
+    if (folder == null || folder.state == FolderTransferStatus.complete) return;
 
     final allDone = folder.transferIdToPath.keys.every((tid) {
       final t = _transfers[tid];
       return t != null && t.state == TransferState.complete;
     });
 
-    if (allDone && folder.transferIdToPath.isNotEmpty) {
-      folder.state = FolderTransferState.complete;
+    if (allDone && folder.transferIdToPath.length >= folder.fileCount) {
+      folder.state = FolderTransferStatus.complete;
       _log('INFO', 'folder complete: folder=$folderId name=${folder.folderName}');
     }
   }
@@ -1166,6 +1133,18 @@ class FileTransferService {
     }).toList();
 
     _log('INFO', '_handleFolderOffer: folder=$folderId name=$folderName files=$fileCount size=$totalSize from=$fromUserId');
+
+    // If folder already exists and was accepted, don't overwrite — just
+    // update the manifest in case it changed and revert to active.
+    final existing = _folders[folderId];
+    if (existing != null && existing.saveDir != null) {
+      _log('INFO', '_handleFolderOffer: folder=$folderId already accepted, keeping state');
+      if (existing.state == FolderTransferStatus.complete) {
+        existing.state = FolderTransferStatus.active;
+      }
+      onProgressUpdate?.call();
+      return;
+    }
 
     final folder = FolderTransfer(
       folderId: folderId,
@@ -1194,7 +1173,7 @@ class FileTransferService {
 
     final folder = _folders[folderId];
     if (folder != null) {
-      folder.state = FolderTransferState.rejected;
+      folder.state = FolderTransferStatus.rejected;
       // Cancel all child transfers
       for (final tid in folder.transferIdToPath.keys) {
         cancelTransfer(tid);
@@ -1238,10 +1217,13 @@ class FileTransferService {
         folder.transferIdToPath[transferId] = filename;
 
         // If folder is already accepted, auto-accept this file
-        if (folder.state == FolderTransferState.active &&
-            folder.saveDir != null &&
+        if (folder.saveDir != null &&
             folder.masterKey != null &&
             folder.salt != null) {
+          // Revert to active if new children arrive after premature completion
+          if (folder.state == FolderTransferStatus.complete) {
+            folder.state = FolderTransferStatus.active;
+          }
           final savePath = '${folder.saveDir}/$filename'.replaceAll('/', '\\');
           _log('INFO', '_handleFileOffer: auto-accepting folder child transfer=$transferId savePath=$savePath');
           acceptOffer(transferId, savePath, folder.masterKey!, folder.salt!);

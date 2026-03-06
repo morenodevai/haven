@@ -250,6 +250,54 @@ impl Dispatcher {
         });
     }
 
+    /// Force-disconnect a user: close all send channels and perform full
+    /// cleanup (voice leave, presence broadcast, subscription clear).
+    /// Does not rely on connection loops for cleanup.
+    pub async fn force_disconnect(&self, user_id: Uuid) {
+        // Drop all send channels (closes the connections)
+        self.inner.user_channels.write().await.remove(&user_id);
+
+        // Remove from online users
+        let username = self
+            .inner
+            .online_users
+            .write()
+            .await
+            .remove(&user_id)
+            .unwrap_or_default();
+
+        // Auto-leave voice
+        if let Some(channel_id) = self.voice_leave(user_id).await {
+            self.broadcast(GatewayEvent::VoiceStateUpdate {
+                channel_id,
+                user_id,
+                username: username.clone(),
+                session_id: None,
+                self_mute: false,
+                self_deaf: false,
+            });
+        }
+
+        self.clear_subscriptions(user_id).await;
+
+        if !username.is_empty() {
+            self.broadcast(GatewayEvent::PresenceUpdate {
+                user_id,
+                username,
+                online: false,
+            });
+        }
+    }
+
+    /// Get a snapshot of all voice states (for admin dashboard).
+    pub async fn voice_states(&self) -> HashMap<Uuid, Vec<VoiceParticipant>> {
+        let states = self.inner.voice_states.read().await;
+        states
+            .iter()
+            .map(|(channel_id, participants)| (*channel_id, participants.values().cloned().collect()))
+            .collect()
+    }
+
     /// Get list of online users.
     pub async fn online_users(&self) -> Vec<(Uuid, String)> {
         self.inner
@@ -322,59 +370,37 @@ impl Dispatcher {
         left_channel
     }
 
-    /// Relay voice audio data from sender to all other participants in the same channel.
-    /// Uses `try_send` -- drops data for slow clients with a warning.
+    /// Relay voice audio data (JSON) from sender to all other participants in the same channel.
     pub async fn relay_voice_data(&self, sender_id: Uuid, data: String) {
+        let msg = UserMessage::Event(GatewayEvent::VoiceAudioData {
+            from_user_id: sender_id,
+            data,
+        });
+        self.relay_to_voice_peers(sender_id, msg).await;
+    }
+
+    /// Relay binary voice/screen audio data to all other participants in the same channel.
+    /// The frame is already built -- just forward as a binary WebSocket frame.
+    pub async fn relay_voice_data_binary(&self, sender_id: Uuid, data: Bytes) {
+        self.relay_to_voice_peers(sender_id, UserMessage::Binary(data)).await;
+    }
+
+    /// Send a message to all voice channel peers of `sender_id` (excluding sender).
+    async fn relay_to_voice_peers(&self, sender_id: Uuid, msg: UserMessage) {
         let voice_states = self.inner.voice_states.read().await;
         let channels = self.inner.user_channels.read().await;
 
         for (_channel_id, participants) in voice_states.iter() {
             if participants.contains_key(&sender_id) {
-                let event = GatewayEvent::VoiceAudioData {
-                    from_user_id: sender_id,
-                    data,
-                };
                 for (&uid, _) in participants.iter() {
                     if uid != sender_id {
                         if let Some(conns) = channels.get(&uid) {
                             for (conn_id, tx) in conns {
-                                match tx.try_send(UserMessage::Event(event.clone())) {
+                                match tx.try_send(msg.clone()) {
                                     Ok(()) => {}
                                     Err(mpsc::error::TrySendError::Full(_)) => {
                                         warn!(
                                             "Dropping voice data for user {} conn {}: channel full",
-                                            uid, conn_id
-                                        );
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {}
-                                }
-                            }
-                        }
-                    }
-                }
-                return;
-            }
-        }
-    }
-
-    /// #10: Relay binary voice audio data to all other participants in the same channel.
-    /// The frame is already built as [0x04][sender_uid(16)][payload] — just forward
-    /// as a binary WebSocket frame. No base64 encoding, no JSON serialization.
-    pub async fn relay_voice_data_binary(&self, sender_id: Uuid, data: Bytes) {
-        let voice_states = self.inner.voice_states.read().await;
-        let channels = self.inner.user_channels.read().await;
-
-        for (_channel_id, participants) in voice_states.iter() {
-            if participants.contains_key(&sender_id) {
-                for (&uid, _) in participants.iter() {
-                    if uid != sender_id {
-                        if let Some(conns) = channels.get(&uid) {
-                            for (conn_id, tx) in conns {
-                                match tx.try_send(UserMessage::Binary(data.clone())) {
-                                    Ok(()) => {}
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        warn!(
-                                            "Dropping binary voice data for user {} conn {}: channel full",
                                             uid, conn_id
                                         );
                                     }

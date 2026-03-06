@@ -30,6 +30,7 @@ async-stream = { workspace = true }
 http-body-util = { workspace = true }
 futures-util = { workspace = true }
 
+haven-db = { workspace = true }
 haven-types = { workspace = true }
 haven-fast-transfer = { workspace = true }
 crossbeam-channel = { workspace = true }

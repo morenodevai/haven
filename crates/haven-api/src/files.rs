@@ -124,13 +124,16 @@ pub async fn download_file(
 
     // #14: Use configurable uploads directory from state
     let file_path = state.uploads_dir.join(&file_id);
-    let bytes = tokio::fs::read(&file_path).await.map_err(|e| {
-        error!("Failed to read file {:?}: {}", file_path, e);
+    let file = tokio::fs::File::open(&file_path).await.map_err(|e| {
+        error!("Failed to open file {:?}: {}", file_path, e);
         StatusCode::NOT_FOUND
     })?;
 
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = axum::body::Body::from_stream(stream);
+
     Ok((
         [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-        bytes,
+        body,
     ))
 }

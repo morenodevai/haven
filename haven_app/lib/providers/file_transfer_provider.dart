@@ -1,5 +1,6 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'package:haven_app/services/file_client_bindings.dart';
 import 'package:haven_app/services/file_transfer_service.dart';
 
 /// State for file transfers UI.
@@ -27,40 +28,40 @@ class FileTransferState {
       .where((t) =>
           !t.isUpload &&
           t.nativeHandle == null &&
-          t.state == 0 &&
+          t.state == TransferState.idle &&
           t.folderId == null)
       .toList();
 
   /// Active individual transfers (not part of a folder).
   List<FileTransfer> get active => transfers.values
       .where((t) =>
-          (t.state == 1 || t.state == 2) &&
+          (t.state == TransferState.hashing || t.state == TransferState.transferring) &&
           t.folderId == null)
       .toList();
 
   /// Completed individual transfers (not part of a folder).
   List<FileTransfer> get completed => transfers.values
-      .where((t) => t.state == 3 && t.folderId == null)
+      .where((t) => t.state == TransferState.complete && t.folderId == null)
       .toList();
 
   /// Failed/cancelled individual transfers (not part of a folder).
   List<FileTransfer> get failed => transfers.values
-      .where((t) => (t.state == 4 || t.state == 5) && t.folderId == null)
+      .where((t) => (t.state == TransferState.error || t.state == TransferState.cancelled) && t.folderId == null)
       .toList();
 
   /// Pending folder offers waiting for user action.
   List<FolderTransfer> get pendingFolderOffers => folders.values
-      .where((f) => !f.isUpload && f.state == FolderTransferState.pending)
+      .where((f) => !f.isUpload && f.state == FolderTransferStatus.pending)
       .toList();
 
   /// Active folder transfers (uploading or downloading).
   List<FolderTransfer> get activeFolders => folders.values
-      .where((f) => f.state == FolderTransferState.active)
+      .where((f) => f.state == FolderTransferStatus.active)
       .toList();
 
   /// Completed folder transfers.
   List<FolderTransfer> get completedFolders => folders.values
-      .where((f) => f.state == FolderTransferState.complete)
+      .where((f) => f.state == FolderTransferStatus.complete)
       .toList();
 }
 

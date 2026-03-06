@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Haven Admin</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- Login -->
+    <div id="login-page" class="login-page">
+        <div class="login-box">
+            <h1>Haven Admin</h1>
+            <form id="login-form">
+                <input type="password" id="login-secret" placeholder="Admin secret" autocomplete="off" required>
+                <button type="submit" class="primary">Login</button>
+            </form>
+            <div id="login-error" class="error" hidden></div>
+        </div>
+    </div>
+
+    <!-- Dashboard -->
+    <div id="dashboard" class="app" hidden>
+        <header class="header">
+            <span class="header-title">Haven Admin</span>
+            <span id="header-uptime" class="header-uptime"></span>
+        </header>
+
+        <nav class="nav">
+            <a class="nav-item active" data-section="overview">Overview</a>
+            <a class="nav-item" data-section="users">Users</a>
+            <a class="nav-item" data-section="channels">Channels</a>
+            <a class="nav-item" data-section="messages">Messages</a>
+            <a class="nav-item" data-section="voice">Voice</a>
+            <a class="nav-item" data-section="transfers">Transfers</a>
+            <a class="nav-item" data-section="offers">Offers</a>
+            <a class="nav-item" data-section="config">Config</a>
+            <a class="nav-item nav-logout" id="logout-btn">Logout</a>
+        </nav>
+
+        <main class="content">
+            <section id="section-overview" class="section">
+                <h2>Overview</h2>
+                <div id="overview-cards" class="stat-grid"></div>
+            </section>
+
+            <section id="section-users" class="section" hidden>
+                <h2>Users</h2>
+                <div id="users-content"></div>
+            </section>
+
+            <section id="section-channels" class="section" hidden>
+                <h2>Channels</h2>
+                <form id="create-channel-form" class="inline-form">
+                    <input type="text" id="new-channel-name" placeholder="New channel name" required>
+                    <button type="submit" class="primary">Create</button>
+                </form>
+                <div id="channels-content"></div>
+            </section>
+
+            <section id="section-messages" class="section" hidden>
+                <h2>Messages</h2>
+                <div class="filter-bar">
+                    <select id="msg-channel-filter">
+                        <option value="">All channels</option>
+                    </select>
+                </div>
+                <div id="messages-content"></div>
+            </section>
+
+            <section id="section-voice" class="section" hidden>
+                <h2>Voice</h2>
+                <div id="voice-content"></div>
+            </section>
+
+            <section id="section-transfers" class="section" hidden>
+                <h2>Transfers</h2>
+                <div id="transfers-content"></div>
+            </section>
+
+            <section id="section-offers" class="section" hidden>
+                <h2>Offers</h2>
+                <div id="offers-content"></div>
+            </section>
+
+            <section id="section-config" class="section" hidden>
+                <h2>Config</h2>
+                <div id="config-content"></div>
+            </section>
+        </main>
+
+        <footer class="status-bar">
+            <span id="status-text">Connecting...</span>
+            <span id="status-online"></span>
+        </footer>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

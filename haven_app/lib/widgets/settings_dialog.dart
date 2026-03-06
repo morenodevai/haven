@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'package:haven_app/config/constants.dart';
 import 'package:haven_app/config/theme.dart';
 import 'package:haven_app/providers/audio_settings_provider.dart';
 import 'package:haven_app/providers/auth_provider.dart';
@@ -113,7 +114,7 @@ class SettingsDialog extends ConsumerWidget {
               // About section
               _SectionHeader(title: 'ABOUT'),
               const SizedBox(height: 8),
-              _InfoRow(label: 'Version', value: '2.0.0'),
+              _InfoRow(label: 'Version', value: appVersion),
               const SizedBox(height: 4),
               _InfoRow(label: 'Platform', value: 'Flutter Desktop'),
 

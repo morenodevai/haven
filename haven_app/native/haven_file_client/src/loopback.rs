@@ -1,12 +1,15 @@
 //! WASAPI loopback capture — captures system audio output.
 //!
-//! Opens the default render endpoint in loopback mode, captures at device native
-//! format, and converts to 48 kHz stereo 16-bit PCM for consumption by Dart.
+//! Uses process-exclusion loopback (Windows 10 2004+) to capture all system
+//! audio EXCEPT audio played by our own process, preventing feedback loops
+//! when screen sharing. Converts to 48 kHz stereo 16-bit PCM for Dart.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
+use windows::core::{implement, IUnknown, Interface, PROPVARIANT};
 use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::*;
+use windows::Win32::System::Threading::GetCurrentProcessId;
 
 // WAVE_FORMAT constants not always exported by the windows crate
 const WAVE_FORMAT_IEEE_FLOAT_TAG: u16 = 0x0003;
@@ -106,27 +109,120 @@ pub fn stop() -> i32 {
 
 // ── Internal ─────────────────────────────────────────────────────────────
 
+// ── Completion handler for ActivateAudioInterfaceAsync ──────────────────
+
+/// Shared state signaled by the completion handler when activation finishes.
+struct ActivationResult {
+    done: bool,
+    hr: i32,
+    interface: Option<IUnknown>,
+}
+
+/// COM object implementing IActivateAudioInterfaceCompletionHandler.
+#[implement(IActivateAudioInterfaceCompletionHandler)]
+struct CompletionHandler {
+    state: Arc<(Mutex<ActivationResult>, Condvar)>,
+}
+
+impl IActivateAudioInterfaceCompletionHandler_Impl for CompletionHandler_Impl {
+    fn ActivateCompleted(
+        &self,
+        operation: Option<&IActivateAudioInterfaceAsyncOperation>,
+    ) -> windows::core::Result<()> {
+        let (lock, cvar) = &*self.state;
+        let mut result = lock.lock().unwrap();
+
+        if let Some(op) = operation {
+            let mut hr = windows::core::HRESULT(0);
+            let mut activated: Option<IUnknown> = None;
+            unsafe {
+                let _ = op.GetActivateResult(&mut hr, &mut activated);
+            }
+            result.hr = hr.0;
+            result.interface = activated;
+        } else {
+            result.hr = -1;
+        }
+        result.done = true;
+        cvar.notify_one();
+        Ok(())
+    }
+}
+
+// VT_BLOB = 65 (from Win32_System_Variant, hardcoded to avoid extra feature dep)
+const VT_BLOB: u16 = 65;
+
 fn init_loopback() -> Result<LoopbackState, String> {
     unsafe {
         // Initialize COM (may already be initialized — that's OK)
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
 
-        // Get default render (output) device
-        let enumerator: IMMDeviceEnumerator = CoCreateInstance(
-            &MMDeviceEnumerator,
-            None,
-            CLSCTX_ALL,
+        // Build process-exclusion loopback activation params
+        let loopback_params = AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+            TargetProcessId: GetCurrentProcessId(),
+            ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+        };
+
+        let mut activation_params = AUDIOCLIENT_ACTIVATION_PARAMS {
+            ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+            Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+                ProcessLoopbackParams: loopback_params,
+            },
+        };
+
+        // Wrap in a PROPVARIANT (VT_BLOB pointing to activation_params)
+        let params_ptr = &mut activation_params as *mut _ as *mut u8;
+        let params_size = std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32;
+
+        let mut propvariant: windows::core::imp::PROPVARIANT = std::mem::zeroed();
+        propvariant.Anonymous.Anonymous.vt = VT_BLOB;
+        propvariant.Anonymous.Anonymous.Anonymous.blob.cbSize = params_size;
+        propvariant.Anonymous.Anonymous.Anonymous.blob.pBlobData = params_ptr;
+        let propvariant = PROPVARIANT::from_raw(propvariant);
+
+        // Create completion handler
+        let pair = Arc::new((
+            Mutex::new(ActivationResult {
+                done: false,
+                hr: 0,
+                interface: None,
+            }),
+            Condvar::new(),
+        ));
+
+        let handler: IActivateAudioInterfaceCompletionHandler =
+            CompletionHandler { state: pair.clone() }.into();
+
+        // Activate with process-exclusion loopback
+        let _op = ActivateAudioInterfaceAsync(
+            VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+            &IAudioClient::IID,
+            Some(&propvariant),
+            &handler,
         )
-        .map_err(|e| format!("CoCreateInstance MMDeviceEnumerator: {e}"))?;
+        .map_err(|e| format!("ActivateAudioInterfaceAsync: {e}"))?;
 
-        let device = enumerator
-            .GetDefaultAudioEndpoint(eRender, eConsole)
-            .map_err(|e| format!("GetDefaultAudioEndpoint: {e}"))?;
+        // Wait for completion
+        let (lock, cvar) = &*pair;
+        let result = cvar
+            .wait_while(lock.lock().unwrap(), |r| !r.done)
+            .unwrap();
 
-        // Activate IAudioClient
-        let client: IAudioClient = device
-            .Activate(CLSCTX_ALL, None)
-            .map_err(|e| format!("Activate IAudioClient: {e}"))?;
+        if result.hr < 0 {
+            return Err(format!(
+                "Process loopback activation failed: HRESULT 0x{:08X}",
+                result.hr as u32
+            ));
+        }
+
+        let activated = result
+            .interface
+            .as_ref()
+            .ok_or("Activation returned no interface")?;
+
+        let client: IAudioClient = activated
+            .cast()
+            .map_err(|e| format!("Cast to IAudioClient: {e}"))?;
 
         // Get device mix format
         let mix_format_ptr = client
@@ -140,13 +236,12 @@ fn init_loopback() -> Result<LoopbackState, String> {
         let src_is_float = mix_format.wFormatTag == WAVE_FORMAT_IEEE_FLOAT_TAG
             || (mix_format.wFormatTag == WAVE_FORMAT_EXTENSIBLE_TAG && src_bits_per_sample == 32);
 
-        // Initialize in loopback mode with the device's native format
-        // Use 20ms buffer (shared mode)
+        // Initialize — NO LOOPBACK flag (mode already set via activation params)
         let buffer_duration = 200_000; // 20ms in 100ns units
         client
             .Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_LOOPBACK,
+                0, // no flags — process loopback mode set at activation
                 buffer_duration,
                 0, // periodicity (must be 0 for shared mode)
                 mix_format_ptr,

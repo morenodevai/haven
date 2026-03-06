@@ -18,7 +18,9 @@ use haven_fast_transfer::{
     SenderProgress, TracingLogger, run_raw_sender, run_receiver,
 };
 
-use crate::routes::{AppState, Claims};
+use haven_types::api::Claims;
+
+use crate::routes::AppState;
 
 /// WebSocket control messages for fast transfer (JSON, tagged union).
 #[derive(Debug, Serialize, Deserialize)]
@@ -109,7 +111,7 @@ pub async fn handle_fast_transfer_ws(
                 // Create transfer record in DB
                 let retention_hours = state.retention_hours;
                 let tid = transfer_id.clone();
-                let uploader_id = claims.sub.clone();
+                let uploader_id = claims.sub.to_string();
                 let hashes = chunk_hashes.clone();
                 let cs = chunk_size;
                 let fs = file_size;
@@ -314,7 +316,7 @@ pub async fn handle_fast_transfer_ws(
                     }
                 };
 
-                if status != "complete" {
+                if status != haven_types::api::TransferStatus::Complete.to_string() {
                     warn!(
                         "FastDownloadStart: transfer {} not complete (status={})",
                         transfer_id, status

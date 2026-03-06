@@ -11,6 +11,7 @@ import 'package:haven_app/providers/file_transfer_provider.dart';
 import 'package:haven_app/providers/presence_provider.dart';
 import 'package:haven_app/services/file_client_bindings.dart';
 import 'package:haven_app/services/file_transfer_service.dart';
+import 'package:haven_app/utils/formatters.dart';
 
 // Phase colors
 const _colorQueued = Colors.grey;
@@ -316,15 +317,6 @@ class _UserPickerDialog extends StatelessWidget {
   }
 }
 
-String _formatBytes(int bytes) {
-  if (bytes < 1024) return '$bytes B';
-  if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
-  if (bytes < 1024 * 1024 * 1024) {
-    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
-  }
-  return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
-}
-
 /// Returns the phase color for a file transfer state.
 Color _phaseColor(int state, bool isUpload) {
   switch (state) {
@@ -373,7 +365,7 @@ class _PendingOfferTile extends ConsumerWidget {
                     ),
                   ),
                   Text(
-                    _formatBytes(transfer.fileSize),
+                    formatFileSize(transfer.fileSize),
                     style: TextStyle(fontSize: 12, color: HavenTheme.textMuted),
                   ),
                 ],
@@ -470,7 +462,7 @@ class _ActiveTransferTile extends ConsumerWidget {
                   style: TextStyle(fontSize: 12, color: HavenTheme.textMuted),
                 ),
                 Text(
-                  '${_formatBytes(transfer.bytesDone)} / ${_formatBytes(transfer.bytesTotal)}',
+                  '${formatFileSize(transfer.bytesDone)} / ${formatFileSize(transfer.bytesTotal)}',
                   style: TextStyle(fontSize: 12, color: HavenTheme.textMuted),
                 ),
               ],
@@ -509,7 +501,7 @@ class _CompletedTransferTile extends ConsumerWidget {
                     ),
                   ),
                   Text(
-                    '${transfer.isUpload ? "Sent" : "Received"} — ${_formatBytes(transfer.fileSize)}',
+                    '${transfer.isUpload ? "Sent" : "Received"} — ${formatFileSize(transfer.fileSize)}',
                     style: TextStyle(fontSize: 12, color: HavenTheme.textMuted),
                   ),
                 ],
@@ -613,7 +605,7 @@ class _PendingFolderOfferCard extends ConsumerWidget {
                       ),
                       const SizedBox(height: 2),
                       Text(
-                        '${folder.fileCount} files — ${_formatBytes(folder.totalSize)}',
+                        '${folder.fileCount} files — ${formatFileSize(folder.totalSize)}',
                         style: TextStyle(fontSize: 12, color: HavenTheme.textMuted),
                       ),
                     ],
@@ -736,7 +728,7 @@ class _FolderManifestPreviewState extends State<_FolderManifestPreview> {
                         ),
                       ),
                       Text(
-                        _formatBytes(entry.size),
+                        formatFileSize(entry.size),
                         style: TextStyle(fontSize: 11, color: HavenTheme.textMuted),
                       ),
                     ],
@@ -865,7 +857,7 @@ class _ActiveFolderCardState extends ConsumerState<_ActiveFolderCard> {
                   ],
                 ),
                 Text(
-                  '${_formatBytes(bytesDone)} / ${_formatBytes(folder.totalSize)}',
+                  '${formatFileSize(bytesDone)} / ${formatFileSize(folder.totalSize)}',
                   style: TextStyle(fontSize: 12, color: HavenTheme.textMuted),
                 ),
               ],
@@ -1049,7 +1041,7 @@ class _FolderFileTree extends StatelessWidget {
             const SizedBox(width: 8),
           ],
           Text(
-            _formatBytes(entry.size),
+            formatFileSize(entry.size),
             style: TextStyle(fontSize: 11, color: HavenTheme.textMuted),
           ),
         ],
@@ -1098,7 +1090,7 @@ class _CompletedFolderCard extends ConsumerWidget {
                     ),
                   ),
                   Text(
-                    '${folder.isUpload ? "Sent" : "Received"} — ${folder.fileCount} files, ${_formatBytes(folder.totalSize)}',
+                    '${folder.isUpload ? "Sent" : "Received"} — ${folder.fileCount} files, ${formatFileSize(folder.totalSize)}',
                     style: TextStyle(fontSize: 12, color: HavenTheme.textMuted),
                   ),
                 ],

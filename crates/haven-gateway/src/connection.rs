@@ -9,6 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use tracing::{info, trace, warn};
 use uuid::Uuid;
 
+use haven_types::api::OfferStatus;
 use haven_types::events::{FolderFileEntry, GatewayCommand, GatewayEvent, TurnServer};
 
 use crate::dispatcher::{Dispatcher, UserMessage};
@@ -44,7 +45,7 @@ pub async fn handle_connection_authenticated(
         turn_servers,
     };
     if sender
-        .send(Message::Text(serde_json::to_string(&ready).unwrap().into()))
+        .send(Message::Text(serde_json::to_string(&ready).expect("GatewayEvent serialization").into()))
         .await
         .is_err()
     {
@@ -60,42 +61,7 @@ pub async fn handle_connection_authenticated(
     run_connection_loop(sender, receiver, dispatcher, user_id, username, file_server_url, db).await;
 }
 
-/// Handle a single WebSocket connection (legacy path — uses Identify handshake).
-/// Kept for backwards compatibility with older clients.
-pub async fn handle_connection(socket: WebSocket, dispatcher: Dispatcher, jwt_secret: String) {
-    let (mut sender, mut receiver) = socket.split();
-
-    // Step 1: Wait for Identify command with JWT
-    let (user_id, username) = match wait_for_identify(&mut receiver, &jwt_secret).await {
-        Some(id) => id,
-        None => {
-            warn!("WebSocket client failed to identify, closing");
-            return;
-        }
-    };
-
-    info!("{} ({}) connected to gateway", username, user_id);
-
-    // Step 2: Send Ready event
-    let ready = GatewayEvent::Ready {
-        user_id,
-        username: username.clone(),
-        turn_servers: None,
-    };
-    if sender
-        .send(Message::Text(serde_json::to_string(&ready).unwrap().into()))
-        .await
-        .is_err()
-    {
-        return;
-    }
-
-    // Shared connection loop (legacy path has no file server URL or DB)
-    run_connection_loop(sender, receiver, dispatcher, user_id, username, None, None).await;
-}
-
-/// Shared connection loop — factored out of both handle_connection and
-/// handle_connection_authenticated to avoid code duplication.
+/// Connection event loop — handles broadcasts, targeted messages, and heartbeats.
 async fn run_connection_loop(
     mut sender: futures_util::stream::SplitSink<WebSocket, Message>,
     mut receiver: futures_util::stream::SplitStream<WebSocket>,
@@ -117,7 +83,7 @@ async fn run_connection_loop(
             online: true,
         };
         if sender
-            .send(Message::Text(serde_json::to_string(&event).unwrap().into()))
+            .send(Message::Text(serde_json::to_string(&event).expect("GatewayEvent serialization").into()))
             .await
             .is_err()
         {
@@ -133,8 +99,8 @@ async fn run_connection_loop(
     let dispatcher_clone = dispatcher.clone();
 
     // Per-connection channel subscriptions (shared between send and recv tasks).
-    let subscribed_channels: Arc<std::sync::RwLock<HashSet<Uuid>>> =
-        Arc::new(std::sync::RwLock::new(HashSet::new()));
+    let subscribed_channels: Arc<tokio::sync::RwLock<HashSet<Uuid>>> =
+        Arc::new(tokio::sync::RwLock::new(HashSet::new()));
     let send_subscriptions = subscribed_channels.clone();
 
     // H6: Shared flag for heartbeat
@@ -161,8 +127,7 @@ async fn run_connection_loop(
                     };
 
                     if let Some(channel_id) = msg.channel_id {
-                        let subs = send_subscriptions.read()
-                            .expect("subscription lock poisoned");
+                        let subs = send_subscriptions.read().await;
                         if !subs.contains(&channel_id) {
                             continue;
                         }
@@ -180,7 +145,7 @@ async fn run_connection_loop(
 
                     match msg {
                         UserMessage::Event(event) => {
-                            let text = serde_json::to_string(&event).unwrap();
+                            let text = serde_json::to_string(&event).expect("GatewayEvent serialization");
                             if sender.send(Message::Text(text.into())).await.is_err() {
                                 break;
                             }
@@ -269,42 +234,12 @@ async fn run_connection_loop(
     info!("{} ({}) disconnected from gateway", username, user_id);
 }
 
-async fn wait_for_identify(
-    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
-    jwt_secret: &str,
-) -> Option<(Uuid, String)> {
-    use jsonwebtoken::{DecodingKey, Validation, decode};
-    use haven_types::api::Claims;
-
-    let timeout = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while let Some(Ok(msg)) = receiver.next().await {
-            if let Message::Text(text) = msg {
-                if let Ok(GatewayCommand::Identify { token }) =
-                    serde_json::from_str::<GatewayCommand>(&text)
-                {
-                    let token_data = decode::<Claims>(
-                        &token,
-                        &DecodingKey::from_secret(jwt_secret.as_bytes()),
-                        &Validation::default(),
-                    )
-                    .ok()?;
-
-                    return Some((token_data.claims.sub, token_data.claims.username));
-                }
-            }
-        }
-        None
-    });
-
-    timeout.await.ok().flatten()
-}
-
 async fn handle_command(
     dispatcher: &Dispatcher,
     user_id: Uuid,
     username: &str,
     cmd: GatewayCommand,
-    subscriptions: &Arc<std::sync::RwLock<HashSet<Uuid>>>,
+    subscriptions: &Arc<tokio::sync::RwLock<HashSet<Uuid>>>,
     file_server_url: Option<&str>,
     db: &DbHandle,
 ) {
@@ -319,8 +254,7 @@ async fn handle_command(
                 channel_ids.len()
             );
             {
-                let mut subs = subscriptions.write()
-                    .expect("subscription lock poisoned");
+                let mut subs = subscriptions.write().await;
                 *subs = channel_ids.iter().copied().collect();
             }
             dispatcher
@@ -500,7 +434,7 @@ async fn handle_command(
                 username, user_id, target_user_id
             );
             if let Some(db) = &db {
-                let _ = db.update_pending_offer_status(&transfer_id, "accepted");
+                let _ = db.update_pending_offer_status(&transfer_id, &OfferStatus::Accepted.to_string());
             }
             dispatcher
                 .send_to_user(
@@ -522,7 +456,7 @@ async fn handle_command(
                 username, user_id, target_user_id
             );
             if let Some(db) = &db {
-                let _ = db.update_pending_offer_status(&transfer_id, "rejected");
+                let _ = db.update_pending_offer_status(&transfer_id, &OfferStatus::Rejected.to_string());
             }
             dispatcher
                 .send_to_user(
@@ -641,7 +575,7 @@ async fn handle_command(
                     let ch_json = serde_json::to_string(hashes).unwrap_or_default();
                     let _ = db.update_pending_offer_hashes(&transfer_id, sha, &ch_json);
                 }
-                let _ = db.update_pending_offer_status(&transfer_id, "uploaded");
+                let _ = db.update_pending_offer_status(&transfer_id, &OfferStatus::Uploaded.to_string());
             }
             // Only include file_server_url if the gateway has one configured.
             let fsu = file_server_url.as_deref().filter(|s| !s.is_empty()).map(|s| s.to_string());
@@ -738,7 +672,7 @@ async fn handle_command(
                 username, user_id, target_user_id, folder_id
             );
             if let Some(db) = &db {
-                let _ = db.update_pending_folder_offer_status(&folder_id, "accepted");
+                let _ = db.update_pending_folder_offer_status(&folder_id, &OfferStatus::Accepted.to_string());
             }
             dispatcher
                 .send_to_user(
@@ -760,7 +694,7 @@ async fn handle_command(
                 username, user_id, target_user_id, folder_id
             );
             if let Some(db) = &db {
-                let _ = db.update_pending_folder_offer_status(&folder_id, "rejected");
+                let _ = db.update_pending_folder_offer_status(&folder_id, &OfferStatus::Rejected.to_string());
             }
             dispatcher
                 .send_to_user(
@@ -824,129 +758,57 @@ async fn handle_binary_message(
 
     let msg_type = data[0];
     match msg_type {
-        // 0x01: FileChunkSend -- minimum 37 bytes (1 + 16 + 16 + 4), payload follows
-        0x01 => {
-            if data.len() < 37 {
-                warn!(
-                    "Binary FileChunkSend too short: {} bytes (need >= 37)",
-                    data.len()
-                );
+        // 0x01-0x03: File transfer relay -- swap target_uid for sender_uid, forward.
+        0x01 | 0x02 | 0x03 => {
+            let (label, min_len) = match msg_type {
+                0x01 => ("FileChunkSend", 37),
+                0x02 => ("FileAckSend", 37),
+                0x03 => ("FileDoneSend", 33),
+                _ => unreachable!(),
+            };
+            if data.len() < min_len {
+                warn!("Binary {} too short: {} bytes (need >= {})", label, data.len(), min_len);
                 return;
             }
-            let target_user_id =
-                Uuid::from_bytes(data[1..17].try_into().unwrap());
-            let chunk_index = u32::from_be_bytes(data[33..37].try_into().unwrap());
-            let payload_len = data.len() - 37;
+            let target_user_id = Uuid::from_bytes(data[1..17].try_into().unwrap());
 
-            if chunk_index % 100 == 0 {
-                info!(
-                    "Binary relay chunk #{} ({} bytes payload) from {} -> {}",
-                    chunk_index, payload_len, sender_user_id, target_user_id
-                );
+            if msg_type == 0x01 {
+                let chunk_index = u32::from_be_bytes(data[33..37].try_into().unwrap());
+                if chunk_index % 100 == 0 {
+                    info!("Binary relay chunk #{} ({} bytes payload) from {} -> {}",
+                        chunk_index, data.len() - 37, sender_user_id, target_user_id);
+                }
+            } else if msg_type == 0x03 {
+                info!("Binary relay DONE from {} -> {}", sender_user_id, target_user_id);
             }
 
-            let mut outgoing = Vec::with_capacity(data.len());
-            outgoing.push(0x01);
-            outgoing.extend_from_slice(sender_user_id.as_bytes());
-            outgoing.extend_from_slice(&data[17..]);
-
-            dispatcher
-                .send_binary_to_user(target_user_id, Bytes::from(outgoing))
-                .await;
+            let outgoing = relay_binary_frame(msg_type, sender_user_id, &data[17..]);
+            dispatcher.send_binary_to_user(target_user_id, outgoing).await;
         }
 
-        // 0x02: FileAckSend -- exactly 37 bytes (1 + 16 + 16 + 4)
-        0x02 => {
-            if data.len() < 37 {
-                warn!(
-                    "Binary FileAckSend too short: {} bytes (need >= 37)",
-                    data.len()
-                );
-                return;
-            }
-            let target_user_id =
-                Uuid::from_bytes(data[1..17].try_into().unwrap());
-
-            let mut outgoing = Vec::with_capacity(37);
-            outgoing.push(0x02);
-            outgoing.extend_from_slice(sender_user_id.as_bytes());
-            outgoing.extend_from_slice(&data[17..]);
-
-            dispatcher
-                .send_binary_to_user(target_user_id, Bytes::from(outgoing))
-                .await;
-        }
-
-        // 0x03: FileDoneSend -- exactly 33 bytes (1 + 16 + 16)
-        0x03 => {
-            if data.len() < 33 {
-                warn!(
-                    "Binary FileDoneSend too short: {} bytes (need >= 33)",
-                    data.len()
-                );
-                return;
-            }
-            let target_user_id =
-                Uuid::from_bytes(data[1..17].try_into().unwrap());
-
-            info!(
-                "Binary relay DONE from {} -> {}",
-                sender_user_id, target_user_id
-            );
-
-            let mut outgoing = Vec::with_capacity(33);
-            outgoing.push(0x03);
-            outgoing.extend_from_slice(sender_user_id.as_bytes());
-            outgoing.extend_from_slice(&data[17..]);
-
-            dispatcher
-                .send_binary_to_user(target_user_id, Bytes::from(outgoing))
-                .await;
-        }
-
-        // #10: 0x04: VoiceAudio binary -- [type(1)] [encrypted_payload...]
-        // Server builds [0x04][sender_uid(16)][payload] and relays to all other
-        // voice participants as binary frames (no base64 encoding, no JSON).
-        0x04 => {
-            if data.len() < 2 {
-                return; // Need at least type byte + some payload
-            }
-            let payload = &data[1..];
-
-            // Build outgoing frame: [0x04][sender_uid(16)][payload]
-            let mut outgoing = Vec::with_capacity(1 + 16 + payload.len());
-            outgoing.push(0x04);
-            outgoing.extend_from_slice(sender_user_id.as_bytes());
-            outgoing.extend_from_slice(payload);
-
-            dispatcher
-                .relay_voice_data_binary(sender_user_id, Bytes::from(outgoing))
-                .await;
-        }
-
-        // #11: 0x05: ScreenAudio binary -- [type(1)] [encrypted_payload...]
-        // Same relay logic as VoiceAudio but separate prefix so receivers can
-        // route screen share audio to a different playback pipeline (48kHz stereo).
-        0x05 => {
+        // 0x04/0x05: Voice/ScreenAudio binary relay to all voice participants.
+        0x04 | 0x05 => {
             if data.len() < 2 {
                 return;
             }
-            let payload = &data[1..];
-
-            let mut outgoing = Vec::with_capacity(1 + 16 + payload.len());
-            outgoing.push(0x05);
-            outgoing.extend_from_slice(sender_user_id.as_bytes());
-            outgoing.extend_from_slice(payload);
-
-            dispatcher
-                .relay_voice_data_binary(sender_user_id, Bytes::from(outgoing))
-                .await;
+            let outgoing = relay_binary_frame(msg_type, sender_user_id, &data[1..]);
+            dispatcher.relay_voice_data_binary(sender_user_id, outgoing).await;
         }
 
         _ => {
             warn!("Unknown binary message type: 0x{:02x}", msg_type);
         }
     }
+}
+
+/// Build an outgoing binary frame: [msg_type][sender_uid(16)][tail_data].
+/// Used by all binary relay handlers to swap target_uid for sender_uid.
+fn relay_binary_frame(msg_type: u8, sender_user_id: Uuid, tail_data: &[u8]) -> Bytes {
+    let mut outgoing = Vec::with_capacity(1 + 16 + tail_data.len());
+    outgoing.push(msg_type);
+    outgoing.extend_from_slice(sender_user_id.as_bytes());
+    outgoing.extend_from_slice(tail_data);
+    Bytes::from(outgoing)
 }
 
 /// Replay pending file/folder offers to a reconnecting client.
@@ -962,20 +824,21 @@ async fn replay_pending_offers(
     if let Ok(folders) = db.get_pending_folder_offers_for_user(&uid) {
         for f in folders {
             let manifest: Vec<FolderFileEntry> = serde_json::from_str(&f.manifest).unwrap_or_default();
+            let folder_id = f.folder_id;
             let event = GatewayEvent::FolderOffer {
                 from_user_id: f.from_user_id.parse().unwrap_or(Uuid::nil()),
-                folder_id: f.folder_id,
+                folder_id: folder_id.clone(),
                 folder_name: f.folder_name,
                 total_size: f.total_size as u64,
                 file_count: f.file_count as u32,
                 manifest,
                 file_server_url: f.file_server_url.or_else(|| file_server_url.map(|s| s.to_string())),
             };
-            let text = serde_json::to_string(&event).unwrap();
+            let text = serde_json::to_string(&event).expect("GatewayEvent serialization");
             if sender.send(Message::Text(text.into())).await.is_err() {
                 return;
             }
-            info!("Replayed pending folder offer {} to {}", "folder", uid);
+            info!("Replayed pending folder offer {} to {}", folder_id, uid);
         }
     }
 
@@ -994,13 +857,13 @@ async fn replay_pending_offers(
                 file_server_url: o.file_server_url.or_else(|| file_server_url.map(|s| s.to_string())),
                 folder_id: o.folder_id,
             };
-            let text = serde_json::to_string(&event).unwrap();
+            let text = serde_json::to_string(&event).expect("GatewayEvent serialization");
             if sender.send(Message::Text(text.into())).await.is_err() {
                 return;
             }
 
             // If upload is complete, also replay FileReady
-            if o.status == "uploaded" && o.file_sha256.is_some() && chunk_hashes.is_some() {
+            if o.status == OfferStatus::Uploaded.to_string() && o.file_sha256.is_some() && chunk_hashes.is_some() {
                 let ready = GatewayEvent::FileReady {
                     from_user_id: o.from_user_id.parse().unwrap_or(Uuid::nil()),
                     transfer_id: o.transfer_id.clone(),
@@ -1008,7 +871,7 @@ async fn replay_pending_offers(
                     file_sha256: o.file_sha256,
                     chunk_hashes,
                 };
-                let text = serde_json::to_string(&ready).unwrap();
+                let text = serde_json::to_string(&ready).expect("GatewayEvent serialization");
                 if sender.send(Message::Text(text.into())).await.is_err() {
                     return;
                 }
